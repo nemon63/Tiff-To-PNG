@@ -10,9 +10,44 @@ from PIL import Image, ImageSequence
 SOURCE_EXTS = {".tif", ".tiff", ".tga"}
 
 
+class Tooltip:
+    def __init__(self, widget: tk.Widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tip_window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show_tip, add="+")
+        widget.bind("<Leave>", self._hide_tip, add="+")
+        widget.bind("<ButtonPress>", self._hide_tip, add="+")
+
+    def _show_tip(self, _event=None):
+        if self.tip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tw,
+            text=self.text,
+            justify="left",
+            background="#fff7cc",
+            relief="solid",
+            borderwidth=1,
+            padx=6,
+            pady=3,
+        )
+        label.pack()
+
+    def _hide_tip(self, _event=None):
+        if self.tip_window is not None:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+
 def convert_one(src: Path, dst: Path, force_rgba: bool, overwrite: bool) -> str:
     if dst.exists() and not overwrite:
-        return f"skip (exists): {dst.name}"
+        return f"пропуск (уже есть): {dst.name}"
 
     with Image.open(src) as im:
         # Use the first frame/page for multi-frame TIFFs.
@@ -33,7 +68,7 @@ def convert_one(src: Path, dst: Path, force_rgba: bool, overwrite: bool) -> str:
         dst.parent.mkdir(parents=True, exist_ok=True)
         im.save(dst, format="PNG", optimize=True, compress_level=6)
 
-    return f"ok: {dst.name}"
+    return f"успех: {dst.name}"
 
 
 def iter_sources(root: Path, recursive: bool):
@@ -79,11 +114,11 @@ def run_batch(
         dst = build_dst_path(src, inp, out_root)
         try:
             msg = convert_one(src, dst, force_rgba, overwrite)
-            if msg.startswith("ok"):
+            if msg.startswith("успех"):
                 ok += 1
             logger(f"{src.name} -> {msg}")
         except Exception as exc:
-            logger(f"{src.name} -> ERROR: {exc}")
+            logger(f"{src.name} -> ОШИБКА: {exc}")
 
     return total, ok
 
@@ -126,7 +161,7 @@ def run_cli() -> int:
 class ConverterApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("TIFF/TGA to PNG Converter")
+        self.title("Конвертер TIFF/TGA в PNG")
         self.geometry("760x520")
         self.minsize(640, 420)
 
@@ -135,9 +170,13 @@ class ConverterApp(tk.Tk):
         self.recursive_var = tk.BooleanVar(value=True)
         self.force_rgba_var = tk.BooleanVar(value=False)
         self.overwrite_var = tk.BooleanVar(value=False)
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value="Готово")
+        self._tooltips: list[Tooltip] = []
 
         self._build_ui()
+
+    def _attach_tooltip(self, widget: tk.Widget, text: str):
+        self._tooltips.append(Tooltip(widget, text))
 
     def _build_ui(self):
         main = ttk.Frame(self, padding=12)
@@ -145,41 +184,54 @@ class ConverterApp(tk.Tk):
 
         input_row = ttk.Frame(main)
         input_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(input_row, text="Input (file or folder):").pack(anchor="w")
+        ttk.Label(input_row, text="Вход (файл или папка):").pack(anchor="w")
         input_line = ttk.Frame(input_row)
         input_line.pack(fill="x", pady=(4, 0))
         self.input_entry = ttk.Entry(input_line, textvariable=self.input_var)
         self.input_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(input_line, text="File", command=self._pick_input_file).pack(side="left", padx=(8, 0))
-        ttk.Button(input_line, text="Folder", command=self._pick_input_folder).pack(side="left", padx=(6, 0))
+        input_file_btn = ttk.Button(input_line, text="Файл", command=self._pick_input_file)
+        input_file_btn.pack(side="left", padx=(8, 0))
+        input_folder_btn = ttk.Button(input_line, text="Папка", command=self._pick_input_folder)
+        input_folder_btn.pack(side="left", padx=(6, 0))
+        self._attach_tooltip(self.input_entry, "Укажите путь к TIFF/TGA файлу или папке с файлами.")
+        self._attach_tooltip(input_file_btn, "Выбрать один файл TIFF/TGA.")
+        self._attach_tooltip(input_folder_btn, "Выбрать папку для пакетной конвертации.")
 
         output_row = ttk.Frame(main)
         output_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(output_row, text="Output folder (optional):").pack(anchor="w")
+        ttk.Label(output_row, text="Выходная папка (необязательно):").pack(anchor="w")
         output_line = ttk.Frame(output_row)
         output_line.pack(fill="x", pady=(4, 0))
         self.output_entry = ttk.Entry(output_line, textvariable=self.output_var)
         self.output_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(output_line, text="Browse", command=self._pick_output_folder).pack(
-            side="left", padx=(8, 0)
-        )
+        output_btn = ttk.Button(output_line, text="Выбрать", command=self._pick_output_folder)
+        output_btn.pack(side="left", padx=(8, 0))
+        self._attach_tooltip(self.output_entry, "Если пусто, PNG сохраняются рядом с исходными файлами.")
+        self._attach_tooltip(output_btn, "Выбрать папку, куда сохранять PNG.")
 
-        options = ttk.LabelFrame(main, text="Options", padding=8)
+        options = ttk.LabelFrame(main, text="Параметры", padding=8)
         options.pack(fill="x", pady=(0, 8))
-        ttk.Checkbutton(options, text="Recursive for folders", variable=self.recursive_var).pack(
+        recursive_chk = ttk.Checkbutton(options, text="Рекурсивно для папок", variable=self.recursive_var)
+        recursive_chk.pack(anchor="w")
+        force_rgba_chk = ttk.Checkbutton(options, text="Принудительно RGBA", variable=self.force_rgba_var)
+        force_rgba_chk.pack(anchor="w")
+        overwrite_chk = ttk.Checkbutton(
+            options, text="Перезаписывать PNG, если уже есть", variable=self.overwrite_var
+        )
+        overwrite_chk.pack(
             anchor="w"
         )
-        ttk.Checkbutton(options, text="Force RGBA", variable=self.force_rgba_var).pack(anchor="w")
-        ttk.Checkbutton(options, text="Overwrite PNG if exists", variable=self.overwrite_var).pack(
-            anchor="w"
-        )
+        self._attach_tooltip(recursive_chk, "Обрабатывать также файлы во вложенных папках.")
+        self._attach_tooltip(force_rgba_chk, "Всегда сохранять PNG в RGBA, даже без альфа-канала.")
+        self._attach_tooltip(overwrite_chk, "Если PNG уже существует, заменить его новым файлом.")
 
         controls = ttk.Frame(main)
         controls.pack(fill="x", pady=(0, 8))
-        self.convert_btn = ttk.Button(controls, text="Convert", command=self._on_convert)
+        self.convert_btn = ttk.Button(controls, text="Конвертировать", command=self._on_convert)
         self.convert_btn.pack(side="left")
+        self._attach_tooltip(self.convert_btn, "Запустить конвертацию выбранных файлов в PNG.")
 
-        ttk.Label(main, text="Log:").pack(anchor="w")
+        ttk.Label(main, text="Журнал:").pack(anchor="w")
         log_wrap = ttk.Frame(main)
         log_wrap.pack(fill="both", expand=True)
         self.log_text = tk.Text(log_wrap, height=12, wrap="word", state="disabled")
@@ -187,25 +239,26 @@ class ConverterApp(tk.Tk):
         scrollbar = ttk.Scrollbar(log_wrap, orient="vertical", command=self.log_text.yview)
         scrollbar.pack(side="left", fill="y")
         self.log_text.configure(yscrollcommand=scrollbar.set)
+        self._attach_tooltip(self.log_text, "Здесь отображается ход конвертации и возможные ошибки.")
 
         status = ttk.Label(main, textvariable=self.status_var)
         status.pack(anchor="w", pady=(8, 0))
 
     def _pick_input_file(self):
         path = filedialog.askopenfilename(
-            title="Select image file",
-            filetypes=[("TIFF/TGA files", "*.tif *.tiff *.tga"), ("All files", "*.*")],
+            title="Выберите файл изображения",
+            filetypes=[("Файлы TIFF/TGA", "*.tif *.tiff *.tga"), ("Все файлы", "*.*")],
         )
         if path:
             self.input_var.set(path)
 
     def _pick_input_folder(self):
-        path = filedialog.askdirectory(title="Select input folder")
+        path = filedialog.askdirectory(title="Выберите входную папку")
         if path:
             self.input_var.set(path)
 
     def _pick_output_folder(self):
-        path = filedialog.askdirectory(title="Select output folder")
+        path = filedialog.askdirectory(title="Выберите выходную папку")
         if path:
             self.output_var.set(path)
 
@@ -227,18 +280,18 @@ class ConverterApp(tk.Tk):
         output_value = self.output_var.get().strip()
 
         if not input_value:
-            messagebox.showerror("Error", "Select input file or folder.")
+            messagebox.showerror("Ошибка", "Выберите входной файл или папку.")
             return
 
         inp = Path(input_value)
         if not inp.exists():
-            messagebox.showerror("Error", f"Input does not exist:\n{inp}")
+            messagebox.showerror("Ошибка", f"Входной путь не существует:\n{inp}")
             return
 
         out_root = Path(output_value) if output_value else None
-        self.status_var.set("Converting...")
+        self.status_var.set("Конвертация...")
         self._set_running(True)
-        self._append_log("---- Conversion started ----")
+        self._append_log("---- Старт конвертации ----")
 
         try:
             total, ok = run_batch(
@@ -250,14 +303,14 @@ class ConverterApp(tk.Tk):
                 logger=self._append_log,
             )
             failed = total - ok
-            summary = f"Done. total={total}, ok={ok}, failed={failed}"
+            summary = f"Готово. всего={total}, успешно={ok}, ошибок={failed}"
             self._append_log(summary)
             self.status_var.set(summary)
-            messagebox.showinfo("Finished", summary)
+            messagebox.showinfo("Готово", summary)
         except Exception as exc:
-            self._append_log(f"ERROR: {exc}")
-            self.status_var.set("Failed")
-            messagebox.showerror("Error", str(exc))
+            self._append_log(f"ОШИБКА: {exc}")
+            self.status_var.set("Ошибка")
+            messagebox.showerror("Ошибка", str(exc))
         finally:
             self._set_running(False)
 
