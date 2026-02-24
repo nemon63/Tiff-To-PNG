@@ -77,13 +77,15 @@ def iter_sources(root: Path, recursive: bool):
             yield root
         return
 
+    # Always process files in the selected folder itself.
+    for p in root.glob("*"):
+        if p.is_file() and p.suffix.lower() in SOURCE_EXTS:
+            yield p
+
+    # If recursive mode is enabled, additionally process files in subfolders.
     if recursive:
         for p in root.rglob("*"):
-            if p.is_file() and p.suffix.lower() in SOURCE_EXTS:
-                yield p
-    else:
-        for p in root.glob("*"):
-            if p.is_file() and p.suffix.lower() in SOURCE_EXTS:
+            if p.parent != root and p.is_file() and p.suffix.lower() in SOURCE_EXTS:
                 yield p
 
 
