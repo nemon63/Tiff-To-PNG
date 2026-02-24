@@ -7,7 +7,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageSequence
 
-TIFF_EXTS = {".tif", ".tiff"}
+SOURCE_EXTS = {".tif", ".tiff", ".tga"}
 
 
 def convert_one(src: Path, dst: Path, force_rgba: bool, overwrite: bool) -> str:
@@ -38,17 +38,17 @@ def convert_one(src: Path, dst: Path, force_rgba: bool, overwrite: bool) -> str:
 
 def iter_sources(root: Path, recursive: bool):
     if root.is_file():
-        if root.suffix.lower() in TIFF_EXTS:
+        if root.suffix.lower() in SOURCE_EXTS:
             yield root
         return
 
     if recursive:
         for p in root.rglob("*"):
-            if p.is_file() and p.suffix.lower() in TIFF_EXTS:
+            if p.is_file() and p.suffix.lower() in SOURCE_EXTS:
                 yield p
     else:
         for p in root.glob("*"):
-            if p.is_file() and p.suffix.lower() in TIFF_EXTS:
+            if p.is_file() and p.suffix.lower() in SOURCE_EXTS:
                 yield p
 
 
@@ -90,9 +90,9 @@ def run_batch(
 
 def run_cli() -> int:
     parser = argparse.ArgumentParser(
-        description="Batch convert TIFF/TIF to PNG preserving alpha when present."
+        description="Batch convert TIFF/TIF/TGA to PNG preserving alpha when present."
     )
-    parser.add_argument("input", type=str, help="Input file or folder with .tif/.tiff")
+    parser.add_argument("input", type=str, help="Input file or folder with .tif/.tiff/.tga")
     parser.add_argument(
         "--out",
         type=str,
@@ -126,7 +126,7 @@ def run_cli() -> int:
 class ConverterApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("TIFF to PNG Converter")
+        self.title("TIFF/TGA to PNG Converter")
         self.geometry("760x520")
         self.minsize(640, 420)
 
@@ -193,8 +193,8 @@ class ConverterApp(tk.Tk):
 
     def _pick_input_file(self):
         path = filedialog.askopenfilename(
-            title="Select TIFF file",
-            filetypes=[("TIFF files", "*.tif *.tiff"), ("All files", "*.*")],
+            title="Select image file",
+            filetypes=[("TIFF/TGA files", "*.tif *.tiff *.tga"), ("All files", "*.*")],
         )
         if path:
             self.input_var.set(path)
