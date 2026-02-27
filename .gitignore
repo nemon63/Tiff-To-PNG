@@ -16,6 +16,7 @@ dist/
 
 .idea/
 .vscode/
+app_settings.json
 
 .DS_Store
 Thumbs.db
