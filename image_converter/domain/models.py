@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -73,3 +73,13 @@ class BatchSummary:
             f"Готово. всего={self.total}, успешно={self.succeeded}, "
             f"пропущено={self.skipped}, ошибок={self.failed}"
         )
+
+
+@dataclass(slots=True, frozen=True)
+class AppSettings:
+    input_path: str = ""
+    output_path: str = ""
+    options: ConversionOptions = field(default_factory=ConversionOptions)
+    window_width: int = 1180
+    window_height: int = 780
+    splitter_sizes: tuple[int, int] = (420, 740)

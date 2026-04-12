@@ -60,6 +60,8 @@ cd d:\Python\Tiff-To-PNG
 .\.venv\Scripts\python.exe tiff_to_png.py
 ```
 
+Приложение автоматически сохраняет последние пути, параметры конвертации и размер окна в `app_settings.json`.
+
 ### CLI
 
 Пример запуска из командной строки:

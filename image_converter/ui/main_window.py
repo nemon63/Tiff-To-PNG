@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from image_converter.domain.constants import FILE_DIALOG_FILTER
-from image_converter.domain.models import BatchRequest, ConversionOptions, ResizeMode
+from image_converter.domain.models import AppSettings, BatchRequest, ConversionOptions, ResizeMode
 
 
 class SettingsPanel(QWidget):
@@ -331,6 +331,33 @@ class SettingsPanel(QWidget):
             ),
         )
 
+    def apply_app_settings(self, settings: AppSettings) -> None:
+        self.input_edit.setText(settings.input_path)
+        self.output_edit.setText(settings.output_path)
+
+        options = settings.options
+        self.recursive_checkbox.setChecked(options.recursive)
+        self.force_rgba_checkbox.setChecked(options.force_rgba)
+        self.overwrite_checkbox.setChecked(options.overwrite)
+        self.delete_source_checkbox.setChecked(options.delete_source)
+        self.optimize_checkbox.setChecked(options.optimize)
+        self.compress_spin.setValue(options.compress_level)
+        self.png8_checkbox.setChecked(options.png8)
+        self.png8_colors_spin.setValue(options.png8_colors)
+        self.dither_checkbox.setChecked(options.dither)
+        self.resize_percent_spin.setValue(options.resize_percent)
+        self.max_side_spin.setValue(options.max_side)
+
+        if options.resize_mode is ResizeMode.PERCENT:
+            self.resize_percent_radio.setChecked(True)
+        elif options.resize_mode is ResizeMode.MAX_SIDE:
+            self.resize_max_side_radio.setChecked(True)
+        else:
+            self.resize_none_radio.setChecked(True)
+
+        self._update_resize_state()
+        self._update_png8_state()
+
     def set_controls_enabled(self, enabled: bool) -> None:
         for widget in self._interactive_widgets:
             widget.setEnabled(enabled)
@@ -392,15 +419,15 @@ class MainWindow(QMainWindow):
 
         self.log_panel = LogPanel()
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(settings_scroll)
-        splitter.addWidget(self.log_panel)
-        splitter.setChildrenCollapsible(False)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 740])
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.addWidget(settings_scroll)
+        self.main_splitter.addWidget(self.log_panel)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([420, 740])
 
-        self.setCentralWidget(splitter)
+        self.setCentralWidget(self.main_splitter)
 
     def build_request(self) -> BatchRequest:
         return self.settings_panel.build_request()
@@ -417,6 +444,23 @@ class MainWindow(QMainWindow):
 
     def set_status(self, text: str) -> None:
         self.statusBar().showMessage(text)
+
+    def apply_app_settings(self, settings: AppSettings) -> None:
+        self.resize(settings.window_width, settings.window_height)
+        self.settings_panel.apply_app_settings(settings)
+        if len(settings.splitter_sizes) == 2:
+            self.main_splitter.setSizes(list(settings.splitter_sizes))
+
+    def build_app_settings(self) -> AppSettings:
+        request = self.settings_panel.build_request()
+        return AppSettings(
+            input_path=str(request.input_path or ""),
+            output_path=str(request.output_root or ""),
+            options=request.options,
+            window_width=self.width(),
+            window_height=self.height(),
+            splitter_sizes=tuple(self.main_splitter.sizes()[:2]),
+        )
 
     def confirm_delete_sources(self) -> bool:
         button = QMessageBox.question(
