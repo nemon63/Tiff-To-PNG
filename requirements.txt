@@ -1,2 +1,2 @@
 Pillow>=10.0.0
-tkinterdnd2>=0.4.3
+PyQt6>=6.7.0
