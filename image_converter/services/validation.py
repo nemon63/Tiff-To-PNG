@@ -10,11 +10,12 @@ def validate_request(request: BatchRequest) -> None:
     output_root = request.output_root
     options = request.options
     sources = request.sources
+    has_queue_sources = bool(sources)
 
-    if input_path is None and not sources:
+    if input_path is None and not has_queue_sources:
         raise ValidationError("Выберите входной файл, папку или добавьте файлы в очередь.")
 
-    if input_path is not None:
+    if input_path is not None and not has_queue_sources:
         if not input_path.exists():
             raise ValidationError(f"Входной путь не существует:\n{input_path}")
 
@@ -24,7 +25,7 @@ def validate_request(request: BatchRequest) -> None:
                 f"Неподдерживаемый формат: {input_path.suffix}\nПоддерживаются: {supported}"
             )
 
-    if sources:
+    if has_queue_sources:
         valid_sources = [source for source in sources if source.path.exists()]
         if not valid_sources:
             raise ValidationError("В очереди нет корректных файлов для конвертации.")

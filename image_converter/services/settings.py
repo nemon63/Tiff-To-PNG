@@ -54,26 +54,20 @@ class AppSettingsRepository:
                 "width": settings.window_width,
                 "height": settings.window_height,
                 "splitter_sizes": list(settings.splitter_sizes),
+                "workspace_splitter_sizes": list(settings.workspace_splitter_sizes),
+                "detail_splitter_sizes": list(settings.detail_splitter_sizes),
+                "inspector_splitter_sizes": list(settings.inspector_splitter_sizes),
             },
         }
 
     def _deserialize(self, data: dict[str, Any]) -> AppSettings:
         options_data = data.get("options", {})
         window_data = data.get("window", {})
-        splitter_sizes = window_data.get("splitter_sizes", [420, 740])
 
         try:
             resize_mode = ResizeMode(options_data.get("resize_mode", ResizeMode.NONE.value))
         except ValueError:
             resize_mode = ResizeMode.NONE
-
-        try:
-            splitter_tuple = tuple(int(size) for size in splitter_sizes[:2])
-        except (TypeError, ValueError):
-            splitter_tuple = (420, 740)
-
-        if len(splitter_tuple) != 2:
-            splitter_tuple = (420, 740)
 
         return AppSettings(
             input_path=str(data.get("input_path", "")),
@@ -92,9 +86,21 @@ class AppSettingsRepository:
                 png8_colors=self._coerce_int(options_data.get("png8_colors"), 256),
                 dither=bool(options_data.get("dither", True)),
             ),
-            window_width=self._coerce_int(window_data.get("width"), 1180),
-            window_height=self._coerce_int(window_data.get("height"), 780),
-            splitter_sizes=splitter_tuple,
+            window_width=self._coerce_int(window_data.get("width"), 1280),
+            window_height=self._coerce_int(window_data.get("height"), 820),
+            splitter_sizes=self._coerce_pair(window_data.get("splitter_sizes"), (420, 740)),
+            workspace_splitter_sizes=self._coerce_pair(
+                window_data.get("workspace_splitter_sizes"),
+                (240, 390),
+            ),
+            detail_splitter_sizes=self._coerce_pair(
+                window_data.get("detail_splitter_sizes"),
+                (540, 300),
+            ),
+            inspector_splitter_sizes=self._coerce_pair(
+                window_data.get("inspector_splitter_sizes"),
+                (230, 150),
+            ),
         )
 
     @staticmethod
@@ -103,3 +109,14 @@ class AppSettingsRepository:
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    @classmethod
+    def _coerce_pair(cls, value: Any, default: tuple[int, int]) -> tuple[int, int]:
+        try:
+            result = tuple(cls._coerce_int(item, default[index]) for index, item in enumerate(value[:2]))
+        except (TypeError, ValueError, IndexError):
+            return default
+
+        if len(result) != 2:
+            return default
+        return result

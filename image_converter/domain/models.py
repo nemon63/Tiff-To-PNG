@@ -31,6 +31,15 @@ class QueueStatus(str, Enum):
     ERROR = "error"
 
 
+class PreviewChannel(str, Enum):
+    COMPOSITE = "composite"
+    RED = "red"
+    GREEN = "green"
+    BLUE = "blue"
+    ALPHA = "alpha"
+    LUMA = "luma"
+
+
 @dataclass(slots=True, frozen=True)
 class ConversionOptions:
     recursive: bool = True
@@ -69,6 +78,7 @@ class AssetMetadata:
     mode: str
     has_alpha: bool
     file_size_bytes: int
+    frame_count: int = 1
     warnings: tuple[str, ...] = ()
 
     @property
@@ -90,6 +100,16 @@ class AssetMetadata:
         if unit_index == 0:
             return f"{int(size)} {units[unit_index]}"
         return f"{size:.1f} {units[unit_index]}"
+
+    @property
+    def warning_count(self) -> int:
+        return len(self.warnings)
+
+    @property
+    def warning_summary(self) -> str:
+        if not self.warnings:
+            return ""
+        return "; ".join(self.warnings)
 
 
 @dataclass(slots=True)
@@ -151,6 +171,9 @@ class AppSettings:
     input_path: str = ""
     output_path: str = ""
     options: ConversionOptions = field(default_factory=ConversionOptions)
-    window_width: int = 1180
-    window_height: int = 780
-    splitter_sizes: tuple[int, int] = (420, 740)
+    window_width: int = 1280
+    window_height: int = 820
+    splitter_sizes: tuple[int, int] = (360, 880)
+    workspace_splitter_sizes: tuple[int, int] = (240, 390)
+    detail_splitter_sizes: tuple[int, int] = (540, 300)
+    inspector_splitter_sizes: tuple[int, int] = (230, 150)

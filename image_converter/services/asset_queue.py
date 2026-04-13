@@ -46,14 +46,24 @@ class AssetScanner:
             return [BatchSource(path=path, root=path.parent)], []
 
         iterator = path.rglob("*") if recursive else path.glob("*")
-        sources = [
-            BatchSource(path=file_path, root=path)
-            for file_path in iterator
-            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_SOURCE_EXTENSIONS
-        ]
+        sources: list[BatchSource] = []
+        ignored: list[str] = []
+        unsupported_count = 0
+
+        for file_path in iterator:
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() in SUPPORTED_SOURCE_EXTENSIONS:
+                sources.append(BatchSource(path=file_path, root=path))
+            else:
+                unsupported_count += 1
 
         if sources:
-            return sources, []
+            if unsupported_count:
+                ignored.append(
+                    f"В папке {path.name} пропущено неподдерживаемых файлов: {unsupported_count}"
+                )
+            return sources, ignored
 
         return [], [f"В папке не найдено поддерживаемых файлов: {path}"]
 
@@ -82,16 +92,31 @@ class AssetScanner:
         with Image.open(path) as image:
             width, height = image.size
             mode = image.mode
+            frame_count = getattr(image, "n_frames", 1)
             has_alpha = "A" in image.getbands() or (
                 image.mode == "P" and "transparency" in image.info
             )
             format_name = (image.format or path.suffix.removeprefix(".")).upper()
+            alpha_fully_opaque = False
+            if has_alpha and "A" in image.getbands():
+                alpha_min, alpha_max = image.getchannel("A").getextrema()
+                alpha_fully_opaque = alpha_min == 255 and alpha_max == 255
 
         warnings: list[str] = []
         if width <= 0 or height <= 0:
             warnings.append("Некорректное разрешение")
         if width > 8192 or height > 8192:
             warnings.append("Очень большое изображение")
+        if not self._is_power_of_two(width) or not self._is_power_of_two(height):
+            warnings.append("Разрешение не кратно power-of-two")
+        if mode == "CMYK":
+            warnings.append("CMYK требует проверки перед экспортом")
+        if frame_count > 1:
+            warnings.append("Будет использован только первый кадр/слой")
+        if alpha_fully_opaque:
+            warnings.append("Альфа-канал есть, но полностью непрозрачный")
+        if file_size > 128 * 1024 * 1024:
+            warnings.append("Очень большой файл")
         if file_size <= 0:
             warnings.append("Пустой файл")
 
@@ -102,5 +127,10 @@ class AssetScanner:
             mode=mode,
             has_alpha=has_alpha,
             file_size_bytes=file_size,
+            frame_count=frame_count,
             warnings=tuple(warnings),
         )
+
+    @staticmethod
+    def _is_power_of_two(value: int) -> bool:
+        return value > 0 and (value & (value - 1)) == 0

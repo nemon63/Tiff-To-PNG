@@ -10,10 +10,12 @@ from image_converter.application.controller import ConversionController
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.settings import AppSettingsRepository
 from image_converter.ui.main_window import MainWindow
+from image_converter.ui.theme import APP_STYLESHEET
 
 
 def run_gui() -> int:
     app = QApplication(sys.argv)
+    app.setStyleSheet(APP_STYLESHEET)
 
     project_root = Path(__file__).resolve().parents[2]
     icon_path = project_root / "ico" / "favicon.ico"
