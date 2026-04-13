@@ -82,39 +82,103 @@ QLabel#AssetName {
     border: none;
 }
 
-QLabel#PathCaption,
-QLabel#OutputCaption {
-    color: #6E7781;
+QLabel#PreviewFileName {
+    color: #16212C;
+    font-size: 14px;
+    font-weight: 700;
+    background: transparent;
+    border: none;
+}
+
+QLabel#PreviewMetaText {
+    color: #4C5B69;
+    font-size: 13px;
+    background: transparent;
+    border: none;
+}
+
+QLabel#CanvasBadge {
+    color: #F7F9FC;
     font-size: 12px;
-    background: transparent;
-    border: none;
+    font-weight: 700;
+    background: rgba(24, 35, 48, 190);
+    border: 1px solid rgba(93, 112, 130, 180);
+    border-radius: 10px;
+    padding: 4px 8px;
 }
 
-QLabel#PathValue,
-QLabel#OutputValue {
-    color: #24313D;
-    background: transparent;
-    border: none;
+QPushButton#CanvasControlButton {
+    background: rgba(24, 35, 48, 210);
+    color: #F7F9FC;
+    border: 1px solid rgba(96, 114, 130, 180);
+    border-radius: 10px;
+    padding: 4px 8px;
+    font-weight: 700;
 }
 
-QFrame#MetricCard {
-    background: #F5F0E7;
-    border: 1px solid #E3D8C9;
+QPushButton#CanvasControlButton:hover {
+    background: rgba(34, 48, 64, 225);
+}
+
+QToolButton#ChannelChip {
+    background: rgba(24, 35, 48, 210);
+    color: #DCE6F0;
+    border: 1px solid rgba(96, 114, 130, 180);
+    border-radius: 10px;
+    padding: 4px 8px;
+    font-weight: 700;
+}
+
+QToolButton#ChannelChip:hover {
+    background: rgba(34, 48, 64, 225);
+}
+
+QToolButton#ChannelChip:checked {
+    background: #F3E2C6;
+    color: #192430;
+    border: 1px solid #E4C99E;
+}
+
+QFrame#InspectorRow {
+    background: #F6F2EA;
+    border: 1px solid #E1D7C9;
     border-radius: 14px;
 }
 
-QLabel#MetricLabel {
-    color: #7B828A;
+QFrame#InspectorCompactRow {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+}
+
+QLabel#InspectorKey {
+    color: #7A8087;
     font-size: 11px;
+    font-weight: 700;
+    background: transparent;
+    border: none;
+}
+
+QLabel#InspectorValue {
+    color: #182430;
+    font-size: 13px;
     font-weight: 600;
     background: transparent;
     border: none;
 }
 
-QLabel#MetricValue {
-    color: #182430;
-    font-size: 16px;
+QLabel#InspectorInlineKey {
+    color: #6E7A86;
+    font-size: 11px;
     font-weight: 700;
+    background: transparent;
+    border: none;
+}
+
+QLabel#InspectorInlineValue {
+    color: #182430;
+    font-size: 13px;
+    font-weight: 600;
     background: transparent;
     border: none;
 }
@@ -172,6 +236,13 @@ QPushButton#DangerButton {
     background: #FFF3EE;
     color: #A73D2F;
     border: 1px solid #EFC2B8;
+}
+
+QPushButton#GhostButton {
+    background: #FCFBF8;
+    color: #324150;
+    border: 1px solid #D8D0C4;
+    padding: 6px 10px;
 }
 
 QCheckBox,

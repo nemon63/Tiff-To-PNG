@@ -2,20 +2,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QCloseEvent,
     QDragEnterEvent,
     QDropEvent,
     QImage,
+    QKeySequence,
     QPainter,
     QPixmap,
+    QShortcut,
+    QWheelEvent,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -36,6 +39,7 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -590,56 +594,176 @@ class QueuePanel(QWidget):
 
 
 class PreviewCanvas(QFrame):
+    zoom_changed = pyqtSignal(float)
+    stage_rect_changed = pyqtSignal(QRect)
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._source_pixmap: QPixmap | None = None
-        self._placeholder_text = "Выберите текстуру из очереди, чтобы открыть preview stage."
-        self.setMinimumHeight(320)
+        self._placeholder_text = "Выберите текстуру из очереди, чтобы открыть preview."
+        self._zoom_factor = 1.0
+        self._padding = 14
+        self._min_zoom = 0.5
+        self._max_zoom = 8.0
+        self._pan_offset = QPointF(0.0, 0.0)
+        self._drag_origin: QPoint | None = None
+        self._drag_offset_origin = QPointF(0.0, 0.0)
+        self.setMinimumSize(360, 360)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
 
-    def set_preview_pixmap(self, pixmap: QPixmap) -> None:
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return width
+
+    def sizeHint(self) -> QSize:
+        return QSize(460, 460)
+
+    def set_preview_pixmap(self, pixmap: QPixmap, *, preserve_zoom: bool = True) -> None:
         self._source_pixmap = pixmap
+        if not preserve_zoom:
+            self._zoom_factor = 1.0
+            self._pan_offset = QPointF(0.0, 0.0)
+        self._normalize_pan_offset()
+        self._update_cursor()
+        self._emit_zoom_changed()
         self.update()
 
-    def clear_preview(self, text: str = "Выберите текстуру из очереди, чтобы открыть preview stage.") -> None:
+    def clear_preview(self, text: str = "Выберите текстуру из очереди, чтобы открыть preview.") -> None:
         self._source_pixmap = None
         self._placeholder_text = text
+        self._zoom_factor = 1.0
+        self._pan_offset = QPointF(0.0, 0.0)
+        self._drag_origin = None
+        self._update_cursor()
+        self._emit_zoom_changed()
         self.update()
+
+    def reset_zoom(self) -> None:
+        self._zoom_factor = 1.0
+        self._pan_offset = QPointF(0.0, 0.0)
+        self._update_cursor()
+        self._emit_zoom_changed()
+        self.update()
+
+    def change_zoom(self, steps: float) -> None:
+        if self._source_pixmap is None or steps == 0:
+            return
+
+        scale_step = 1.15 ** steps
+        next_zoom = max(self._min_zoom, min(self._max_zoom, self._zoom_factor * scale_step))
+        if abs(next_zoom - self._zoom_factor) < 0.001:
+            return
+
+        self._zoom_factor = next_zoom
+        if self._zoom_factor <= 1.0:
+            self._pan_offset = QPointF(0.0, 0.0)
+        self._normalize_pan_offset()
+        self._update_cursor()
+        self._emit_zoom_changed()
+        self.update()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.change_zoom(event.angleDelta().y() / 120.0)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.reset_zoom()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton and self._can_pan():
+            self._drag_origin = event.position().toPoint()
+            self._drag_offset_origin = QPointF(self._pan_offset)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_origin is not None and self._source_pixmap is not None:
+            delta = event.position().toPoint() - self._drag_origin
+            self._pan_offset = QPointF(
+                self._drag_offset_origin.x() + delta.x(),
+                self._drag_offset_origin.y() + delta.y(),
+            )
+            self._normalize_pan_offset()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton and self._drag_origin is not None:
+            self._drag_origin = None
+            self._update_cursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._normalize_pan_offset()
+        self._update_cursor()
+        self.stage_rect_changed.emit(self.stage_rect())
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        frame_rect = self.rect().adjusted(1, 1, -1, -1)
+        frame_rect = self.stage_rect()
         painter.setPen(QColor("#31404D"))
         painter.setBrush(QColor("#1C232B"))
         painter.drawRoundedRect(frame_rect, 18, 18)
 
-        inner_rect = frame_rect.adjusted(22, 22, -22, -22)
-        if inner_rect.width() <= 0 or inner_rect.height() <= 0:
+        square_rect = frame_rect.adjusted(self._padding, self._padding, -self._padding, -self._padding)
+        if square_rect.width() <= 0 or square_rect.height() <= 0:
             return
 
-        self._draw_checkerboard(painter, inner_rect)
+        self._draw_checkerboard(painter, square_rect)
 
         if self._source_pixmap is None:
             painter.setPen(QColor("#8F9CAA"))
             painter.drawText(
-                inner_rect,
+                square_rect.adjusted(20, 20, -20, -20),
                 Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
                 self._placeholder_text,
             )
             return
 
+        target_width, target_height = self._scaled_target_size(square_rect)
         scaled = self._source_pixmap.scaled(
-            inner_rect.size(),
+            target_width,
+            target_height,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        x = inner_rect.x() + (inner_rect.width() - scaled.width()) // 2
-        y = inner_rect.y() + (inner_rect.height() - scaled.height()) // 2
-        painter.drawPixmap(x, y, scaled)
 
-    def _draw_checkerboard(self, painter: QPainter, rect) -> None:
+        x = square_rect.center().x() - scaled.width() // 2 + round(self._pan_offset.x())
+        y = square_rect.center().y() - scaled.height() // 2 + round(self._pan_offset.y())
+        painter.save()
+        painter.setClipRect(square_rect)
+        painter.drawPixmap(x, y, scaled)
+        painter.restore()
+
+    def _square_stage_rect(self, frame_rect: QRect) -> QRect:
+        side = max(0, min(frame_rect.width(), frame_rect.height()))
+        x = frame_rect.x() + (frame_rect.width() - side) // 2
+        y = frame_rect.y() + (frame_rect.height() - side) // 2
+        return QRect(x, y, side, side)
+
+    def stage_rect(self) -> QRect:
+        return self._square_stage_rect(self.rect().adjusted(1, 1, -1, -1))
+
+    def _draw_checkerboard(self, painter: QPainter, rect: QRect) -> None:
         tile_size = 18
         light_color = QColor("#34414C")
         dark_color = QColor("#29333D")
@@ -651,26 +775,112 @@ class PreviewCanvas(QFrame):
                 color = light_color if (row_index + column_index) % 2 == 0 else dark_color
                 painter.fillRect(left, top, tile_size, tile_size, color)
 
+    def _emit_zoom_changed(self) -> None:
+        self.zoom_changed.emit(self._zoom_factor)
 
-class MetricTile(QFrame):
-    def __init__(self, label_text: str, parent: QWidget | None = None):
+    def _scaled_target_size(self, square_rect: QRect) -> tuple[int, int]:
+        if self._source_pixmap is None:
+            return (0, 0)
+
+        base_scale = min(
+            square_rect.width() / max(self._source_pixmap.width(), 1),
+            square_rect.height() / max(self._source_pixmap.height(), 1),
+        )
+        target_width = max(1, round(self._source_pixmap.width() * base_scale * self._zoom_factor))
+        target_height = max(1, round(self._source_pixmap.height() * base_scale * self._zoom_factor))
+        return (target_width, target_height)
+
+    def _can_pan(self) -> bool:
+        if self._source_pixmap is None or self._zoom_factor <= 1.0:
+            return False
+
+        viewport_rect = self._square_stage_rect(self.rect().adjusted(1, 1, -1, -1)).adjusted(
+            self._padding,
+            self._padding,
+            -self._padding,
+            -self._padding,
+        )
+        target_width, target_height = self._scaled_target_size(viewport_rect)
+        return target_width > viewport_rect.width() or target_height > viewport_rect.height()
+
+    def _normalize_pan_offset(self) -> None:
+        if self._source_pixmap is None:
+            self._pan_offset = QPointF(0.0, 0.0)
+            return
+
+        viewport_rect = self._square_stage_rect(self.rect().adjusted(1, 1, -1, -1)).adjusted(
+            self._padding,
+            self._padding,
+            -self._padding,
+            -self._padding,
+        )
+        if viewport_rect.width() <= 0 or viewport_rect.height() <= 0:
+            self._pan_offset = QPointF(0.0, 0.0)
+            return
+
+        target_width, target_height = self._scaled_target_size(viewport_rect)
+        max_offset_x = max(0.0, (target_width - viewport_rect.width()) / 2)
+        max_offset_y = max(0.0, (target_height - viewport_rect.height()) / 2)
+        self._pan_offset = QPointF(
+            min(max(self._pan_offset.x(), -max_offset_x), max_offset_x),
+            min(max(self._pan_offset.y(), -max_offset_y), max_offset_y),
+        )
+
+    def _update_cursor(self) -> None:
+        if self._drag_origin is not None:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        if self._can_pan():
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
+        self.unsetCursor()
+
+
+class InspectorField(QFrame):
+    def __init__(
+        self,
+        title: str,
+        parent: QWidget | None = None,
+        *,
+        compact: bool = False,
+        wrap_value: bool = True,
+        inline: bool = False,
+    ):
         super().__init__(parent)
-        self.setObjectName("MetricCard")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(2)
+        self.setObjectName("InspectorCompactRow" if compact else "InspectorRow")
+        if inline:
+            layout = QHBoxLayout(self)
+            if compact:
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(6)
+            else:
+                layout.setContentsMargins(12, 8, 12, 8)
+                layout.setSpacing(10)
+        else:
+            layout = QVBoxLayout(self)
+            if compact:
+                layout.setContentsMargins(10, 8, 10, 8)
+                layout.setSpacing(2)
+            else:
+                layout.setContentsMargins(12, 10, 12, 10)
+                layout.setSpacing(4)
 
-        label = QLabel(label_text)
-        label.setObjectName("MetricLabel")
-        layout.addWidget(label)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("InspectorInlineKey" if inline else "InspectorKey")
+        layout.addWidget(self.title_label)
 
         self.value_label = QLabel("-")
-        self.value_label.setObjectName("MetricValue")
-        self.value_label.setWordWrap(True)
-        layout.addWidget(self.value_label)
+        self.value_label.setObjectName("InspectorInlineValue" if inline else "InspectorValue")
+        self.value_label.setWordWrap(wrap_value)
+        self.value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        if inline:
+            layout.addWidget(self.value_label, 1)
+        else:
+            layout.addWidget(self.value_label)
 
     def set_value(self, text: str) -> None:
         self.value_label.setText(text)
+        self.value_label.setToolTip(text)
 
 
 class PreviewPanel(QWidget):
@@ -678,77 +888,97 @@ class PreviewPanel(QWidget):
         super().__init__(parent)
         self._preview_service = TexturePreviewService()
         self._current_item: QueueItem | None = None
+        self._selected_channel = PreviewChannel.COMPOSITE
+        self._channel_buttons: dict[PreviewChannel, QToolButton] = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
+        self.setMinimumHeight(220)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(8)
 
-        header_row = QHBoxLayout()
-        title_stack = QVBoxLayout()
-
-        title_label = QLabel("Preview Stage")
+        title_label = QLabel("Texture Preview")
         title_label.setObjectName("PanelTitle")
-        title_stack.addWidget(title_label)
-
-        subtitle_label = QLabel("Просмотр по каналам и быстрый визуальный контроль текстуры.")
-        subtitle_label.setObjectName("PanelSubtitle")
-        subtitle_label.setWordWrap(True)
-        title_stack.addWidget(subtitle_label)
-
-        header_row.addLayout(title_stack, 1)
-
-        channel_stack = QVBoxLayout()
-        channel_label = QLabel("Активный канал")
-        channel_label.setObjectName("SummaryText")
-        channel_stack.addWidget(channel_label)
-
-        self.channel_combo = QComboBox()
-        self.channel_combo.currentIndexChanged.connect(self._refresh_preview)
-        channel_stack.addWidget(self.channel_combo)
-        header_row.addLayout(channel_stack)
-
-        layout.addLayout(header_row)
+        layout.addWidget(title_label)
 
         self.preview_canvas = PreviewCanvas()
+        self.preview_canvas.zoom_changed.connect(self._update_zoom_label)
+        self.preview_canvas.stage_rect_changed.connect(self._layout_canvas_controls)
         layout.addWidget(self.preview_canvas, 1)
+        self._build_canvas_controls()
 
         self.asset_label = QLabel("Ничего не выбрано")
-        self.asset_label.setObjectName("AssetName")
-        self.asset_label.setWordWrap(True)
+        self.asset_label.setObjectName("PreviewFileName")
+        self.asset_label.setWordWrap(False)
         layout.addWidget(self.asset_label)
 
-        self.asset_meta_label = QLabel(
-            "Выберите строку в очереди, чтобы оценить форму, alpha и отдельные каналы."
-        )
-        self.asset_meta_label.setObjectName("SummaryText")
-        self.asset_meta_label.setWordWrap(True)
+        self.asset_meta_label = QLabel("Выберите строку в очереди, чтобы открыть превью текстуры.")
+        self.asset_meta_label.setObjectName("PreviewMetaText")
+        self.asset_meta_label.setWordWrap(False)
         layout.addWidget(self.asset_meta_label)
 
+        self.fit_shortcut = QShortcut(QKeySequence("F"), self)
+        self.fit_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.fit_shortcut.activated.connect(self.preview_reset_requested)
+
+    def _build_canvas_controls(self) -> None:
+        self.fit_overlay_button = QPushButton("F", self.preview_canvas)
+        self.fit_overlay_button.setObjectName("CanvasControlButton")
+        self.fit_overlay_button.setToolTip("Fit: сбросить масштаб до 100%")
+        self.fit_overlay_button.clicked.connect(self.preview_reset_requested)
+
+        self.zoom_label = QLabel("100%", self.preview_canvas)
+        self.zoom_label.setObjectName("CanvasBadge")
+
+        self.channel_host = QWidget(self.preview_canvas)
+        channel_layout = QHBoxLayout(self.channel_host)
+        channel_layout.setContentsMargins(0, 0, 0, 0)
+        channel_layout.setSpacing(4)
+
+        self.channel_group = QButtonGroup(self)
+        self.channel_group.setExclusive(True)
+        channel_specs = (
+            (PreviewChannel.COMPOSITE, "RGB"),
+            (PreviewChannel.RED, "R"),
+            (PreviewChannel.GREEN, "G"),
+            (PreviewChannel.BLUE, "B"),
+            (PreviewChannel.ALPHA, "A"),
+        )
+        for channel, label in channel_specs:
+            button = QToolButton(self.channel_host)
+            button.setObjectName("ChannelChip")
+            button.setText(label)
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, current=channel: self._set_selected_channel(current))
+            self.channel_group.addButton(button)
+            channel_layout.addWidget(button)
+            self._channel_buttons[channel] = button
+
+        self._sync_channel_buttons([])
+        self._layout_canvas_controls(self.preview_canvas.stage_rect())
+
+    def preview_reset_requested(self) -> None:
+        self.preview_canvas.reset_zoom()
+
     def set_queue_item(self, item: QueueItem | None) -> None:
+        previous_path = self._current_item.path if self._current_item is not None else None
+        next_path = item.path if item is not None else None
         self._current_item = item
         self._rebuild_channels(item)
+        if previous_path != next_path:
+            self.preview_canvas.reset_zoom()
         self._refresh_preview()
 
     def _rebuild_channels(self, item: QueueItem | None) -> None:
-        current_channel = self.channel_combo.currentData()
-        self.channel_combo.blockSignals(True)
-        self.channel_combo.clear()
-
         channels = self._available_channels(item)
-        for channel in channels:
-            self.channel_combo.addItem(_preview_channel_label(channel), channel)
-
-        self.channel_combo.setEnabled(bool(channels))
-
-        if current_channel in channels:
-            self.channel_combo.setCurrentIndex(channels.index(current_channel))
-        elif channels:
-            self.channel_combo.setCurrentIndex(0)
-
-        self.channel_combo.blockSignals(False)
+        if self._selected_channel not in channels:
+            self._selected_channel = PreviewChannel.COMPOSITE if PreviewChannel.COMPOSITE in channels else (
+                channels[0] if channels else PreviewChannel.COMPOSITE
+            )
+        self._sync_channel_buttons(channels)
 
     def _available_channels(self, item: QueueItem | None) -> list[PreviewChannel]:
         if item is None or item.metadata is None or item.status is QueueStatus.ERROR:
@@ -759,7 +989,6 @@ class PreviewPanel(QWidget):
             PreviewChannel.RED,
             PreviewChannel.GREEN,
             PreviewChannel.BLUE,
-            PreviewChannel.LUMA,
         ]
         if item.metadata.has_alpha:
             channels.append(PreviewChannel.ALPHA)
@@ -770,49 +999,107 @@ class PreviewPanel(QWidget):
         if item is None:
             self.preview_canvas.clear_preview()
             self._update_footer(item)
+            self._sync_control_state(False)
             return
 
         if item.status is QueueStatus.ERROR:
             self.preview_canvas.clear_preview("Предпросмотр недоступен для поврежденного или неподдерживаемого файла.")
             self._update_footer(item)
+            self._sync_control_state(False)
             return
 
-        if self.channel_combo.count() == 0:
+        if not self._available_channels(item):
             self.preview_canvas.clear_preview("Нет доступных каналов для предпросмотра.")
             self._update_footer(item)
+            self._sync_control_state(False)
             return
 
         try:
-            channel = self.channel_combo.currentData()
-            if channel is None:
-                channel = PreviewChannel.COMPOSITE
-            preview_image = self._preview_service.render(item.path, channel)
+            preview_image = self._preview_service.render(item.path, self._selected_channel)
             preview_pixmap = QPixmap.fromImage(_qimage_from_pil(preview_image))
-            self.preview_canvas.set_preview_pixmap(preview_pixmap)
+            self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=True)
         except Exception as exc:
             self.preview_canvas.clear_preview(f"Ошибка предпросмотра: {exc}")
+            self._sync_control_state(False)
+            self._update_footer(item)
+            return
 
+        self._sync_control_state(True)
         self._update_footer(item)
 
     def _update_footer(self, item: QueueItem | None) -> None:
         if item is None:
             self.asset_label.setText("Ничего не выбрано")
-            self.asset_meta_label.setText(
-                "Выберите строку в очереди, чтобы оценить форму, alpha и отдельные каналы."
-            )
+            self.asset_meta_label.setText("Выберите строку в очереди, чтобы открыть превью текстуры.")
             return
 
         self.asset_label.setText(item.path.name)
+        self.asset_label.setToolTip(str(item.path))
         metadata = item.metadata
         if metadata is None:
             self.asset_meta_label.setText(item.message or "Метаданные недоступны.")
             return
 
-        channel_name = self.channel_combo.currentText() or "RGB"
+        channel_name = _preview_channel_label(self._selected_channel)
         alpha_state = "alpha" if metadata.has_alpha else "opaque"
         self.asset_meta_label.setText(
             f"{metadata.format_name} · {metadata.resolution_text} · {metadata.mode} · канал: {channel_name} · {alpha_state}"
         )
+        self.asset_meta_label.setToolTip(self.asset_meta_label.text())
+
+    def _update_zoom_label(self, zoom_factor: float) -> None:
+        self.zoom_label.setText(f"{round(zoom_factor * 100)}%")
+        self.zoom_label.adjustSize()
+        self._layout_canvas_controls(self.preview_canvas.stage_rect())
+
+    def _set_selected_channel(self, channel: PreviewChannel) -> None:
+        if channel == self._selected_channel:
+            return
+        self._selected_channel = channel
+        self._sync_channel_buttons(self._available_channels(self._current_item))
+        self._refresh_preview()
+
+    def _sync_channel_buttons(self, channels: list[PreviewChannel]) -> None:
+        for channel, button in self._channel_buttons.items():
+            available = channel in channels
+            button.setVisible(available)
+            button.setEnabled(available)
+            button.blockSignals(True)
+            button.setChecked(available and channel == self._selected_channel)
+            button.blockSignals(False)
+
+        self.channel_host.setVisible(bool(channels))
+        self.fit_overlay_button.setEnabled(bool(channels))
+        self._layout_canvas_controls(self.preview_canvas.stage_rect())
+
+    def _sync_control_state(self, enabled: bool) -> None:
+        self.fit_overlay_button.setEnabled(enabled)
+        if not enabled:
+            self.preview_canvas.reset_zoom()
+
+    def _layout_canvas_controls(self, stage_rect: QRect) -> None:
+        if stage_rect.width() <= 0 or stage_rect.height() <= 0:
+            return
+
+        margin = 14
+        top = stage_rect.top() + margin
+        left = stage_rect.left() + margin
+
+        self.fit_overlay_button.adjustSize()
+        fit_height = 30
+        fit_width = max(32, self.fit_overlay_button.sizeHint().width())
+        self.fit_overlay_button.resize(fit_width, fit_height)
+        self.fit_overlay_button.move(left, top)
+
+        self.zoom_label.adjustSize()
+        zoom_x = self.fit_overlay_button.x() + self.fit_overlay_button.width() + 8
+        zoom_y = top + max(0, (fit_height - self.zoom_label.height()) // 2)
+        self.zoom_label.move(zoom_x, zoom_y)
+
+        self.channel_host.adjustSize()
+        channel_x = stage_rect.right() - margin - self.channel_host.width()
+        channel_y = top
+        self.channel_host.move(max(left, channel_x), channel_y)
 
 
 class MetadataPanel(QWidget):
@@ -822,97 +1109,101 @@ class MetadataPanel(QWidget):
 
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
+        self.setMinimumHeight(170)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
 
+        header_row = QHBoxLayout()
         title_label = QLabel("Asset Inspector")
         title_label.setObjectName("PanelTitle")
-        layout.addWidget(title_label)
+        header_row.addWidget(title_label)
+        header_row.addStretch(1)
+        layout.addLayout(header_row)
 
-        subtitle_label = QLabel("Технический срез выбранной текстуры и preflight-предупреждения.")
-        subtitle_label.setObjectName("PanelSubtitle")
-        subtitle_label.setWordWrap(True)
-        layout.addWidget(subtitle_label)
+        self.asset_name_label = QLabel("Ничего не выбрано")
+        self.asset_name_label.setObjectName("AssetName")
+        self.asset_name_label.setWordWrap(True)
+        layout.addWidget(self.asset_name_label)
 
-        path_caption = QLabel("Исходный файл")
-        path_caption.setObjectName("PathCaption")
-        layout.addWidget(path_caption)
-
-        self.path_label = QLabel("-")
-        self.path_label.setObjectName("PathValue")
-        self.path_label.setWordWrap(True)
-        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.path_label)
+        self.source_field = InspectorField("Исходный файл", compact=True, wrap_value=False, inline=True)
+        layout.addWidget(self.source_field)
 
         metrics_grid = QGridLayout()
-        metrics_grid.setHorizontalSpacing(10)
-        metrics_grid.setVerticalSpacing(10)
+        metrics_grid.setHorizontalSpacing(8)
+        metrics_grid.setVerticalSpacing(6)
+        self.format_field = InspectorField("Формат", compact=True, wrap_value=False, inline=True)
+        self.resolution_field = InspectorField("Разрешение", compact=True, wrap_value=False, inline=True)
+        self.mode_field = InspectorField("Режим", compact=True, wrap_value=False, inline=True)
+        self.alpha_field = InspectorField("Alpha", compact=True, wrap_value=False, inline=True)
+        self.frames_field = InspectorField("Кадры", compact=True, wrap_value=False, inline=True)
+        self.size_field = InspectorField("Размер", compact=True, wrap_value=False, inline=True)
 
-        self.format_tile = MetricTile("Формат")
-        self.resolution_tile = MetricTile("Разрешение")
-        self.mode_tile = MetricTile("Режим")
-        self.alpha_tile = MetricTile("Alpha")
-        self.frames_tile = MetricTile("Кадры")
-        self.size_tile = MetricTile("Размер")
-
-        metric_tiles = (
-            self.format_tile,
-            self.resolution_tile,
-            self.mode_tile,
-            self.alpha_tile,
-            self.frames_tile,
-            self.size_tile,
+        metric_fields = (
+            self.format_field,
+            self.resolution_field,
+            self.mode_field,
+            self.alpha_field,
+            self.frames_field,
+            self.size_field,
         )
-        for index, tile in enumerate(metric_tiles):
-            metrics_grid.addWidget(tile, index // 2, index % 2)
-
+        for index, field in enumerate(metric_fields):
+            metrics_grid.addWidget(field, index // 3, index % 3)
         layout.addLayout(metrics_grid)
 
-        output_caption = QLabel("Выходной PNG")
-        output_caption.setObjectName("OutputCaption")
-        layout.addWidget(output_caption)
-
-        self.output_label = QLabel("Будет рассчитан после выбора выходной папки.")
-        self.output_label.setObjectName("OutputValue")
-        self.output_label.setWordWrap(True)
-        self.output_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.output_label)
+        self.output_field = InspectorField("Выходной PNG", compact=True, wrap_value=False, inline=True)
+        layout.addWidget(self.output_field)
 
         self.warning_label = QLabel("")
         self.warning_label.setObjectName("WarningBanner")
         self.warning_label.setWordWrap(True)
         self.warning_label.hide()
         layout.addWidget(self.warning_label)
-        layout.addStretch(1)
 
     def set_queue_item(self, item: QueueItem | None) -> None:
         if item is None:
-            self.path_label.setText("-")
-            self.output_label.setText("Будет рассчитан после выбора выходной папки.")
-            self._set_metric_values("-", "-", "-", "-", "-", "-")
+            self.asset_name_label.setText("Ничего не выбрано")
+            self._set_values(
+                source="-",
+                format_value="-",
+                resolution="-",
+                mode="-",
+                alpha="-",
+                frames="-",
+                size="-",
+                output="Будет рассчитан после выбора выходной папки.",
+            )
             self.warning_label.hide()
             return
 
-        self.path_label.setText(str(item.path))
-        self.output_label.setText(
-            str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом."
-        )
-
+        self.asset_name_label.setText(item.path.name)
         metadata = item.metadata
+
         if metadata is None:
-            self._set_metric_values("-", "-", "-", "-", "-", "-")
+            self._set_values(
+                source=str(item.path),
+                format_value="-",
+                resolution="-",
+                mode="-",
+                alpha="-",
+                frames="-",
+                size="-",
+                output=str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом.",
+            )
             self.warning_label.setText(item.message or "Не удалось прочитать метаданные.")
             self.warning_label.show()
             return
 
-        self._set_metric_values(
-            metadata.format_name,
-            metadata.resolution_text,
-            metadata.mode,
-            "Да" if metadata.has_alpha else "Нет",
-            str(metadata.frame_count),
-            metadata.size_text,
+        self._set_values(
+            source=str(item.path),
+            format_value=metadata.format_name,
+            resolution=metadata.resolution_text,
+            mode=metadata.mode,
+            alpha="Да" if metadata.has_alpha else "Нет",
+            frames=str(metadata.frame_count),
+            size=metadata.size_text,
+            output=str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом.",
         )
 
         warnings: list[str] = list(metadata.warnings)
@@ -927,21 +1218,26 @@ class MetadataPanel(QWidget):
 
         self.warning_label.hide()
 
-    def _set_metric_values(
+    def _set_values(
         self,
+        *,
+        source: str,
         format_value: str,
-        resolution_value: str,
-        mode_value: str,
-        alpha_value: str,
-        frames_value: str,
-        size_value: str,
+        resolution: str,
+        mode: str,
+        alpha: str,
+        frames: str,
+        size: str,
+        output: str,
     ) -> None:
-        self.format_tile.set_value(format_value)
-        self.resolution_tile.set_value(resolution_value)
-        self.mode_tile.set_value(mode_value)
-        self.alpha_tile.set_value(alpha_value)
-        self.frames_tile.set_value(frames_value)
-        self.size_tile.set_value(size_value)
+        self.source_field.set_value(source)
+        self.format_field.set_value(format_value)
+        self.resolution_field.set_value(resolution)
+        self.mode_field.set_value(mode)
+        self.alpha_field.set_value(alpha)
+        self.frames_field.set_value(frames)
+        self.size_field.set_value(size)
+        self.output_field.set_value(output)
 
 
 class LogPanel(QWidget):
@@ -1028,26 +1324,26 @@ class MainWindow(QMainWindow):
         self.metadata_panel = MetadataPanel()
         self.log_panel = LogPanel()
 
-        self.inspector_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.inspector_splitter.addWidget(self.metadata_panel)
-        self.inspector_splitter.addWidget(self.log_panel)
-        self.inspector_splitter.setChildrenCollapsible(False)
-        self.inspector_splitter.setStretchFactor(0, 3)
-        self.inspector_splitter.setStretchFactor(1, 2)
-
-        self.detail_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.detail_splitter.addWidget(self.preview_panel)
-        self.detail_splitter.addWidget(self.inspector_splitter)
+        self.detail_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.detail_splitter.addWidget(self.queue_panel)
+        self.detail_splitter.addWidget(self.log_panel)
         self.detail_splitter.setChildrenCollapsible(False)
         self.detail_splitter.setStretchFactor(0, 3)
         self.detail_splitter.setStretchFactor(1, 2)
 
-        self.workspace_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.workspace_splitter.addWidget(self.queue_panel)
+        self.inspector_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.inspector_splitter.addWidget(self.preview_panel)
+        self.inspector_splitter.addWidget(self.metadata_panel)
+        self.inspector_splitter.setChildrenCollapsible(False)
+        self.inspector_splitter.setStretchFactor(0, 4)
+        self.inspector_splitter.setStretchFactor(1, 3)
+
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.workspace_splitter.addWidget(self.detail_splitter)
+        self.workspace_splitter.addWidget(self.inspector_splitter)
         self.workspace_splitter.setChildrenCollapsible(False)
         self.workspace_splitter.setStretchFactor(0, 3)
-        self.workspace_splitter.setStretchFactor(1, 4)
+        self.workspace_splitter.setStretchFactor(1, 2)
 
         workspace_card = QFrame()
         workspace_card.setObjectName("WorkspaceCard")
@@ -1060,7 +1356,7 @@ class MainWindow(QMainWindow):
         workspace_layout.addWidget(workspace_title)
 
         workspace_subtitle = QLabel(
-            "Очередь, preview-stage и preflight-анализ собраны в одном рабочем полотне."
+            "Середина отвечает за intake и лог, правая колонка за square-preview и техинспекцию."
         )
         workspace_subtitle.setObjectName("PanelSubtitle")
         workspace_subtitle.setWordWrap(True)
@@ -1419,7 +1715,7 @@ class MainWindow(QMainWindow):
         self.queue_panel.table.selectRow(target_row)
 
     def _apply_default_splitter_sizes(self) -> None:
-        self.main_splitter.setSizes([360, 880])
-        self.workspace_splitter.setSizes([240, 390])
-        self.detail_splitter.setSizes([540, 300])
-        self.inspector_splitter.setSizes([230, 150])
+        self.main_splitter.setSizes([340, 940])
+        self.workspace_splitter.setSizes([500, 440])
+        self.detail_splitter.setSizes([420, 220])
+        self.inspector_splitter.setSizes([500, 190])

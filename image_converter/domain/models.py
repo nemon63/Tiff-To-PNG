@@ -173,7 +173,7 @@ class AppSettings:
     options: ConversionOptions = field(default_factory=ConversionOptions)
     window_width: int = 1280
     window_height: int = 820
-    splitter_sizes: tuple[int, int] = (360, 880)
-    workspace_splitter_sizes: tuple[int, int] = (240, 390)
-    detail_splitter_sizes: tuple[int, int] = (540, 300)
-    inspector_splitter_sizes: tuple[int, int] = (230, 150)
+    splitter_sizes: tuple[int, int] = (340, 940)
+    workspace_splitter_sizes: tuple[int, int] = (500, 440)
+    detail_splitter_sizes: tuple[int, int] = (420, 220)
+    inspector_splitter_sizes: tuple[int, int] = (500, 190)

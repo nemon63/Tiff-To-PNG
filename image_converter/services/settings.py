@@ -6,6 +6,8 @@ from typing import Any
 
 from image_converter.domain.models import AppSettings, ConversionOptions, ResizeMode
 
+LAYOUT_VERSION = 3
+
 
 class AppSettingsRepository:
     def __init__(self, path: Path):
@@ -51,6 +53,7 @@ class AppSettingsRepository:
                 "dither": settings.options.dither,
             },
             "window": {
+                "layout_version": LAYOUT_VERSION,
                 "width": settings.window_width,
                 "height": settings.window_height,
                 "splitter_sizes": list(settings.splitter_sizes),
@@ -63,6 +66,7 @@ class AppSettingsRepository:
     def _deserialize(self, data: dict[str, Any]) -> AppSettings:
         options_data = data.get("options", {})
         window_data = data.get("window", {})
+        use_saved_layout = self._coerce_int(window_data.get("layout_version"), 0) == LAYOUT_VERSION
 
         try:
             resize_mode = ResizeMode(options_data.get("resize_mode", ResizeMode.NONE.value))
@@ -88,18 +92,21 @@ class AppSettingsRepository:
             ),
             window_width=self._coerce_int(window_data.get("width"), 1280),
             window_height=self._coerce_int(window_data.get("height"), 820),
-            splitter_sizes=self._coerce_pair(window_data.get("splitter_sizes"), (420, 740)),
+            splitter_sizes=self._coerce_pair(
+                window_data.get("splitter_sizes") if use_saved_layout else None,
+                (340, 940),
+            ),
             workspace_splitter_sizes=self._coerce_pair(
-                window_data.get("workspace_splitter_sizes"),
-                (240, 390),
+                window_data.get("workspace_splitter_sizes") if use_saved_layout else None,
+                (500, 440),
             ),
             detail_splitter_sizes=self._coerce_pair(
-                window_data.get("detail_splitter_sizes"),
-                (540, 300),
+                window_data.get("detail_splitter_sizes") if use_saved_layout else None,
+                (420, 220),
             ),
             inspector_splitter_sizes=self._coerce_pair(
-                window_data.get("inspector_splitter_sizes"),
-                (230, 150),
+                window_data.get("inspector_splitter_sizes") if use_saved_layout else None,
+                (500, 190),
             ),
         )
 
