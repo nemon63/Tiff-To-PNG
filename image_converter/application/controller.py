@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import QObject, QThread
 
 from image_converter.application.worker import BatchConversionWorker
 from image_converter.domain.errors import ValidationError
-from image_converter.domain.models import BatchSummary
+from image_converter.domain.models import BatchSummary, ConversionStatus, QueueStatus
+from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.validation import validate_request
 from image_converter.ui.main_window import MainWindow
@@ -15,10 +18,28 @@ class ConversionController(QObject):
         super().__init__(window)
         self._window = window
         self._service = service
+        self._scanner = AssetScanner()
         self._thread: QThread | None = None
         self._worker: BatchConversionWorker | None = None
 
         self._window.convert_requested.connect(self.start_conversion)
+        self._window.queue_paths_received.connect(self.add_paths_to_queue)
+
+    def add_paths_to_queue(self, raw_paths: list[str]) -> None:
+        paths = [Path(raw_path) for raw_path in raw_paths]
+        scan_result = self._scanner.scan_paths(
+            paths,
+            recursive=self._window.queue_recursive_enabled(),
+        )
+        self._window.add_queue_items(list(scan_result.items))
+
+        for message in scan_result.ignored_messages:
+            self._window.append_log(message)
+
+        if scan_result.items:
+            self._window.set_status(f"Добавлено в очередь: {len(scan_result.items)}")
+        elif scan_result.ignored_messages:
+            self._window.set_status("Поддерживаемые файлы не найдены")
 
     def start_conversion(self) -> None:
         if self._thread is not None:
@@ -38,6 +59,7 @@ class ConversionController(QObject):
         self._window.append_log("---- Старт конвертации ----")
         self._window.set_status("Конвертация...")
         self._window.set_running(True)
+        self._window.reset_queue_statuses_for_run()
 
         self._thread = QThread(self)
         self._worker = BatchConversionWorker(self._service, request)
@@ -45,6 +67,8 @@ class ConversionController(QObject):
 
         self._thread.started.connect(self._worker.run)
         self._worker.log_message.connect(self._window.append_log)
+        self._worker.item_started.connect(self._on_item_started)
+        self._worker.item_completed.connect(self._on_item_completed)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.completed.connect(self._thread.quit)
@@ -66,6 +90,23 @@ class ConversionController(QObject):
         self._window.set_status("Ошибка")
         self._window.set_running(False)
         self._window.show_error("Ошибка", message)
+
+    def _on_item_started(self, raw_path: str) -> None:
+        self._window.set_queue_item_running(Path(raw_path))
+
+    def _on_item_completed(self, result) -> None:
+        status_mapping = {
+            ConversionStatus.SUCCESS: QueueStatus.DONE,
+            ConversionStatus.SKIPPED: QueueStatus.SKIPPED,
+            ConversionStatus.FAILED: QueueStatus.ERROR,
+        }
+        queue_status = status_mapping.get(result.status, QueueStatus.ERROR)
+        self._window.set_queue_item_result(
+            result.source,
+            status=queue_status,
+            message=result.message,
+            destination=result.destination,
+        )
 
     def _reset_worker_state(self) -> None:
         self._thread = None

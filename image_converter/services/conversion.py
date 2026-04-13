@@ -8,6 +8,7 @@ from PIL import Image, ImageSequence
 from image_converter.domain.constants import SUPPORTED_SOURCE_EXTENSIONS
 from image_converter.domain.models import (
     BatchRequest,
+    BatchSource,
     BatchSummary,
     ConversionOptions,
     ConversionResult,
@@ -60,20 +61,27 @@ class BatchConversionService:
     def __init__(self, converter: ImageConverter | None = None):
         self._converter = converter or ImageConverter()
 
-    def run(self, request: BatchRequest, logger: Logger | None = None) -> BatchSummary:
+    def run(
+        self,
+        request: BatchRequest,
+        logger: Logger | None = None,
+        *,
+        on_item_start: Callable[[Path], None] | None = None,
+        on_item_complete: Callable[[ConversionResult], None] | None = None,
+    ) -> BatchSummary:
         write_log = logger or (lambda _message: None)
         summary = BatchSummary()
-        input_path = request.input_path
-
-        if input_path is None:
-            return summary
-
-        for source in self.iter_sources(input_path, request.options.recursive):
-            destination = self.build_destination_path(source, input_path, request.output_root)
+        for source_spec in self.iter_request_sources(request):
+            source = source_spec.path
+            destination = self.build_destination_for_source(source_spec, request.output_root)
             try:
+                if on_item_start is not None:
+                    on_item_start(source)
                 result = self._converter.convert(source, destination, request.options)
                 write_log(f"{source.name} -> {result.message}")
                 summary.register(result)
+                if on_item_complete is not None:
+                    on_item_complete(result)
                 if result.is_success and request.options.delete_source:
                     self._delete_source(source, destination, write_log)
             except Exception as exc:
@@ -85,8 +93,27 @@ class BatchConversionService:
                 )
                 write_log(f"{source.name} -> {failed_result.message}")
                 summary.register(failed_result)
+                if on_item_complete is not None:
+                    on_item_complete(failed_result)
 
         return summary
+
+    def iter_request_sources(self, request: BatchRequest) -> Iterator[BatchSource]:
+        if request.sources:
+            yield from request.sources
+            return
+
+        input_path = request.input_path
+        if input_path is None:
+            return
+
+        if input_path.is_file():
+            if input_path.suffix.lower() in SUPPORTED_SOURCE_EXTENSIONS:
+                yield BatchSource(path=input_path, root=input_path.parent)
+            return
+
+        for path in self.iter_sources(input_path, request.options.recursive):
+            yield BatchSource(path=path, root=input_path)
 
     @staticmethod
     def iter_sources(root: Path, recursive: bool) -> Iterator[Path]:
@@ -110,6 +137,13 @@ class BatchConversionService:
             return output_root / relative_path.with_suffix(".png")
 
         return output_root / source.with_suffix(".png").name
+
+    @classmethod
+    def build_destination_for_source(cls, source: BatchSource, output_root: Path | None) -> Path:
+        source_root = source.root
+        if source_root is None:
+            return cls.build_destination_path(source.path, source.path.parent, output_root)
+        return cls.build_destination_path(source.path, source_root, output_root)
 
     @staticmethod
     def _delete_source(source: Path, destination: Path, logger: Logger) -> None:

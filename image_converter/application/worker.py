@@ -8,6 +8,8 @@ from image_converter.services.conversion import BatchConversionService
 
 class BatchConversionWorker(QObject):
     log_message = pyqtSignal(str)
+    item_started = pyqtSignal(str)
+    item_completed = pyqtSignal(object)
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
     completed = pyqtSignal()
@@ -19,7 +21,12 @@ class BatchConversionWorker(QObject):
 
     def run(self) -> None:
         try:
-            summary = self._service.run(self._request, logger=self.log_message.emit)
+            summary = self._service.run(
+                self._request,
+                logger=self.log_message.emit,
+                on_item_start=lambda path: self.item_started.emit(str(path)),
+                on_item_complete=self.item_completed.emit,
+            )
             self.finished.emit(summary)
         except Exception as exc:
             self.failed.emit(str(exc))

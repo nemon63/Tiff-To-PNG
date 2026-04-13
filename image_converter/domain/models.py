@@ -11,10 +11,24 @@ class ResizeMode(str, Enum):
     MAX_SIDE = "max_side"
 
 
+class AssetKind(str, Enum):
+    IMAGE = "image"
+    UNKNOWN = "unknown"
+
+
 class ConversionStatus(str, Enum):
     SUCCESS = "success"
     SKIPPED = "skipped"
     FAILED = "failed"
+
+
+class QueueStatus(str, Enum):
+    PENDING = "pending"
+    READY = "ready"
+    RUNNING = "running"
+    DONE = "done"
+    SKIPPED = "skipped"
+    ERROR = "error"
 
 
 @dataclass(slots=True, frozen=True)
@@ -34,10 +48,67 @@ class ConversionOptions:
 
 
 @dataclass(slots=True, frozen=True)
+class BatchSource:
+    path: Path
+    root: Path | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class BatchRequest:
     input_path: Path | None
     output_root: Path | None
     options: ConversionOptions
+    sources: tuple[BatchSource, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class AssetMetadata:
+    format_name: str
+    width: int
+    height: int
+    mode: str
+    has_alpha: bool
+    file_size_bytes: int
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def resolution_text(self) -> str:
+        if self.width <= 0 or self.height <= 0:
+            return "-"
+        return f"{self.width}x{self.height}"
+
+    @property
+    def size_text(self) -> str:
+        if self.file_size_bytes <= 0:
+            return "0 B"
+        size = float(self.file_size_bytes)
+        units = ["B", "KB", "MB", "GB"]
+        unit_index = 0
+        while size >= 1024 and unit_index < len(units) - 1:
+            size /= 1024.0
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(size)} {units[unit_index]}"
+        return f"{size:.1f} {units[unit_index]}"
+
+
+@dataclass(slots=True)
+class QueueItem:
+    source: BatchSource
+    asset_kind: AssetKind
+    metadata: AssetMetadata | None
+    status: QueueStatus = QueueStatus.READY
+    output_path: Path | None = None
+    message: str = ""
+
+    @property
+    def path(self) -> Path:
+        return self.source.path
+
+    @property
+    def root(self) -> Path | None:
+        return self.source.root
+
 
 
 @dataclass(slots=True, frozen=True)
