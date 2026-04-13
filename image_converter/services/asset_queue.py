@@ -8,6 +8,7 @@ from PIL import Image
 
 from image_converter.domain.constants import SUPPORTED_SOURCE_EXTENSIONS
 from image_converter.domain.models import AssetKind, AssetMetadata, BatchSource, QueueItem, QueueStatus
+from image_converter.services.map_types import detect_texture_map_type
 
 
 @dataclass(slots=True, frozen=True)
@@ -89,6 +90,7 @@ class AssetScanner:
 
     def _read_metadata(self, path: Path) -> AssetMetadata:
         file_size = path.stat().st_size
+        map_type = detect_texture_map_type(path)
         with Image.open(path) as image:
             width, height = image.size
             mode = image.mode
@@ -127,6 +129,7 @@ class AssetScanner:
             mode=mode,
             has_alpha=has_alpha,
             file_size_bytes=file_size,
+            map_type=map_type,
             frame_count=frame_count,
             warnings=tuple(warnings),
         )

@@ -16,6 +16,33 @@ class AssetKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class TextureMapType(str, Enum):
+    UNKNOWN = "unknown"
+    BASECOLOR = "basecolor"
+    NORMAL = "normal"
+    ROUGHNESS = "roughness"
+    METALLIC = "metallic"
+    AO = "ao"
+    OPACITY = "opacity"
+    EMISSIVE = "emissive"
+    HEIGHT = "height"
+
+    @property
+    def label(self) -> str:
+        mapping = {
+            TextureMapType.UNKNOWN: "Unknown",
+            TextureMapType.BASECOLOR: "BaseColor",
+            TextureMapType.NORMAL: "Normal",
+            TextureMapType.ROUGHNESS: "Roughness",
+            TextureMapType.METALLIC: "Metallic",
+            TextureMapType.AO: "AO",
+            TextureMapType.OPACITY: "Opacity",
+            TextureMapType.EMISSIVE: "Emissive",
+            TextureMapType.HEIGHT: "Height",
+        }
+        return mapping[self]
+
+
 class ConversionStatus(str, Enum):
     SUCCESS = "success"
     SKIPPED = "skipped"
@@ -78,6 +105,7 @@ class AssetMetadata:
     mode: str
     has_alpha: bool
     file_size_bytes: int
+    map_type: TextureMapType = TextureMapType.UNKNOWN
     frame_count: int = 1
     warnings: tuple[str, ...] = ()
 
@@ -120,6 +148,7 @@ class QueueItem:
     status: QueueStatus = QueueStatus.READY
     output_path: Path | None = None
     message: str = ""
+    map_type_override: TextureMapType | None = None
 
     @property
     def path(self) -> Path:
@@ -128,6 +157,14 @@ class QueueItem:
     @property
     def root(self) -> Path | None:
         return self.source.root
+
+    @property
+    def effective_map_type(self) -> TextureMapType:
+        if self.map_type_override is not None:
+            return self.map_type_override
+        if self.metadata is not None:
+            return self.metadata.map_type
+        return TextureMapType.UNKNOWN
 
 
 

@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -47,7 +48,6 @@ from PyQt6.QtWidgets import (
 from image_converter.domain.constants import FILE_DIALOG_FILTER
 from image_converter.domain.models import (
     AppSettings,
-    AssetMetadata,
     BatchRequest,
     BatchSource,
     ConversionOptions,
@@ -55,11 +55,13 @@ from image_converter.domain.models import (
     QueueItem,
     QueueStatus,
     ResizeMode,
+    TextureMapType,
 )
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.preview import TexturePreviewService
 
-QUEUE_HEADERS = ("Имя", "Тип", "Размер", "Разрешение", "Статус", "Выходной путь")
+QUEUE_HEADERS = ("Имя", "Карта", "Размер", "Разрешение", "Статус", "Выходной путь")
+AUTO_MAP_TYPE_DATA = "__auto__"
 
 
 def _extract_local_paths(event) -> list[str]:
@@ -105,6 +107,10 @@ def _preview_channel_label(channel: PreviewChannel) -> str:
         PreviewChannel.LUMA: "Luma",
     }
     return mapping[channel]
+
+
+def _map_type_label(map_type: TextureMapType) -> str:
+    return map_type.label
 
 
 def _qimage_from_pil(image) -> QImage:
@@ -1042,8 +1048,9 @@ class PreviewPanel(QWidget):
 
         channel_name = _preview_channel_label(self._selected_channel)
         alpha_state = "alpha" if metadata.has_alpha else "opaque"
+        map_type_name = _map_type_label(item.effective_map_type)
         self.asset_meta_label.setText(
-            f"{metadata.format_name} · {metadata.resolution_text} · {metadata.mode} · канал: {channel_name} · {alpha_state}"
+            f"{map_type_name} · {metadata.resolution_text} · {metadata.mode} · канал: {channel_name} · {alpha_state}"
         )
         self.asset_meta_label.setToolTip(self.asset_meta_label.text())
 
@@ -1103,8 +1110,11 @@ class PreviewPanel(QWidget):
 
 
 class MetadataPanel(QWidget):
+    map_type_override_changed = pyqtSignal(object)
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        self._current_item: QueueItem | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1126,6 +1136,16 @@ class MetadataPanel(QWidget):
         self.asset_name_label.setObjectName("AssetName")
         self.asset_name_label.setWordWrap(True)
         layout.addWidget(self.asset_name_label)
+
+        map_type_row = QHBoxLayout()
+        map_type_row.setSpacing(8)
+        map_type_label = QLabel("Map Type")
+        map_type_label.setObjectName("SummaryText")
+        map_type_row.addWidget(map_type_label)
+        self.map_type_combo = QComboBox()
+        self.map_type_combo.currentIndexChanged.connect(self._emit_map_type_override)
+        map_type_row.addWidget(self.map_type_combo, 1)
+        layout.addLayout(map_type_row)
 
         self.source_field = InspectorField("Исходный файл", compact=True, wrap_value=False, inline=True)
         layout.addWidget(self.source_field)
@@ -1162,6 +1182,9 @@ class MetadataPanel(QWidget):
         layout.addWidget(self.warning_label)
 
     def set_queue_item(self, item: QueueItem | None) -> None:
+        self._current_item = item
+        self._sync_map_type_combo(item)
+
         if item is None:
             self.asset_name_label.setText("Ничего не выбрано")
             self._set_values(
@@ -1238,6 +1261,43 @@ class MetadataPanel(QWidget):
         self.frames_field.set_value(frames)
         self.size_field.set_value(size)
         self.output_field.set_value(output)
+
+    def _sync_map_type_combo(self, item: QueueItem | None) -> None:
+        self.map_type_combo.blockSignals(True)
+        self.map_type_combo.clear()
+
+        if item is None or item.metadata is None:
+            self.map_type_combo.addItem("Авто", AUTO_MAP_TYPE_DATA)
+            self.map_type_combo.setEnabled(False)
+            self.map_type_combo.blockSignals(False)
+            return
+
+        detected_map_type = item.metadata.map_type
+        self.map_type_combo.addItem(f"Авто: {_map_type_label(detected_map_type)}", AUTO_MAP_TYPE_DATA)
+        self.map_type_combo.addItem(_map_type_label(TextureMapType.UNKNOWN), TextureMapType.UNKNOWN)
+        for map_type in TextureMapType:
+            if map_type is TextureMapType.UNKNOWN:
+                continue
+            self.map_type_combo.addItem(_map_type_label(map_type), map_type)
+
+        current_value = item.map_type_override if item.map_type_override is not None else AUTO_MAP_TYPE_DATA
+        for index in range(self.map_type_combo.count()):
+            if self.map_type_combo.itemData(index) == current_value:
+                self.map_type_combo.setCurrentIndex(index)
+                break
+
+        self.map_type_combo.setEnabled(True)
+        self.map_type_combo.blockSignals(False)
+
+    def _emit_map_type_override(self) -> None:
+        if self._current_item is None or self._current_item.metadata is None:
+            return
+
+        selected_data = self.map_type_combo.currentData()
+        if selected_data == AUTO_MAP_TYPE_DATA:
+            self.map_type_override_changed.emit(None)
+            return
+        self.map_type_override_changed.emit(selected_data)
 
 
 class LogPanel(QWidget):
@@ -1322,6 +1382,7 @@ class MainWindow(QMainWindow):
 
         self.preview_panel = PreviewPanel()
         self.metadata_panel = MetadataPanel()
+        self.metadata_panel.map_type_override_changed.connect(self._apply_selected_map_type_override)
         self.log_panel = LogPanel()
 
         self.detail_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -1570,9 +1631,9 @@ class MainWindow(QMainWindow):
 
             row_items = [
                 self._make_table_item(item.path.name, tooltip=str(item.path)),
-                self._make_table_item(self._asset_type_text(item), tooltip=self._metadata_tooltip(metadata)),
-                self._make_table_item(metadata.size_text if metadata else "-", tooltip=self._metadata_tooltip(metadata)),
-                self._make_table_item(metadata.resolution_text if metadata else "-", tooltip=self._metadata_tooltip(metadata)),
+                self._make_table_item(self._asset_type_text(item), tooltip=self._map_type_tooltip(item)),
+                self._make_table_item(metadata.size_text if metadata else "-", tooltip=self._metadata_tooltip(item)),
+                self._make_table_item(metadata.resolution_text if metadata else "-", tooltip=self._metadata_tooltip(item)),
                 self._make_table_item(status_text, tooltip=status_tooltip),
                 self._make_table_item(output_text, tooltip=output_text),
             ]
@@ -1618,16 +1679,26 @@ class MainWindow(QMainWindow):
         return table_item
 
     def _asset_type_text(self, item: QueueItem) -> str:
-        if item.metadata is not None and item.metadata.format_name:
-            return item.metadata.format_name
-        suffix = item.path.suffix.removeprefix(".").upper()
-        return suffix or "IMAGE"
+        return _map_type_label(item.effective_map_type)
 
-    def _metadata_tooltip(self, metadata: AssetMetadata | None) -> str:
+    def _map_type_tooltip(self, item: QueueItem) -> str:
+        metadata = item.metadata
+        lines = [f"Тип карты: {_map_type_label(item.effective_map_type)}"]
+        if item.map_type_override is not None:
+            lines.append("Источник: ручное переопределение")
+        elif metadata is not None:
+            lines.append("Источник: автоопределение по имени файла")
+        if metadata is not None:
+            lines.append(f"Формат: {metadata.format_name}")
+        return "\n".join(lines)
+
+    def _metadata_tooltip(self, item: QueueItem) -> str:
+        metadata = item.metadata
         if metadata is None:
             return ""
 
         lines = [
+            f"Тип карты: {_map_type_label(item.effective_map_type)}",
             f"Формат: {metadata.format_name}",
             f"Разрешение: {metadata.resolution_text}",
             f"Режим: {metadata.mode}",
@@ -1680,6 +1751,22 @@ class MainWindow(QMainWindow):
         item = self._selected_queue_item()
         self.preview_panel.set_queue_item(item)
         self.metadata_panel.set_queue_item(item)
+
+    def _apply_selected_map_type_override(self, map_type_override: object) -> None:
+        item = self._selected_queue_item()
+        if item is None:
+            return
+
+        if map_type_override is None:
+            item.map_type_override = None
+        elif isinstance(map_type_override, TextureMapType):
+            item.map_type_override = map_type_override
+        else:
+            return
+
+        self._render_queue()
+        self._sync_workspace_selection()
+        self._sync_status_bar_with_selection()
 
     def _selected_queue_item(self) -> QueueItem | None:
         selection_model = self.queue_panel.table.selectionModel()
