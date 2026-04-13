@@ -11,6 +11,11 @@ class ResizeMode(str, Enum):
     MAX_SIDE = "max_side"
 
 
+class PresetScope(str, Enum):
+    SYSTEM = "system"
+    USER = "user"
+
+
 class AssetKind(str, Enum):
     IMAGE = "image"
     UNKNOWN = "unknown"
@@ -81,6 +86,19 @@ class ConversionOptions:
     png8: bool = False
     png8_colors: int = 256
     dither: bool = True
+
+
+@dataclass(slots=True, frozen=True)
+class ConversionPreset:
+    preset_id: str
+    name: str
+    options: ConversionOptions
+    scope: PresetScope
+    description: str = ""
+
+    @property
+    def is_system(self) -> bool:
+        return self.scope is PresetScope.SYSTEM
 
 
 @dataclass(slots=True, frozen=True)

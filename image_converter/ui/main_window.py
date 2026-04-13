@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -51,6 +52,7 @@ from image_converter.domain.models import (
     BatchRequest,
     BatchSource,
     ConversionOptions,
+    ConversionPreset,
     PreviewChannel,
     QueueItem,
     QueueStatus,
@@ -58,10 +60,13 @@ from image_converter.domain.models import (
     TextureMapType,
 )
 from image_converter.services.conversion import BatchConversionService
+from image_converter.services.inspection import build_output_estimate
 from image_converter.services.preview import TexturePreviewService
+from image_converter.services.presets import PresetRepository
 
 QUEUE_HEADERS = ("Имя", "Карта", "Размер", "Разрешение", "Статус", "Выходной путь")
 AUTO_MAP_TYPE_DATA = "__auto__"
+CURRENT_PRESET_DATA = "__current_preset__"
 
 
 def _extract_local_paths(event) -> list[str]:
@@ -144,13 +149,21 @@ def _status_colors(item: QueueItem) -> tuple[QColor, QColor]:
 class SettingsPanel(QWidget):
     convert_requested = pyqtSignal()
     output_path_changed = pyqtSignal(str)
+    preset_apply_requested = pyqtSignal(str)
+    preset_save_requested = pyqtSignal()
+    preset_delete_requested = pyqtSignal(str)
+    options_changed = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._interactive_widgets: list[QWidget] = []
+        self._presets_by_id: dict[str, ConversionPreset] = {}
+        self._suppress_option_signal = False
         self._build_ui()
+        self._connect_option_change_signals()
         self._update_resize_state()
         self._update_png8_state()
+        self.set_available_presets([])
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -168,6 +181,7 @@ class SettingsPanel(QWidget):
         subtitle_label.setWordWrap(True)
         root_layout.addWidget(subtitle_label)
 
+        root_layout.addWidget(self._build_presets_group())
         root_layout.addWidget(self._build_paths_group())
         root_layout.addWidget(self._build_basic_group())
         root_layout.addWidget(self._build_png_group())
@@ -185,6 +199,47 @@ class SettingsPanel(QWidget):
         controls_row.addWidget(self.convert_button)
         root_layout.addLayout(controls_row)
         self._register_interactive(self.convert_button)
+
+    def _build_presets_group(self) -> QGroupBox:
+        group = QGroupBox("Workflow Presets")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.currentIndexChanged.connect(self._refresh_preset_ui)
+        layout.addWidget(self.preset_combo)
+
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(8)
+
+        self.apply_preset_button = QPushButton("Применить")
+        self.apply_preset_button.clicked.connect(self._emit_apply_selected_preset)
+        actions_row.addWidget(self.apply_preset_button, 1)
+
+        self.save_preset_button = QPushButton("Сохранить как...")
+        self.save_preset_button.setObjectName("GhostButton")
+        self.save_preset_button.clicked.connect(self.preset_save_requested.emit)
+        actions_row.addWidget(self.save_preset_button, 1)
+
+        self.delete_preset_button = QPushButton("Удалить")
+        self.delete_preset_button.setObjectName("DangerButton")
+        self.delete_preset_button.clicked.connect(self._emit_delete_selected_preset)
+        actions_row.addWidget(self.delete_preset_button)
+
+        layout.addLayout(actions_row)
+
+        self.preset_summary_label = QLabel()
+        self.preset_summary_label.setObjectName("SummaryText")
+        self.preset_summary_label.setWordWrap(True)
+        layout.addWidget(self.preset_summary_label)
+
+        self._register_interactive(
+            self.preset_combo,
+            self.apply_preset_button,
+            self.save_preset_button,
+            self.delete_preset_button,
+        )
+        return group
 
     def _build_paths_group(self) -> QGroupBox:
         group = QGroupBox("Пути")
@@ -349,6 +404,30 @@ class SettingsPanel(QWidget):
     def _register_interactive(self, *widgets: QWidget) -> None:
         self._interactive_widgets.extend(widgets)
 
+    def _connect_option_change_signals(self) -> None:
+        toggles = (
+            self.recursive_checkbox,
+            self.force_rgba_checkbox,
+            self.overwrite_checkbox,
+            self.delete_source_checkbox,
+            self.optimize_checkbox,
+            self.png8_checkbox,
+            self.dither_checkbox,
+            self.resize_none_radio,
+            self.resize_percent_radio,
+            self.resize_max_side_radio,
+        )
+        for widget in toggles:
+            widget.toggled.connect(self._notify_options_changed)
+
+        for widget in (
+            self.compress_spin,
+            self.png8_colors_spin,
+            self.resize_percent_spin,
+            self.max_side_spin,
+        ):
+            widget.valueChanged.connect(self._notify_options_changed)
+
     def _set_input_path(self, path: str) -> None:
         self.input_edit.setText(path)
         self._auto_fill_output_from_input(force=True)
@@ -409,54 +488,63 @@ class SettingsPanel(QWidget):
             return ResizeMode.MAX_SIDE
         return ResizeMode.NONE
 
+    def build_conversion_options(self) -> ConversionOptions:
+        return ConversionOptions(
+            recursive=self.recursive_checkbox.isChecked(),
+            force_rgba=self.force_rgba_checkbox.isChecked(),
+            overwrite=self.overwrite_checkbox.isChecked(),
+            delete_source=self.delete_source_checkbox.isChecked(),
+            optimize=self.optimize_checkbox.isChecked(),
+            compress_level=self.compress_spin.value(),
+            resize_mode=self.selected_resize_mode(),
+            resize_percent=self.resize_percent_spin.value(),
+            max_side=self.max_side_spin.value(),
+            png8=self.png8_checkbox.isChecked(),
+            png8_colors=self.png8_colors_spin.value(),
+            dither=self.dither_checkbox.isChecked(),
+        )
+
     def build_request(self) -> BatchRequest:
         input_text = self.input_edit.text().strip()
         output_text = self.output_edit.text().strip()
         return BatchRequest(
             input_path=Path(input_text) if input_text else None,
             output_root=Path(output_text) if output_text else None,
-            options=ConversionOptions(
-                recursive=self.recursive_checkbox.isChecked(),
-                force_rgba=self.force_rgba_checkbox.isChecked(),
-                overwrite=self.overwrite_checkbox.isChecked(),
-                delete_source=self.delete_source_checkbox.isChecked(),
-                optimize=self.optimize_checkbox.isChecked(),
-                compress_level=self.compress_spin.value(),
-                resize_mode=self.selected_resize_mode(),
-                resize_percent=self.resize_percent_spin.value(),
-                max_side=self.max_side_spin.value(),
-                png8=self.png8_checkbox.isChecked(),
-                png8_colors=self.png8_colors_spin.value(),
-                dither=self.dither_checkbox.isChecked(),
-            ),
+            options=self.build_conversion_options(),
         )
+
+    def apply_conversion_options(self, options: ConversionOptions) -> None:
+        self._suppress_option_signal = True
+        try:
+            self.recursive_checkbox.setChecked(options.recursive)
+            self.force_rgba_checkbox.setChecked(options.force_rgba)
+            self.overwrite_checkbox.setChecked(options.overwrite)
+            self.delete_source_checkbox.setChecked(options.delete_source)
+            self.optimize_checkbox.setChecked(options.optimize)
+            self.compress_spin.setValue(options.compress_level)
+            self.png8_checkbox.setChecked(options.png8)
+            self.png8_colors_spin.setValue(options.png8_colors)
+            self.dither_checkbox.setChecked(options.dither)
+            self.resize_percent_spin.setValue(options.resize_percent)
+            self.max_side_spin.setValue(options.max_side)
+
+            if options.resize_mode is ResizeMode.PERCENT:
+                self.resize_percent_radio.setChecked(True)
+            elif options.resize_mode is ResizeMode.MAX_SIDE:
+                self.resize_max_side_radio.setChecked(True)
+            else:
+                self.resize_none_radio.setChecked(True)
+        finally:
+            self._suppress_option_signal = False
+
+        self._update_resize_state()
+        self._update_png8_state()
+        self._notify_options_changed()
 
     def apply_app_settings(self, settings: AppSettings) -> None:
         self.input_edit.setText(settings.input_path)
         self.output_edit.setText(settings.output_path)
-
-        options = settings.options
-        self.recursive_checkbox.setChecked(options.recursive)
-        self.force_rgba_checkbox.setChecked(options.force_rgba)
-        self.overwrite_checkbox.setChecked(options.overwrite)
-        self.delete_source_checkbox.setChecked(options.delete_source)
-        self.optimize_checkbox.setChecked(options.optimize)
-        self.compress_spin.setValue(options.compress_level)
-        self.png8_checkbox.setChecked(options.png8)
-        self.png8_colors_spin.setValue(options.png8_colors)
-        self.dither_checkbox.setChecked(options.dither)
-        self.resize_percent_spin.setValue(options.resize_percent)
-        self.max_side_spin.setValue(options.max_side)
-
-        if options.resize_mode is ResizeMode.PERCENT:
-            self.resize_percent_radio.setChecked(True)
-        elif options.resize_mode is ResizeMode.MAX_SIDE:
-            self.resize_max_side_radio.setChecked(True)
-        else:
-            self.resize_none_radio.setChecked(True)
-
-        self._update_resize_state()
-        self._update_png8_state()
+        self.apply_conversion_options(settings.options)
 
     def set_controls_enabled(self, enabled: bool) -> None:
         for widget in self._interactive_widgets:
@@ -465,6 +553,71 @@ class SettingsPanel(QWidget):
         if enabled:
             self._update_resize_state()
             self._update_png8_state()
+            self._refresh_preset_ui()
+
+    def set_available_presets(self, presets: list[ConversionPreset]) -> None:
+        self._presets_by_id = {preset.preset_id: preset for preset in presets}
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("Текущие настройки", CURRENT_PRESET_DATA)
+
+        for preset in presets:
+            source_label = "Системный" if preset.is_system else "Пользовательский"
+            self.preset_combo.addItem(f"{source_label} · {preset.name}", preset.preset_id)
+
+        self.preset_combo.blockSignals(False)
+        self.set_selected_preset_id(None)
+        self._refresh_preset_ui()
+
+    def set_selected_preset_id(self, preset_id: str | None) -> None:
+        target_data = preset_id or CURRENT_PRESET_DATA
+        self.preset_combo.blockSignals(True)
+        for index in range(self.preset_combo.count()):
+            if self.preset_combo.itemData(index) == target_data:
+                self.preset_combo.setCurrentIndex(index)
+                break
+        else:
+            self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.blockSignals(False)
+        self._refresh_preset_ui()
+
+    def selected_preset_id(self) -> str | None:
+        current_data = self.preset_combo.currentData()
+        if current_data in (None, CURRENT_PRESET_DATA):
+            return None
+        return str(current_data)
+
+    def _emit_apply_selected_preset(self) -> None:
+        preset_id = self.selected_preset_id()
+        if preset_id is not None:
+            self.preset_apply_requested.emit(preset_id)
+
+    def _emit_delete_selected_preset(self) -> None:
+        preset_id = self.selected_preset_id()
+        if preset_id is not None:
+            self.preset_delete_requested.emit(preset_id)
+
+    def _refresh_preset_ui(self, *_args: object) -> None:
+        preset_id = self.selected_preset_id()
+        preset = self._presets_by_id.get(preset_id or "")
+
+        self.apply_preset_button.setEnabled(preset is not None)
+        self.delete_preset_button.setEnabled(preset is not None and not preset.is_system)
+
+        if preset is None:
+            self.preset_summary_label.setText(
+                "Рабочее состояние. Сохраните его как preset, если этот сетап нужен регулярно."
+            )
+            return
+
+        source_label = "Системный" if preset.is_system else "Пользовательский"
+        description = preset.description or "Без описания."
+        self.preset_summary_label.setText(f"{source_label} preset: {description}")
+
+    def _notify_options_changed(self, *_args: object) -> None:
+        if self._suppress_option_signal:
+            return
+        self.options_changed.emit()
 
 
 class QueueTableWidget(QTableWidget):
@@ -1115,6 +1268,7 @@ class MetadataPanel(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._current_item: QueueItem | None = None
+        self._conversion_options = ConversionOptions()
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1175,6 +1329,9 @@ class MetadataPanel(QWidget):
         self.output_field = InspectorField("Выходной PNG", compact=True, wrap_value=False, inline=True)
         layout.addWidget(self.output_field)
 
+        self.expected_field = InspectorField("После настроек", compact=True, wrap_value=False, inline=True)
+        layout.addWidget(self.expected_field)
+
         self.warning_label = QLabel("")
         self.warning_label.setObjectName("WarningBanner")
         self.warning_label.setWordWrap(True)
@@ -1196,6 +1353,7 @@ class MetadataPanel(QWidget):
                 frames="-",
                 size="-",
                 output="Будет рассчитан после выбора выходной папки.",
+                expected="-",
             )
             self.warning_label.hide()
             return
@@ -1213,11 +1371,13 @@ class MetadataPanel(QWidget):
                 frames="-",
                 size="-",
                 output=str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом.",
+                expected="Недоступно без метаданных.",
             )
             self.warning_label.setText(item.message or "Не удалось прочитать метаданные.")
             self.warning_label.show()
             return
 
+        output_estimate = build_output_estimate(metadata, self._conversion_options)
         self._set_values(
             source=str(item.path),
             format_value=metadata.format_name,
@@ -1227,6 +1387,7 @@ class MetadataPanel(QWidget):
             frames=str(metadata.frame_count),
             size=metadata.size_text,
             output=str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом.",
+            expected=output_estimate.summary,
         )
 
         warnings: list[str] = list(metadata.warnings)
@@ -1252,6 +1413,7 @@ class MetadataPanel(QWidget):
         frames: str,
         size: str,
         output: str,
+        expected: str,
     ) -> None:
         self.source_field.set_value(source)
         self.format_field.set_value(format_value)
@@ -1261,6 +1423,11 @@ class MetadataPanel(QWidget):
         self.frames_field.set_value(frames)
         self.size_field.set_value(size)
         self.output_field.set_value(output)
+        self.expected_field.set_value(expected)
+
+    def set_conversion_options(self, options: ConversionOptions) -> None:
+        self._conversion_options = options
+        self.set_queue_item(self._current_item)
 
     def _sync_map_type_combo(self, item: QueueItem | None) -> None:
         self.map_type_combo.blockSignals(True)
@@ -1343,6 +1510,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._is_running = False
         self._queue_items: list[QueueItem] = []
+        self._preset_repository: PresetRepository | None = None
+        self._presets_by_id: dict[str, ConversionPreset] = {}
         self.setWindowTitle("Конвертер изображений в PNG")
         self.resize(1280, 820)
         self.setMinimumSize(980, 680)
@@ -1359,6 +1528,11 @@ class MainWindow(QMainWindow):
         self.settings_panel = SettingsPanel()
         self.settings_panel.convert_requested.connect(self.convert_requested.emit)
         self.settings_panel.output_path_changed.connect(self._update_queue_output_paths)
+        self.settings_panel.preset_apply_requested.connect(self._apply_preset)
+        self.settings_panel.preset_save_requested.connect(self._save_current_preset)
+        self.settings_panel.preset_delete_requested.connect(self._delete_preset)
+        self.settings_panel.options_changed.connect(self._sync_preset_selection_with_current_options)
+        self.settings_panel.options_changed.connect(self._sync_metadata_conversion_options)
 
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
@@ -1382,6 +1556,7 @@ class MainWindow(QMainWindow):
 
         self.preview_panel = PreviewPanel()
         self.metadata_panel = MetadataPanel()
+        self.metadata_panel.set_conversion_options(self.settings_panel.build_conversion_options())
         self.metadata_panel.map_type_override_changed.connect(self._apply_selected_map_type_override)
         self.log_panel = LogPanel()
 
@@ -1574,6 +1749,11 @@ class MainWindow(QMainWindow):
         if len(settings.inspector_splitter_sizes) == 2:
             self.inspector_splitter.setSizes(list(settings.inspector_splitter_sizes))
         self._update_queue_output_paths()
+        self._sync_preset_selection_with_current_options()
+
+    def set_preset_repository(self, preset_repository: PresetRepository) -> None:
+        self._preset_repository = preset_repository
+        self._reload_presets()
 
     def build_app_settings(self) -> AppSettings:
         request = self.settings_panel.build_request()
@@ -1734,6 +1914,128 @@ class MainWindow(QMainWindow):
             item.output_path = self._build_output_path(item.source)
         self._render_queue()
         self._sync_workspace_selection()
+
+    def _reload_presets(self) -> None:
+        if self._preset_repository is None:
+            self._presets_by_id = {}
+            self.settings_panel.set_available_presets([])
+            return
+
+        presets = list(self._preset_repository.load_presets())
+        self._presets_by_id = {preset.preset_id: preset for preset in presets}
+        self.settings_panel.set_available_presets(presets)
+        self._sync_preset_selection_with_current_options()
+
+    def _sync_preset_selection_with_current_options(self, *_args: object) -> None:
+        current_options = self.settings_panel.build_conversion_options()
+        matched_preset_id = next(
+            (
+                preset.preset_id
+                for preset in self._presets_by_id.values()
+                if preset.options == current_options
+            ),
+            None,
+        )
+        self.settings_panel.set_selected_preset_id(matched_preset_id)
+
+    def _sync_metadata_conversion_options(self, *_args: object) -> None:
+        self.metadata_panel.set_conversion_options(self.settings_panel.build_conversion_options())
+
+    def _apply_preset(self, preset_id: str) -> None:
+        preset = self._presets_by_id.get(preset_id)
+        if preset is None:
+            return
+
+        self.settings_panel.apply_conversion_options(preset.options)
+        self.settings_panel.set_selected_preset_id(preset.preset_id)
+        self.set_status(f"Применен preset: {preset.name}")
+
+    def _save_current_preset(self) -> None:
+        if self._preset_repository is None:
+            return
+
+        selected_preset = self._presets_by_id.get(self.settings_panel.selected_preset_id() or "")
+        suggested_name = "My Preset"
+        if selected_preset is not None:
+            suggested_name = (
+                f"{selected_preset.name} Copy" if selected_preset.is_system else selected_preset.name
+            )
+
+        name, accepted = QInputDialog.getText(
+            self,
+            "Сохранить preset",
+            "Название preset:",
+            text=suggested_name,
+        )
+        if not accepted:
+            return
+
+        clean_name = name.strip()
+        if not clean_name:
+            self.show_error("Preset не сохранен", "Название preset не может быть пустым.")
+            return
+
+        existing_user_preset = next(
+            (
+                preset
+                for preset in self._presets_by_id.values()
+                if not preset.is_system and preset.name.casefold() == clean_name.casefold()
+            ),
+            None,
+        )
+        if existing_user_preset is not None:
+            button = QMessageBox.question(
+                self,
+                "Перезаписать preset",
+                f"Preset '{existing_user_preset.name}' уже существует. Перезаписать его?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if button is not QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            preset = self._preset_repository.save_preset(
+                clean_name,
+                self.settings_panel.build_conversion_options(),
+            )
+        except (OSError, ValueError) as exc:
+            self.show_error("Preset не сохранен", str(exc))
+            return
+
+        self._reload_presets()
+        self.settings_panel.set_selected_preset_id(preset.preset_id)
+        self.set_status(f"Сохранен preset: {preset.name}")
+
+    def _delete_preset(self, preset_id: str) -> None:
+        if self._preset_repository is None:
+            return
+
+        preset = self._presets_by_id.get(preset_id)
+        if preset is None or preset.is_system:
+            return
+
+        button = QMessageBox.question(
+            self,
+            "Удалить preset",
+            f"Удалить пользовательский preset '{preset.name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if button is not QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            deleted = self._preset_repository.delete_preset(preset_id)
+        except OSError as exc:
+            self.show_error("Preset не удален", str(exc))
+            return
+
+        if not deleted:
+            return
+
+        self._reload_presets()
+        self.set_status(f"Удален preset: {preset.name}")
 
     def _sync_status_bar_with_selection(self) -> None:
         item = self._selected_queue_item()

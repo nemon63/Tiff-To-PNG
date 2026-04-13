@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import QApplication
 
 from image_converter.application.controller import ConversionController
 from image_converter.services.conversion import BatchConversionService
+from image_converter.services.presets import PresetRepository
 from image_converter.services.settings import AppSettingsRepository
 from image_converter.ui.main_window import MainWindow
 from image_converter.ui.theme import APP_STYLESHEET
@@ -20,6 +21,7 @@ def run_gui() -> int:
     project_root = Path(__file__).resolve().parents[2]
     icon_path = project_root / "ico" / "favicon.ico"
     settings_repository = AppSettingsRepository(project_root / "app_settings.json")
+    preset_repository = PresetRepository(project_root / "conversion_presets.json")
     if icon_path.exists():
         icon = QIcon(str(icon_path))
         app.setWindowIcon(icon)
@@ -27,6 +29,7 @@ def run_gui() -> int:
         icon = QIcon()
 
     window = MainWindow()
+    window.set_preset_repository(preset_repository)
     if not icon.isNull():
         window.setWindowIcon(icon)
     window.apply_app_settings(settings_repository.load())
