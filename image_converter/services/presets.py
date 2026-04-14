@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
 
 from image_converter.domain.models import (
     ConversionOptions,
     ConversionPreset,
     PresetScope,
     ResizeMode,
+)
+from image_converter.services.options_codec import (
+    deserialize_conversion_options,
+    serialize_conversion_options,
 )
 
 SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
@@ -79,46 +82,6 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
         ),
     ),
 )
-
-
-def serialize_conversion_options(options: ConversionOptions) -> dict[str, Any]:
-    return {
-        "recursive": options.recursive,
-        "force_rgba": options.force_rgba,
-        "overwrite": options.overwrite,
-        "delete_source": options.delete_source,
-        "optimize": options.optimize,
-        "compress_level": options.compress_level,
-        "resize_mode": options.resize_mode.value,
-        "resize_percent": options.resize_percent,
-        "max_side": options.max_side,
-        "png8": options.png8,
-        "png8_colors": options.png8_colors,
-        "dither": options.dither,
-    }
-
-
-def deserialize_conversion_options(data: dict[str, Any]) -> ConversionOptions:
-    try:
-        resize_mode = ResizeMode(data.get("resize_mode", ResizeMode.NONE.value))
-    except ValueError:
-        resize_mode = ResizeMode.NONE
-
-    return ConversionOptions(
-        recursive=bool(data.get("recursive", True)),
-        force_rgba=bool(data.get("force_rgba", False)),
-        overwrite=bool(data.get("overwrite", False)),
-        delete_source=bool(data.get("delete_source", False)),
-        optimize=bool(data.get("optimize", True)),
-        compress_level=_coerce_int(data.get("compress_level"), 6),
-        resize_mode=resize_mode,
-        resize_percent=_coerce_int(data.get("resize_percent"), 100),
-        max_side=_coerce_int(data.get("max_side"), 2048),
-        png8=bool(data.get("png8", False)),
-        png8_colors=_coerce_int(data.get("png8_colors"), 256),
-        dither=bool(data.get("dither", True)),
-    )
-
 
 class PresetRepository:
     def __init__(self, path: Path):
@@ -235,10 +198,3 @@ class PresetRepository:
             candidate = f"user:{slug}-{suffix}"
             suffix += 1
         return candidate
-
-
-def _coerce_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default

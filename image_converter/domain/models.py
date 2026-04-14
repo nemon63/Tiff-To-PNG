@@ -73,6 +73,17 @@ class PreviewChannel(str, Enum):
 
 
 @dataclass(slots=True, frozen=True)
+class NamingRules:
+    lowercase: bool = False
+    replace_spaces: bool = False
+    normalize_map_suffix: bool = False
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.lowercase or self.replace_spaces or self.normalize_map_suffix
+
+
+@dataclass(slots=True, frozen=True)
 class ConversionOptions:
     recursive: bool = True
     force_rgba: bool = False
@@ -86,6 +97,7 @@ class ConversionOptions:
     png8: bool = False
     png8_colors: int = 256
     dither: bool = True
+    naming: NamingRules = field(default_factory=NamingRules)
 
 
 @dataclass(slots=True, frozen=True)
@@ -105,6 +117,7 @@ class ConversionPreset:
 class BatchSource:
     path: Path
     root: Path | None = None
+    map_type: TextureMapType = TextureMapType.UNKNOWN
 
 
 @dataclass(slots=True, frozen=True)
@@ -183,6 +196,14 @@ class QueueItem:
         if self.metadata is not None:
             return self.metadata.map_type
         return TextureMapType.UNKNOWN
+
+    @property
+    def batch_source(self) -> BatchSource:
+        return BatchSource(
+            path=self.path,
+            root=self.root,
+            map_type=self.effective_map_type,
+        )
 
 
 

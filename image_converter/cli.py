@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from image_converter.domain.errors import ValidationError
-from image_converter.domain.models import BatchRequest, ConversionOptions, ResizeMode
+from image_converter.domain.models import BatchRequest, ConversionOptions, NamingRules, ResizeMode
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.validation import validate_request
 
@@ -32,6 +32,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-rgba", action="store_true", help="Force output as RGBA")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing PNGs")
     parser.add_argument("--delete-source", action="store_true", help="Delete source after success")
+    parser.add_argument(
+        "--lowercase-names",
+        action="store_true",
+        help="Lowercase output PNG filenames",
+    )
+    parser.add_argument(
+        "--replace-spaces",
+        action="store_true",
+        help="Replace spaces with underscores in output filenames",
+    )
+    parser.add_argument(
+        "--normalize-suffix",
+        action="store_true",
+        help="Normalize texture map suffixes such as albedo -> basecolor",
+    )
     parser.add_argument(
         "--compress-level",
         type=int,
@@ -104,6 +119,11 @@ def build_request_from_args(args: argparse.Namespace) -> BatchRequest:
             png8=args.png8,
             png8_colors=args.png8_colors,
             dither=args.dither,
+            naming=NamingRules(
+                lowercase=args.lowercase_names,
+                replace_spaces=args.replace_spaces,
+                normalize_map_suffix=args.normalize_suffix,
+            ),
         ),
     )
 

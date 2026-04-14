@@ -5,7 +5,7 @@ from pathlib import Path
 
 from image_converter.domain.models import TextureMapType
 
-_MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
+MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
     (
         TextureMapType.BASECOLOR,
         ("basecolor", "base_color", "albedo", "diffuse", "diff", "color"),
@@ -40,6 +40,35 @@ _MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
     ),
 )
 
+CANONICAL_MAP_SUFFIXES: dict[TextureMapType, str] = {
+    TextureMapType.BASECOLOR: "basecolor",
+    TextureMapType.NORMAL: "normal",
+    TextureMapType.ROUGHNESS: "roughness",
+    TextureMapType.METALLIC: "metallic",
+    TextureMapType.AO: "ao",
+    TextureMapType.OPACITY: "opacity",
+    TextureMapType.EMISSIVE: "emissive",
+    TextureMapType.HEIGHT: "height",
+}
+
+
+def map_type_aliases(map_type: TextureMapType) -> tuple[str, ...]:
+    for candidate, aliases in MAP_TYPE_PATTERNS:
+        if candidate is map_type:
+            return aliases
+    return ()
+
+
+def known_map_aliases() -> tuple[str, ...]:
+    aliases: list[str] = []
+    for _map_type, values in MAP_TYPE_PATTERNS:
+        aliases.extend(values)
+    return tuple(dict.fromkeys(aliases))
+
+
+def canonical_map_suffix(map_type: TextureMapType) -> str:
+    return CANONICAL_MAP_SUFFIXES.get(map_type, "")
+
 
 def detect_texture_map_type(path: Path) -> TextureMapType:
     stem = path.stem.lower()
@@ -47,7 +76,7 @@ def detect_texture_map_type(path: Path) -> TextureMapType:
     collapsed = normalized.replace("_", "")
     tokens = {token for token in normalized.split("_") if token}
 
-    for map_type, aliases in _MAP_TYPE_PATTERNS:
+    for map_type, aliases in MAP_TYPE_PATTERNS:
         for alias in aliases:
             alias_tokens = tuple(token for token in alias.lower().split("_") if token)
             alias_collapsed = "".join(alias_tokens)

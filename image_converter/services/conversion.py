@@ -13,7 +13,10 @@ from image_converter.domain.models import (
     ConversionOptions,
     ConversionResult,
     ConversionStatus,
+    TextureMapType,
 )
+from image_converter.services.map_types import detect_texture_map_type
+from image_converter.services.naming import build_output_filename
 from image_converter.services.pipeline import ConversionPipeline
 
 Logger = Callable[[str], None]
@@ -73,7 +76,11 @@ class BatchConversionService:
         summary = BatchSummary()
         for source_spec in self.iter_request_sources(request):
             source = source_spec.path
-            destination = self.build_destination_for_source(source_spec, request.output_root)
+            destination = self.build_destination_for_source(
+                source_spec,
+                request.output_root,
+                request.options,
+            )
             try:
                 if on_item_start is not None:
                     on_item_start(source)
@@ -109,11 +116,19 @@ class BatchConversionService:
 
         if input_path.is_file():
             if input_path.suffix.lower() in SUPPORTED_SOURCE_EXTENSIONS:
-                yield BatchSource(path=input_path, root=input_path.parent)
+                yield BatchSource(
+                    path=input_path,
+                    root=input_path.parent,
+                    map_type=detect_texture_map_type(input_path),
+                )
             return
 
         for path in self.iter_sources(input_path, request.options.recursive):
-            yield BatchSource(path=path, root=input_path)
+            yield BatchSource(
+                path=path,
+                root=input_path,
+                map_type=detect_texture_map_type(path),
+            )
 
     @staticmethod
     def iter_sources(root: Path, recursive: bool) -> Iterator[Path]:
@@ -128,22 +143,48 @@ class BatchConversionService:
                 yield path
 
     @staticmethod
-    def build_destination_path(source: Path, input_path: Path, output_root: Path | None) -> Path:
+    def build_destination_path(
+        source: Path,
+        input_path: Path,
+        output_root: Path | None,
+        options: ConversionOptions,
+        *,
+        map_type: TextureMapType = TextureMapType.UNKNOWN,
+    ) -> Path:
+        output_name = build_output_filename(source, options.naming, map_type)
+
         if output_root is None:
-            return source.with_suffix(".png")
+            return source.with_name(output_name)
 
         if input_path.is_dir():
             relative_path = source.relative_to(input_path)
-            return output_root / relative_path.with_suffix(".png")
+            return output_root / relative_path.with_name(output_name)
 
-        return output_root / source.with_suffix(".png").name
+        return output_root / output_name
 
     @classmethod
-    def build_destination_for_source(cls, source: BatchSource, output_root: Path | None) -> Path:
+    def build_destination_for_source(
+        cls,
+        source: BatchSource,
+        output_root: Path | None,
+        options: ConversionOptions,
+    ) -> Path:
         source_root = source.root
         if source_root is None:
-            return cls.build_destination_path(source.path, source.path.parent, output_root)
-        return cls.build_destination_path(source.path, source_root, output_root)
+            return cls.build_destination_path(
+                source.path,
+                source.path.parent,
+                output_root,
+                options,
+                map_type=source.map_type,
+            )
+        return cls.build_destination_path(
+            source.path,
+            source_root,
+            output_root,
+            options,
+            map_type=source.map_type,
+        )
 
     @staticmethod
     def _delete_source(source: Path, destination: Path, logger: Logger) -> None:

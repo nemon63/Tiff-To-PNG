@@ -53,6 +53,7 @@ from image_converter.domain.models import (
     BatchSource,
     ConversionOptions,
     ConversionPreset,
+    NamingRules,
     PreviewChannel,
     QueueItem,
     QueueStatus,
@@ -61,6 +62,7 @@ from image_converter.domain.models import (
 )
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.inspection import build_output_estimate
+from image_converter.services.naming import build_output_filename
 from image_converter.services.preview import TexturePreviewService
 from image_converter.services.presets import PresetRepository
 
@@ -163,6 +165,7 @@ class SettingsPanel(QWidget):
         self._connect_option_change_signals()
         self._update_resize_state()
         self._update_png8_state()
+        self._refresh_naming_ui()
         self.set_available_presets([])
 
     def _build_ui(self) -> None:
@@ -183,6 +186,7 @@ class SettingsPanel(QWidget):
 
         root_layout.addWidget(self._build_presets_group())
         root_layout.addWidget(self._build_paths_group())
+        root_layout.addWidget(self._build_naming_group())
         root_layout.addWidget(self._build_basic_group())
         root_layout.addWidget(self._build_png_group())
         root_layout.addWidget(self._build_resize_group())
@@ -290,6 +294,38 @@ class SettingsPanel(QWidget):
             self.input_file_button,
             self.input_folder_button,
             self.output_button,
+        )
+        return group
+
+    def _build_naming_group(self) -> QGroupBox:
+        group = QGroupBox("Naming Rules")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        self.naming_lowercase_checkbox = QCheckBox("Приводить имена к lowercase")
+        layout.addWidget(self.naming_lowercase_checkbox)
+
+        self.naming_replace_spaces_checkbox = QCheckBox("Заменять пробелы на _")
+        layout.addWidget(self.naming_replace_spaces_checkbox)
+
+        self.naming_normalize_suffix_checkbox = QCheckBox(
+            "Нормализовать suffix карты по map type"
+        )
+        layout.addWidget(self.naming_normalize_suffix_checkbox)
+
+        self.naming_summary_label = QLabel()
+        self.naming_summary_label.setObjectName("SummaryText")
+        self.naming_summary_label.setWordWrap(True)
+        layout.addWidget(self.naming_summary_label)
+
+        self.naming_lowercase_checkbox.toggled.connect(self._refresh_naming_ui)
+        self.naming_replace_spaces_checkbox.toggled.connect(self._refresh_naming_ui)
+        self.naming_normalize_suffix_checkbox.toggled.connect(self._refresh_naming_ui)
+
+        self._register_interactive(
+            self.naming_lowercase_checkbox,
+            self.naming_replace_spaces_checkbox,
+            self.naming_normalize_suffix_checkbox,
         )
         return group
 
@@ -416,6 +452,9 @@ class SettingsPanel(QWidget):
             self.resize_none_radio,
             self.resize_percent_radio,
             self.resize_max_side_radio,
+            self.naming_lowercase_checkbox,
+            self.naming_replace_spaces_checkbox,
+            self.naming_normalize_suffix_checkbox,
         )
         for widget in toggles:
             widget.toggled.connect(self._notify_options_changed)
@@ -488,6 +527,13 @@ class SettingsPanel(QWidget):
             return ResizeMode.MAX_SIDE
         return ResizeMode.NONE
 
+    def build_naming_rules(self) -> NamingRules:
+        return NamingRules(
+            lowercase=self.naming_lowercase_checkbox.isChecked(),
+            replace_spaces=self.naming_replace_spaces_checkbox.isChecked(),
+            normalize_map_suffix=self.naming_normalize_suffix_checkbox.isChecked(),
+        )
+
     def build_conversion_options(self) -> ConversionOptions:
         return ConversionOptions(
             recursive=self.recursive_checkbox.isChecked(),
@@ -502,6 +548,7 @@ class SettingsPanel(QWidget):
             png8=self.png8_checkbox.isChecked(),
             png8_colors=self.png8_colors_spin.value(),
             dither=self.dither_checkbox.isChecked(),
+            naming=self.build_naming_rules(),
         )
 
     def build_request(self) -> BatchRequest:
@@ -525,6 +572,9 @@ class SettingsPanel(QWidget):
             self.png8_checkbox.setChecked(options.png8)
             self.png8_colors_spin.setValue(options.png8_colors)
             self.dither_checkbox.setChecked(options.dither)
+            self.naming_lowercase_checkbox.setChecked(options.naming.lowercase)
+            self.naming_replace_spaces_checkbox.setChecked(options.naming.replace_spaces)
+            self.naming_normalize_suffix_checkbox.setChecked(options.naming.normalize_map_suffix)
             self.resize_percent_spin.setValue(options.resize_percent)
             self.max_side_spin.setValue(options.max_side)
 
@@ -539,6 +589,7 @@ class SettingsPanel(QWidget):
 
         self._update_resize_state()
         self._update_png8_state()
+        self._refresh_naming_ui()
         self._notify_options_changed()
 
     def apply_app_settings(self, settings: AppSettings) -> None:
@@ -553,6 +604,7 @@ class SettingsPanel(QWidget):
         if enabled:
             self._update_resize_state()
             self._update_png8_state()
+            self._refresh_naming_ui()
             self._refresh_preset_ui()
 
     def set_available_presets(self, presets: list[ConversionPreset]) -> None:
@@ -618,6 +670,23 @@ class SettingsPanel(QWidget):
         if self._suppress_option_signal:
             return
         self.options_changed.emit()
+
+    def _refresh_naming_ui(self, *_args: object) -> None:
+        naming_rules = self.build_naming_rules()
+        if not naming_rules.is_enabled:
+            self.naming_summary_label.setText(
+                "PNG-имена останутся как у исходников. Включите правила, если хотите подчистить набор перед экспортом."
+            )
+            return
+
+        example_name = build_output_filename(
+            Path("Wood Floor Albedo.tga"),
+            naming_rules,
+            TextureMapType.BASECOLOR,
+        )
+        self.naming_summary_label.setText(
+            f"Пример: Wood Floor Albedo.tga -> {example_name}"
+        )
 
 
 class QueueTableWidget(QTableWidget):
@@ -1304,6 +1373,9 @@ class MetadataPanel(QWidget):
         self.source_field = InspectorField("Исходный файл", compact=True, wrap_value=False, inline=True)
         layout.addWidget(self.source_field)
 
+        self.name_preview_field = InspectorField("Имя после rules", compact=True, wrap_value=False, inline=True)
+        layout.addWidget(self.name_preview_field)
+
         metrics_grid = QGridLayout()
         metrics_grid.setHorizontalSpacing(8)
         metrics_grid.setVerticalSpacing(6)
@@ -1352,6 +1424,7 @@ class MetadataPanel(QWidget):
                 alpha="-",
                 frames="-",
                 size="-",
+                name_preview="-",
                 output="Будет рассчитан после выбора выходной папки.",
                 expected="-",
             )
@@ -1370,6 +1443,7 @@ class MetadataPanel(QWidget):
                 alpha="-",
                 frames="-",
                 size="-",
+                name_preview="Недоступно без метаданных.",
                 output=str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом.",
                 expected="Недоступно без метаданных.",
             )
@@ -1378,6 +1452,11 @@ class MetadataPanel(QWidget):
             return
 
         output_estimate = build_output_estimate(metadata, self._conversion_options)
+        output_name = build_output_filename(
+            item.path,
+            self._conversion_options.naming,
+            item.effective_map_type,
+        )
         self._set_values(
             source=str(item.path),
             format_value=metadata.format_name,
@@ -1386,6 +1465,7 @@ class MetadataPanel(QWidget):
             alpha="Да" if metadata.has_alpha else "Нет",
             frames=str(metadata.frame_count),
             size=metadata.size_text,
+            name_preview=output_name,
             output=str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом.",
             expected=output_estimate.summary,
         )
@@ -1412,10 +1492,12 @@ class MetadataPanel(QWidget):
         alpha: str,
         frames: str,
         size: str,
+        name_preview: str,
         output: str,
         expected: str,
     ) -> None:
         self.source_field.set_value(source)
+        self.name_preview_field.set_value(name_preview)
         self.format_field.set_value(format_value)
         self.resolution_field.set_value(resolution)
         self.mode_field.set_value(mode)
@@ -1532,6 +1614,7 @@ class MainWindow(QMainWindow):
         self.settings_panel.preset_save_requested.connect(self._save_current_preset)
         self.settings_panel.preset_delete_requested.connect(self._delete_preset)
         self.settings_panel.options_changed.connect(self._sync_preset_selection_with_current_options)
+        self.settings_panel.options_changed.connect(self._update_queue_output_paths)
         self.settings_panel.options_changed.connect(self._sync_metadata_conversion_options)
 
         settings_scroll = QScrollArea()
@@ -1640,7 +1723,7 @@ class MainWindow(QMainWindow):
     def build_request(self) -> BatchRequest:
         request = self.settings_panel.build_request()
         queue_sources = tuple(
-            item.source for item in self._queue_items if item.status is not QueueStatus.ERROR
+            item.batch_source for item in self._queue_items if item.status is not QueueStatus.ERROR
         )
         return BatchRequest(
             input_path=request.input_path,
@@ -1656,7 +1739,7 @@ class MainWindow(QMainWindow):
         existing_index = {self._queue_key(item.path): index for index, item in enumerate(self._queue_items)}
 
         for item in items:
-            item.output_path = self._build_output_path(item.source)
+            item.output_path = self._build_output_path(item.batch_source)
             key = self._queue_key(item.path)
             if key in existing_index:
                 self._queue_items[existing_index[key]] = item
@@ -1886,6 +1969,8 @@ class MainWindow(QMainWindow):
             f"Кадров/страниц: {metadata.frame_count}",
             f"Размер файла: {metadata.size_text}",
         ]
+        if item.output_path is not None:
+            lines.append(f"Выходное имя: {item.output_path.name}")
         if metadata.warnings:
             lines.append("Предупреждения:")
             lines.extend(f"- {warning}" for warning in metadata.warnings)
@@ -1907,11 +1992,15 @@ class MainWindow(QMainWindow):
     def _build_output_path(self, source: BatchSource) -> Path:
         output_root_text = self.settings_panel.output_edit.text().strip()
         output_root = Path(output_root_text) if output_root_text else None
-        return BatchConversionService.build_destination_for_source(source, output_root)
+        return BatchConversionService.build_destination_for_source(
+            source,
+            output_root,
+            self.settings_panel.build_conversion_options(),
+        )
 
     def _update_queue_output_paths(self, *_args: object) -> None:
         for item in self._queue_items:
-            item.output_path = self._build_output_path(item.source)
+            item.output_path = self._build_output_path(item.batch_source)
         self._render_queue()
         self._sync_workspace_selection()
 
@@ -2066,6 +2155,7 @@ class MainWindow(QMainWindow):
         else:
             return
 
+        item.output_path = self._build_output_path(item.batch_source)
         self._render_queue()
         self._sync_workspace_selection()
         self._sync_status_bar_with_selection()
