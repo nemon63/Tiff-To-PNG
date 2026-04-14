@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from image_converter.domain.models import AssetMetadata, ConversionOptions, ResizeMode
+from image_converter.domain.models import (
+    AssetMetadata,
+    ConversionOptions,
+    ResizeMode,
+    TextureMapType,
+)
+from image_converter.services.colorspace import recommended_colorspace_for_map_type
 
 
 @dataclass(slots=True, frozen=True)
@@ -10,32 +16,40 @@ class OutputEstimate:
     resolution_text: str
     format_text: str
     mode_text: str
+    colorspace_text: str
     summary: str
 
 
-def build_output_estimate(metadata: AssetMetadata, options: ConversionOptions) -> OutputEstimate:
+def build_output_estimate(
+    metadata: AssetMetadata,
+    options: ConversionOptions,
+    map_type: TextureMapType = TextureMapType.UNKNOWN,
+) -> OutputEstimate:
     width, height = _estimate_output_size(metadata.width, metadata.height, options)
     resolution_text = f"{width}x{height}" if width > 0 and height > 0 else "-"
+    colorspace = recommended_colorspace_for_map_type(map_type).label
 
     if options.png8:
         color_count = max(2, min(options.png8_colors, 256))
         format_text = "PNG-8"
         mode_text = "Indexed + alpha" if metadata.has_alpha else "Indexed"
-        summary = f"{resolution_text} · {format_text} · {color_count} colors · {mode_text}"
+        summary = f"{resolution_text} · {format_text} · {color_count} colors · {mode_text} · {colorspace}"
         return OutputEstimate(
             resolution_text=resolution_text,
             format_text=format_text,
             mode_text=mode_text,
+            colorspace_text=colorspace,
             summary=summary,
         )
 
     normalized_mode = _estimate_normalized_mode(metadata)
     format_text = "PNG"
-    summary = f"{resolution_text} · {format_text} · {normalized_mode}"
+    summary = f"{resolution_text} · {format_text} · {normalized_mode} · {colorspace}"
     return OutputEstimate(
         resolution_text=resolution_text,
         format_text=format_text,
         mode_text=normalized_mode,
+        colorspace_text=colorspace,
         summary=summary,
     )
 

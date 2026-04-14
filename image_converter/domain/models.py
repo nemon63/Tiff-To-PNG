@@ -48,6 +48,21 @@ class TextureMapType(str, Enum):
         return mapping[self]
 
 
+class TextureColorSpace(str, Enum):
+    UNKNOWN = "unknown"
+    SRGB = "srgb"
+    LINEAR = "linear"
+
+    @property
+    def label(self) -> str:
+        mapping = {
+            TextureColorSpace.UNKNOWN: "Auto",
+            TextureColorSpace.SRGB: "sRGB",
+            TextureColorSpace.LINEAR: "Linear",
+        }
+        return mapping[self]
+
+
 class ConversionStatus(str, Enum):
     SUCCESS = "success"
     SKIPPED = "skipped"

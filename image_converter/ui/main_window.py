@@ -60,7 +60,14 @@ from image_converter.domain.models import (
     QueueItem,
     QueueStatus,
     ResizeMode,
+    TextureColorSpace,
     TextureMapType,
+)
+from image_converter.services.colorspace import (
+    item_preflight_warnings,
+    item_warning_count,
+    item_warning_summary,
+    recommended_colorspace_for_map_type,
 )
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.inspection import build_output_estimate
@@ -106,8 +113,9 @@ def _status_text(status: QueueStatus) -> str:
 
 def _queue_status_display(item: QueueItem) -> str:
     base_text = _status_text(item.status)
-    if item.status in (QueueStatus.READY, QueueStatus.PENDING) and item.metadata and item.metadata.warning_count:
-        return f"{base_text} ({item.metadata.warning_count} предупрежд.)"
+    warning_count = item_warning_count(item)
+    if item.status in (QueueStatus.READY, QueueStatus.PENDING) and warning_count:
+        return f"{base_text} ({warning_count} предупрежд.)"
     return base_text
 
 
@@ -125,6 +133,10 @@ def _preview_channel_label(channel: PreviewChannel) -> str:
 
 def _map_type_label(map_type: TextureMapType) -> str:
     return map_type.label
+
+
+def _colorspace_label(colorspace: TextureColorSpace) -> str:
+    return colorspace.label
 
 
 def _qimage_from_pil(image) -> QImage:
@@ -150,7 +162,7 @@ def _status_colors(item: QueueItem) -> tuple[QColor, QColor]:
         return QColor("#2A2A2A"), QColor("#E7E7E7")
     if status is QueueStatus.ERROR:
         return QColor("#4A1717"), QColor("#FFD7D7")
-    if item.metadata and item.metadata.warnings:
+    if item_warning_count(item):
         return QColor("#4C3B10"), QColor("#FFF0B8")
     return QColor("#1F1F1F"), QColor("#F3F3F3")
 
@@ -1349,8 +1361,11 @@ class PreviewPanel(QWidget):
         channel_name = _preview_channel_label(self._selected_channel)
         alpha_state = "alpha" if metadata.has_alpha else "opaque"
         map_type_name = _map_type_label(item.effective_map_type)
+        colorspace_name = _colorspace_label(
+            recommended_colorspace_for_map_type(item.effective_map_type)
+        )
         self.asset_meta_label.setText(
-            f"{map_type_name} · {metadata.resolution_text} · {metadata.mode} · канал: {channel_name} · {alpha_state}"
+            f"{map_type_name} · {colorspace_name} · {metadata.resolution_text} · {metadata.mode} · канал: {channel_name} · {alpha_state}"
         )
         self.asset_meta_label.setToolTip(self.asset_meta_label.text())
 
@@ -1460,20 +1475,18 @@ class MetadataPanel(QWidget):
         self.format_field = InspectorField("Формат", compact=True, wrap_value=False, inline=True)
         self.resolution_field = InspectorField("Разрешение", compact=True, wrap_value=False, inline=True)
         self.mode_field = InspectorField("Режим", compact=True, wrap_value=False, inline=True)
+        self.colorspace_field = InspectorField("Color Space", compact=True, wrap_value=False, inline=True)
         self.alpha_field = InspectorField("Alpha", compact=True, wrap_value=False, inline=True)
         self.frames_field = InspectorField("Кадры", compact=True, wrap_value=False, inline=True)
         self.size_field = InspectorField("Размер", compact=True, wrap_value=False, inline=True)
 
-        metric_fields = (
-            self.format_field,
-            self.resolution_field,
-            self.mode_field,
-            self.alpha_field,
-            self.frames_field,
-            self.size_field,
-        )
-        for index, field in enumerate(metric_fields):
-            metrics_grid.addWidget(field, index // 3, index % 3)
+        metrics_grid.addWidget(self.format_field, 0, 0)
+        metrics_grid.addWidget(self.resolution_field, 0, 1)
+        metrics_grid.addWidget(self.mode_field, 0, 2)
+        metrics_grid.addWidget(self.colorspace_field, 1, 0)
+        metrics_grid.addWidget(self.alpha_field, 1, 1)
+        metrics_grid.addWidget(self.size_field, 1, 2)
+        metrics_grid.addWidget(self.frames_field, 2, 0)
         layout.addLayout(metrics_grid)
 
         self.output_field = InspectorField("Выходной PNG", compact=True, wrap_value=False, inline=True)
@@ -1499,6 +1512,7 @@ class MetadataPanel(QWidget):
                 format_value="-",
                 resolution="-",
                 mode="-",
+                colorspace="-",
                 alpha="-",
                 frames="-",
                 size="-",
@@ -1518,6 +1532,7 @@ class MetadataPanel(QWidget):
                 format_value="-",
                 resolution="-",
                 mode="-",
+                colorspace="-",
                 alpha="-",
                 frames="-",
                 size="-",
@@ -1529,7 +1544,11 @@ class MetadataPanel(QWidget):
             self.warning_label.show()
             return
 
-        output_estimate = build_output_estimate(metadata, self._conversion_options)
+        output_estimate = build_output_estimate(
+            metadata,
+            self._conversion_options,
+            item.effective_map_type,
+        )
         output_name = build_output_filename(
             item.path,
             self._conversion_options.naming,
@@ -1540,6 +1559,7 @@ class MetadataPanel(QWidget):
             format_value=metadata.format_name,
             resolution=metadata.resolution_text,
             mode=metadata.mode,
+            colorspace=output_estimate.colorspace_text,
             alpha="Да" if metadata.has_alpha else "Нет",
             frames=str(metadata.frame_count),
             size=metadata.size_text,
@@ -1548,7 +1568,7 @@ class MetadataPanel(QWidget):
             expected=output_estimate.summary,
         )
 
-        warnings: list[str] = list(metadata.warnings)
+        warnings: list[str] = list(item_preflight_warnings(item))
         if item.status is QueueStatus.ERROR and item.message:
             warnings.append(item.message)
 
@@ -1567,6 +1587,7 @@ class MetadataPanel(QWidget):
         format_value: str,
         resolution: str,
         mode: str,
+        colorspace: str,
         alpha: str,
         frames: str,
         size: str,
@@ -1579,6 +1600,7 @@ class MetadataPanel(QWidget):
         self.format_field.set_value(format_value)
         self.resolution_field.set_value(resolution)
         self.mode_field.set_value(mode)
+        self.colorspace_field.set_value(colorspace)
         self.alpha_field.set_value(alpha)
         self.frames_field.set_value(frames)
         self.size_field.set_value(size)
@@ -1971,8 +1993,9 @@ class MainWindow(QMainWindow):
             output_text = str(item.output_path) if item.output_path is not None else "-"
             status_text = _queue_status_display(item)
             status_tooltip = item.message or status_text
-            if metadata and metadata.warnings and item.status in (QueueStatus.READY, QueueStatus.PENDING):
-                status_tooltip = metadata.warning_summary
+            dynamic_warnings = item_preflight_warnings(item)
+            if dynamic_warnings and item.status in (QueueStatus.READY, QueueStatus.PENDING):
+                status_tooltip = "; ".join(dynamic_warnings)
 
             row_items = [
                 self._make_table_item(item.path.name, tooltip=str(item.path)),
@@ -1999,7 +2022,7 @@ class MainWindow(QMainWindow):
             self.set_status("Очередь пуста")
             return
 
-        warning_count = sum(1 for item in self._queue_items if item.metadata and item.metadata.warnings)
+        warning_count = sum(1 for item in self._queue_items if item_warning_count(item))
         error_count = sum(1 for item in self._queue_items if item.status is QueueStatus.ERROR)
         summary_text = f"Всего: {len(self._queue_items)} | Предупреждений: {warning_count} | Ошибок: {error_count}"
         self.queue_panel.summary_label.setText(summary_text)
@@ -2029,6 +2052,9 @@ class MainWindow(QMainWindow):
     def _map_type_tooltip(self, item: QueueItem) -> str:
         metadata = item.metadata
         lines = [f"Тип карты: {_map_type_label(item.effective_map_type)}"]
+        lines.append(
+            f"Color Space: {_colorspace_label(recommended_colorspace_for_map_type(item.effective_map_type))}"
+        )
         if item.map_type_override is not None:
             lines.append("Источник: ручное переопределение")
         elif metadata is not None:
@@ -2044,6 +2070,7 @@ class MainWindow(QMainWindow):
 
         lines = [
             f"Тип карты: {_map_type_label(item.effective_map_type)}",
+            f"Color Space: {_colorspace_label(recommended_colorspace_for_map_type(item.effective_map_type))}",
             f"Формат: {metadata.format_name}",
             f"Разрешение: {metadata.resolution_text}",
             f"Режим: {metadata.mode}",
@@ -2053,9 +2080,10 @@ class MainWindow(QMainWindow):
         ]
         if item.output_path is not None:
             lines.append(f"Выходное имя: {item.output_path.name}")
-        if metadata.warnings:
+        dynamic_warnings = item_preflight_warnings(item)
+        if dynamic_warnings:
             lines.append("Предупреждения:")
-            lines.extend(f"- {warning}" for warning in metadata.warnings)
+            lines.extend(f"- {warning}" for warning in dynamic_warnings)
         return "\n".join(lines)
 
     def _find_queue_item(self, path: Path) -> QueueItem | None:
@@ -2227,8 +2255,8 @@ class MainWindow(QMainWindow):
             if not self._queue_items:
                 self.set_status("Очередь пуста")
             return
-        if item.status in (QueueStatus.READY, QueueStatus.PENDING) and item.metadata and item.metadata.warnings:
-            message = item.metadata.warning_summary
+        if item.status in (QueueStatus.READY, QueueStatus.PENDING) and item_warning_count(item):
+            message = item_warning_summary(item)
         else:
             message = item.message or _queue_status_display(item)
         self.set_status(f"{item.path.name}: {message}")
