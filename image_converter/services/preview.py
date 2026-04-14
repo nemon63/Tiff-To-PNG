@@ -8,11 +8,18 @@ from image_converter.domain.models import PreviewChannel
 
 
 class TexturePreviewService:
-    def render(self, path: Path, channel: PreviewChannel, *, max_size: int = 512) -> Image.Image:
+    def render(
+        self,
+        path: Path,
+        channel: PreviewChannel,
+        *,
+        max_size: int | None = 512,
+    ) -> Image.Image:
         with Image.open(path) as image:
             working_image = self._extract_first_frame(image)
             preview_image = self._to_preview_image(working_image, channel)
-            preview_image.thumbnail((max_size, max_size), getattr(Image, "Resampling", Image).LANCZOS)
+            if max_size is not None and max_size > 0:
+                preview_image.thumbnail((max_size, max_size), getattr(Image, "Resampling", Image).LANCZOS)
             return preview_image.copy()
 
     @staticmethod

@@ -145,6 +145,16 @@ QFrame#InspectorRow {
     border-radius: 14px;
 }
 
+QFrame#InspectorCard,
+QFrame#InspectorMetricTile,
+QFrame#ViewerHeaderCard,
+QFrame#ViewerToolbarCard,
+QFrame#ViewerCanvasCard {
+    background: #F7F3EC;
+    border: 1px solid #DED4C7;
+    border-radius: 16px;
+}
+
 QFrame#InspectorCompactRow {
     background: transparent;
     border: none;
@@ -179,6 +189,30 @@ QLabel#InspectorInlineValue {
     color: #182430;
     font-size: 13px;
     font-weight: 600;
+    background: transparent;
+    border: none;
+}
+
+QLabel#InspectorHintText,
+QLabel#ViewerMetaText,
+QLabel#ViewerHintText {
+    color: #607081;
+    background: transparent;
+    border: none;
+}
+
+QLabel#MetricKey {
+    color: #748291;
+    font-size: 11px;
+    font-weight: 700;
+    background: transparent;
+    border: none;
+}
+
+QLabel#MetricValue {
+    color: #182430;
+    font-size: 16px;
+    font-weight: 700;
     background: transparent;
     border: none;
 }
