@@ -2,6 +2,8 @@ from __future__ import annotations
 
 SUPPORTED_SOURCE_EXTENSIONS = frozenset(
     {
+        ".dds",
+        ".png",
         ".tif",
         ".tiff",
         ".tga",
@@ -15,6 +17,6 @@ SUPPORTED_SOURCE_EXTENSIONS = frozenset(
 )
 
 FILE_DIALOG_FILTER = (
-    "Поддерживаемые изображения (*.tif *.tiff *.tga *.jpg *.jpeg *.bmp *.gif *.webp *.psd);;"
+    "Поддерживаемые изображения (*.dds *.png *.tif *.tiff *.tga *.jpg *.jpeg *.bmp *.gif *.webp *.psd);;"
     "Все файлы (*)"
 )

@@ -26,6 +26,7 @@ class TextureMapType(str, Enum):
     BASECOLOR = "basecolor"
     NORMAL = "normal"
     ROUGHNESS = "roughness"
+    SMOOTHNESS = "smoothness"
     METALLIC = "metallic"
     AO = "ao"
     OPACITY = "opacity"
@@ -39,6 +40,7 @@ class TextureMapType(str, Enum):
             TextureMapType.BASECOLOR: "BaseColor",
             TextureMapType.NORMAL: "Normal",
             TextureMapType.ROUGHNESS: "Roughness",
+            TextureMapType.SMOOTHNESS: "Smoothness",
             TextureMapType.METALLIC: "Metallic",
             TextureMapType.AO: "AO",
             TextureMapType.OPACITY: "Opacity",
@@ -91,10 +93,19 @@ class ChannelPackLayout(str, Enum):
     ORM = "orm"
     RMA = "rma"
     MRA = "mra"
+    UNITY_URP = "unity_urp"
+    UNITY_HDRP = "unity_hdrp"
 
     @property
     def label(self) -> str:
-        return self.value.upper()
+        mapping = {
+            ChannelPackLayout.ORM: "ORM",
+            ChannelPackLayout.RMA: "RMA",
+            ChannelPackLayout.MRA: "MRA",
+            ChannelPackLayout.UNITY_URP: "Unity URP",
+            ChannelPackLayout.UNITY_HDRP: "Unity HDRP",
+        }
+        return mapping[self]
 
 
 @dataclass(slots=True, frozen=True)

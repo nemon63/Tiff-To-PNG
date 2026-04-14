@@ -5,8 +5,11 @@ import re
 from pathlib import Path
 
 from image_converter.domain.models import (
+    ChannelPackLayout,
+    ChannelPackingOptions,
     ConversionOptions,
     ConversionPreset,
+    NamingRules,
     PresetScope,
     ResizeMode,
 )
@@ -42,6 +45,42 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
             resize_mode=ResizeMode.MAX_SIDE,
             max_side=4096,
             png8=False,
+        ),
+    ),
+    ConversionPreset(
+        preset_id="system:unity-urp",
+        name="Unity URP",
+        scope=PresetScope.SYSTEM,
+        description="Собирает metallic/smoothness карту для Unity URP. Альфа берет Smoothness или считает 1-Roughness.",
+        options=ConversionOptions(
+            optimize=True,
+            compress_level=6,
+            resize_mode=ResizeMode.MAX_SIDE,
+            max_side=4096,
+            png8=False,
+            naming=NamingRules(normalize_map_suffix=True),
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.UNITY_URP,
+            ),
+        ),
+    ),
+    ConversionPreset(
+        preset_id="system:unity-hdrp",
+        name="Unity HDRP",
+        scope=PresetScope.SYSTEM,
+        description="Собирает HDRP Mask Map. B-канал заполняется белым как detail mask по умолчанию, альфа берет Smoothness или 1-Roughness.",
+        options=ConversionOptions(
+            optimize=True,
+            compress_level=6,
+            resize_mode=ResizeMode.MAX_SIDE,
+            max_side=4096,
+            png8=False,
+            naming=NamingRules(normalize_map_suffix=True),
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.UNITY_HDRP,
+            ),
         ),
     ),
     ConversionPreset(

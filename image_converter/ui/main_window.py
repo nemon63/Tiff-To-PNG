@@ -277,7 +277,7 @@ class SettingsPanel(QWidget):
         self.input_edit.setPlaceholderText("Файл или папка с исходниками")
         self.input_edit.editingFinished.connect(self._on_input_editing_finished)
         self.input_edit.setToolTip(
-            "Путь к файлу или папке.\nПоддерживаются TIFF, TGA, JPEG, BMP, GIF, WEBP и PSD."
+            "Путь к файлу или папке.\nПоддерживаются DDS, PNG, TIFF, TGA, JPEG, BMP, GIF, WEBP и PSD."
         )
 
         input_row = QHBoxLayout()
@@ -768,7 +768,7 @@ class SettingsPanel(QWidget):
 
         if not packing_options.enabled:
             self.packing_queue_label.setText(
-                "Packing выключен. Включите его, если нужно собрать ORM/RMA/MRA прямо из набора карт."
+                "Packing выключен. Включите его, если нужно собрать ORM/RMA/MRA или Unity-packed карты прямо из набора текстур."
             )
             return
 
@@ -2145,7 +2145,7 @@ class MainWindow(QMainWindow):
         options = self.settings_panel.build_conversion_options()
         if not options.packing.enabled:
             self.settings_panel.set_packing_preflight_summary(
-                "Packing выключен. Включите его, если нужно собрать ORM/RMA/MRA прямо из набора карт."
+                "Packing выключен. Включите его, если нужно собрать ORM/RMA/MRA или Unity-packed карты прямо из набора текстур."
             )
             return
 

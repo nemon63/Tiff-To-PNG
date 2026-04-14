@@ -19,6 +19,10 @@ MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
         ("roughness", "rough", "rgh"),
     ),
     (
+        TextureMapType.SMOOTHNESS,
+        ("smoothness", "smooth", "gloss", "glossiness", "glossmap"),
+    ),
+    (
         TextureMapType.METALLIC,
         ("metallic", "metalness", "metal", "mtl"),
     ),
@@ -44,6 +48,7 @@ CANONICAL_MAP_SUFFIXES: dict[TextureMapType, str] = {
     TextureMapType.BASECOLOR: "basecolor",
     TextureMapType.NORMAL: "normal",
     TextureMapType.ROUGHNESS: "roughness",
+    TextureMapType.SMOOTHNESS: "smoothness",
     TextureMapType.METALLIC: "metallic",
     TextureMapType.AO: "ao",
     TextureMapType.OPACITY: "opacity",

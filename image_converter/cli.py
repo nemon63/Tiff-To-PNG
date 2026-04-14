@@ -20,14 +20,14 @@ from image_converter.services.validation import validate_request
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Batch convert TIFF/TGA/JPEG/BMP/GIF/WEBP/PSD to PNG "
+            "Batch convert DDS/PNG/TIFF/TGA/JPEG/BMP/GIF/WEBP/PSD to PNG "
             "with optional resize and PNG-8 quantization."
         )
     )
     parser.add_argument(
         "input",
         type=str,
-        help="Input file or folder with .tif/.tiff/.tga/.jpg/.jpeg/.bmp/.gif/.webp/.psd",
+        help="Input file or folder with .dds/.png/.tif/.tiff/.tga/.jpg/.jpeg/.bmp/.gif/.webp/.psd",
     )
     parser.add_argument(
         "--out",
@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         choices=[layout.value for layout in ChannelPackLayout],
         default="",
-        help="Build packed texture after batch conversion: orm, rma or mra",
+        help="Build packed texture after batch conversion: orm, rma, mra, unity_urp or unity_hdrp",
     )
     parser.add_argument(
         "--compress-level",

@@ -14,6 +14,7 @@ COLOR_MAP_TYPES = {
 TECHNICAL_MAP_TYPES = {
     TextureMapType.NORMAL,
     TextureMapType.ROUGHNESS,
+    TextureMapType.SMOOTHNESS,
     TextureMapType.METALLIC,
     TextureMapType.AO,
     TextureMapType.OPACITY,
@@ -24,6 +25,7 @@ COLOR_NAME_ALIASES = map_type_aliases(TextureMapType.BASECOLOR) + map_type_alias
 TECHNICAL_NAME_ALIASES = (
     map_type_aliases(TextureMapType.NORMAL)
     + map_type_aliases(TextureMapType.ROUGHNESS)
+    + map_type_aliases(TextureMapType.SMOOTHNESS)
     + map_type_aliases(TextureMapType.METALLIC)
     + map_type_aliases(TextureMapType.AO)
     + map_type_aliases(TextureMapType.OPACITY)
