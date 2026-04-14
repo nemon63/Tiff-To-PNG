@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from image_converter.domain.models import ConversionOptions, NamingRules, ResizeMode
+from image_converter.domain.models import (
+    ChannelPackLayout,
+    ChannelPackingOptions,
+    ConversionOptions,
+    NamingRules,
+    ResizeMode,
+)
 
 
 def serialize_conversion_options(options: ConversionOptions) -> dict[str, Any]:
@@ -24,6 +30,10 @@ def serialize_conversion_options(options: ConversionOptions) -> dict[str, Any]:
             "replace_spaces": options.naming.replace_spaces,
             "normalize_map_suffix": options.naming.normalize_map_suffix,
         },
+        "packing": {
+            "enabled": options.packing.enabled,
+            "layout": options.packing.layout.value,
+        },
     }
 
 
@@ -36,6 +46,17 @@ def deserialize_conversion_options(data: dict[str, Any]) -> ConversionOptions:
     naming_data = data.get("naming", {})
     if not isinstance(naming_data, dict):
         naming_data = {}
+
+    packing_data = data.get("packing", {})
+    if not isinstance(packing_data, dict):
+        packing_data = {}
+
+    try:
+        packing_layout = ChannelPackLayout(
+            packing_data.get("layout", ChannelPackLayout.ORM.value)
+        )
+    except ValueError:
+        packing_layout = ChannelPackLayout.ORM
 
     return ConversionOptions(
         recursive=bool(data.get("recursive", True)),
@@ -54,6 +75,10 @@ def deserialize_conversion_options(data: dict[str, Any]) -> ConversionOptions:
             lowercase=bool(naming_data.get("lowercase", False)),
             replace_spaces=bool(naming_data.get("replace_spaces", False)),
             normalize_map_suffix=bool(naming_data.get("normalize_map_suffix", False)),
+        ),
+        packing=ChannelPackingOptions(
+            enabled=bool(packing_data.get("enabled", False)),
+            layout=packing_layout,
         ),
     )
 

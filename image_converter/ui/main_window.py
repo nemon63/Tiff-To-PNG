@@ -51,6 +51,8 @@ from image_converter.domain.models import (
     AppSettings,
     BatchRequest,
     BatchSource,
+    ChannelPackLayout,
+    ChannelPackingOptions,
     ConversionOptions,
     ConversionPreset,
     NamingRules,
@@ -63,6 +65,11 @@ from image_converter.domain.models import (
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.inspection import build_output_estimate
 from image_converter.services.naming import build_output_filename
+from image_converter.services.packing import (
+    build_channel_pack_jobs,
+    channel_pack_mapping_text,
+    summarize_channel_pack_jobs,
+)
 from image_converter.services.preview import TexturePreviewService
 from image_converter.services.presets import PresetRepository
 
@@ -161,11 +168,13 @@ class SettingsPanel(QWidget):
         self._interactive_widgets: list[QWidget] = []
         self._presets_by_id: dict[str, ConversionPreset] = {}
         self._suppress_option_signal = False
+        self._packing_preflight_text = "Подходящих наборов для packing пока нет."
         self._build_ui()
         self._connect_option_change_signals()
         self._update_resize_state()
         self._update_png8_state()
         self._refresh_naming_ui()
+        self._refresh_packing_ui()
         self.set_available_presets([])
 
     def _build_ui(self) -> None:
@@ -187,6 +196,7 @@ class SettingsPanel(QWidget):
         root_layout.addWidget(self._build_presets_group())
         root_layout.addWidget(self._build_paths_group())
         root_layout.addWidget(self._build_naming_group())
+        root_layout.addWidget(self._build_packing_group())
         root_layout.addWidget(self._build_basic_group())
         root_layout.addWidget(self._build_png_group())
         root_layout.addWidget(self._build_resize_group())
@@ -329,6 +339,37 @@ class SettingsPanel(QWidget):
         )
         return group
 
+    def _build_packing_group(self) -> QGroupBox:
+        group = QGroupBox("Channel Packing")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        self.pack_enable_checkbox = QCheckBox("Собирать packed-textures после batch")
+        self.pack_enable_checkbox.toggled.connect(self._refresh_packing_ui)
+        layout.addWidget(self.pack_enable_checkbox)
+
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(QLabel("Layout:"))
+        self.pack_layout_combo = QComboBox()
+        for pack_layout in ChannelPackLayout:
+            self.pack_layout_combo.addItem(pack_layout.label, pack_layout)
+        self.pack_layout_combo.currentIndexChanged.connect(self._refresh_packing_ui)
+        layout_row.addWidget(self.pack_layout_combo, 1)
+        layout.addLayout(layout_row)
+
+        self.packing_mapping_label = QLabel()
+        self.packing_mapping_label.setObjectName("SummaryText")
+        self.packing_mapping_label.setWordWrap(True)
+        layout.addWidget(self.packing_mapping_label)
+
+        self.packing_queue_label = QLabel()
+        self.packing_queue_label.setObjectName("SummaryText")
+        self.packing_queue_label.setWordWrap(True)
+        layout.addWidget(self.packing_queue_label)
+
+        self._register_interactive(self.pack_enable_checkbox, self.pack_layout_combo)
+        return group
+
     def _build_basic_group(self) -> QGroupBox:
         group = QGroupBox("Основные параметры")
         layout = QVBoxLayout(group)
@@ -455,6 +496,7 @@ class SettingsPanel(QWidget):
             self.naming_lowercase_checkbox,
             self.naming_replace_spaces_checkbox,
             self.naming_normalize_suffix_checkbox,
+            self.pack_enable_checkbox,
         )
         for widget in toggles:
             widget.toggled.connect(self._notify_options_changed)
@@ -466,6 +508,8 @@ class SettingsPanel(QWidget):
             self.max_side_spin,
         ):
             widget.valueChanged.connect(self._notify_options_changed)
+
+        self.pack_layout_combo.currentIndexChanged.connect(self._notify_options_changed)
 
     def _set_input_path(self, path: str) -> None:
         self.input_edit.setText(path)
@@ -534,6 +578,15 @@ class SettingsPanel(QWidget):
             normalize_map_suffix=self.naming_normalize_suffix_checkbox.isChecked(),
         )
 
+    def build_channel_packing_options(self) -> ChannelPackingOptions:
+        layout_data = self.pack_layout_combo.currentData()
+        if not isinstance(layout_data, ChannelPackLayout):
+            layout_data = ChannelPackLayout.ORM
+        return ChannelPackingOptions(
+            enabled=self.pack_enable_checkbox.isChecked(),
+            layout=layout_data,
+        )
+
     def build_conversion_options(self) -> ConversionOptions:
         return ConversionOptions(
             recursive=self.recursive_checkbox.isChecked(),
@@ -549,6 +602,7 @@ class SettingsPanel(QWidget):
             png8_colors=self.png8_colors_spin.value(),
             dither=self.dither_checkbox.isChecked(),
             naming=self.build_naming_rules(),
+            packing=self.build_channel_packing_options(),
         )
 
     def build_request(self) -> BatchRequest:
@@ -575,6 +629,11 @@ class SettingsPanel(QWidget):
             self.naming_lowercase_checkbox.setChecked(options.naming.lowercase)
             self.naming_replace_spaces_checkbox.setChecked(options.naming.replace_spaces)
             self.naming_normalize_suffix_checkbox.setChecked(options.naming.normalize_map_suffix)
+            self.pack_enable_checkbox.setChecked(options.packing.enabled)
+            for index in range(self.pack_layout_combo.count()):
+                if self.pack_layout_combo.itemData(index) == options.packing.layout:
+                    self.pack_layout_combo.setCurrentIndex(index)
+                    break
             self.resize_percent_spin.setValue(options.resize_percent)
             self.max_side_spin.setValue(options.max_side)
 
@@ -590,6 +649,7 @@ class SettingsPanel(QWidget):
         self._update_resize_state()
         self._update_png8_state()
         self._refresh_naming_ui()
+        self._refresh_packing_ui()
         self._notify_options_changed()
 
     def apply_app_settings(self, settings: AppSettings) -> None:
@@ -605,6 +665,7 @@ class SettingsPanel(QWidget):
             self._update_resize_state()
             self._update_png8_state()
             self._refresh_naming_ui()
+            self._refresh_packing_ui()
             self._refresh_preset_ui()
 
     def set_available_presets(self, presets: list[ConversionPreset]) -> None:
@@ -687,6 +748,23 @@ class SettingsPanel(QWidget):
         self.naming_summary_label.setText(
             f"Пример: Wood Floor Albedo.tga -> {example_name}"
         )
+
+    def _refresh_packing_ui(self, *_args: object) -> None:
+        packing_options = self.build_channel_packing_options()
+        self.pack_layout_combo.setEnabled(self.pack_enable_checkbox.isChecked())
+        self.packing_mapping_label.setText(channel_pack_mapping_text(packing_options.layout))
+
+        if not packing_options.enabled:
+            self.packing_queue_label.setText(
+                "Packing выключен. Включите его, если нужно собрать ORM/RMA/MRA прямо из набора карт."
+            )
+            return
+
+        self.packing_queue_label.setText(self._packing_preflight_text)
+
+    def set_packing_preflight_summary(self, text: str) -> None:
+        self._packing_preflight_text = text
+        self._refresh_packing_ui()
 
 
 class QueueTableWidget(QTableWidget):
@@ -1748,6 +1826,7 @@ class MainWindow(QMainWindow):
 
         self._queue_items.sort(key=lambda item: str(item.path).lower())
         self._render_queue()
+        self._refresh_packing_preflight()
         self._sync_status_bar_with_selection()
         self._sync_workspace_selection()
 
@@ -1763,12 +1842,14 @@ class MainWindow(QMainWindow):
             self._queue_items.pop(row)
 
         self._render_queue()
+        self._refresh_packing_preflight()
         self._sync_workspace_selection()
         self.set_status(f"Удалено элементов: {len(selected_rows)}")
 
     def clear_queue_items(self) -> None:
         self._queue_items.clear()
         self._render_queue()
+        self._refresh_packing_preflight()
         self.set_status("Очередь очищена")
 
     def reset_queue_statuses_for_run(self) -> None:
@@ -1833,6 +1914,7 @@ class MainWindow(QMainWindow):
             self.inspector_splitter.setSizes(list(settings.inspector_splitter_sizes))
         self._update_queue_output_paths()
         self._sync_preset_selection_with_current_options()
+        self._refresh_packing_preflight()
 
     def set_preset_repository(self, preset_repository: PresetRepository) -> None:
         self._preset_repository = preset_repository
@@ -2002,6 +2084,7 @@ class MainWindow(QMainWindow):
         for item in self._queue_items:
             item.output_path = self._build_output_path(item.batch_source)
         self._render_queue()
+        self._refresh_packing_preflight()
         self._sync_workspace_selection()
 
     def _reload_presets(self) -> None:
@@ -2029,6 +2112,18 @@ class MainWindow(QMainWindow):
 
     def _sync_metadata_conversion_options(self, *_args: object) -> None:
         self.metadata_panel.set_conversion_options(self.settings_panel.build_conversion_options())
+
+    def _refresh_packing_preflight(self, *_args: object) -> None:
+        options = self.settings_panel.build_conversion_options()
+        if not options.packing.enabled:
+            self.settings_panel.set_packing_preflight_summary(
+                "Packing выключен. Включите его, если нужно собрать ORM/RMA/MRA прямо из набора карт."
+            )
+            return
+
+        sources = [item.batch_source for item in self._queue_items if item.status is not QueueStatus.ERROR]
+        jobs = build_channel_pack_jobs(sources, None, options)
+        self.settings_panel.set_packing_preflight_summary(summarize_channel_pack_jobs(jobs))
 
     def _apply_preset(self, preset_id: str) -> None:
         preset = self._presets_by_id.get(preset_id)
@@ -2157,6 +2252,7 @@ class MainWindow(QMainWindow):
 
         item.output_path = self._build_output_path(item.batch_source)
         self._render_queue()
+        self._refresh_packing_preflight()
         self._sync_workspace_selection()
         self._sync_status_bar_with_selection()
 

@@ -72,6 +72,16 @@ class PreviewChannel(str, Enum):
     LUMA = "luma"
 
 
+class ChannelPackLayout(str, Enum):
+    ORM = "orm"
+    RMA = "rma"
+    MRA = "mra"
+
+    @property
+    def label(self) -> str:
+        return self.value.upper()
+
+
 @dataclass(slots=True, frozen=True)
 class NamingRules:
     lowercase: bool = False
@@ -81,6 +91,12 @@ class NamingRules:
     @property
     def is_enabled(self) -> bool:
         return self.lowercase or self.replace_spaces or self.normalize_map_suffix
+
+
+@dataclass(slots=True, frozen=True)
+class ChannelPackingOptions:
+    enabled: bool = False
+    layout: ChannelPackLayout = ChannelPackLayout.ORM
 
 
 @dataclass(slots=True, frozen=True)
@@ -98,6 +114,7 @@ class ConversionOptions:
     png8_colors: int = 256
     dither: bool = True
     naming: NamingRules = field(default_factory=NamingRules)
+    packing: ChannelPackingOptions = field(default_factory=ChannelPackingOptions)
 
 
 @dataclass(slots=True, frozen=True)

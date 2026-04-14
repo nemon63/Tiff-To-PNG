@@ -5,7 +5,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from image_converter.domain.errors import ValidationError
-from image_converter.domain.models import BatchRequest, ConversionOptions, NamingRules, ResizeMode
+from image_converter.domain.models import (
+    BatchRequest,
+    ChannelPackLayout,
+    ChannelPackingOptions,
+    ConversionOptions,
+    NamingRules,
+    ResizeMode,
+)
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.validation import validate_request
 
@@ -46,6 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--normalize-suffix",
         action="store_true",
         help="Normalize texture map suffixes such as albedo -> basecolor",
+    )
+    parser.add_argument(
+        "--pack-layout",
+        type=str,
+        choices=[layout.value for layout in ChannelPackLayout],
+        default="",
+        help="Build packed texture after batch conversion: orm, rma or mra",
     )
     parser.add_argument(
         "--compress-level",
@@ -103,6 +117,13 @@ def build_request_from_args(args: argparse.Namespace) -> BatchRequest:
         resize_mode = ResizeMode.MAX_SIDE
         max_side = args.max_side
 
+    packing = ChannelPackingOptions()
+    if args.pack_layout:
+        packing = ChannelPackingOptions(
+            enabled=True,
+            layout=ChannelPackLayout(args.pack_layout),
+        )
+
     return BatchRequest(
         input_path=Path(args.input),
         output_root=Path(args.out) if args.out else None,
@@ -124,6 +145,7 @@ def build_request_from_args(args: argparse.Namespace) -> BatchRequest:
                 replace_spaces=args.replace_spaces,
                 normalize_map_suffix=args.normalize_suffix,
             ),
+            packing=packing,
         ),
     )
 

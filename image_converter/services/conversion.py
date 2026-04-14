@@ -17,6 +17,11 @@ from image_converter.domain.models import (
 )
 from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.naming import build_output_filename
+from image_converter.services.packing import (
+    build_channel_pack_jobs,
+    execute_channel_pack_job,
+    summarize_channel_pack_jobs,
+)
 from image_converter.services.pipeline import ConversionPipeline
 
 Logger = Callable[[str], None]
@@ -74,7 +79,9 @@ class BatchConversionService:
     ) -> BatchSummary:
         write_log = logger or (lambda _message: None)
         summary = BatchSummary()
-        for source_spec in self.iter_request_sources(request):
+        source_specs = list(self.iter_request_sources(request))
+
+        for source_spec in source_specs:
             source = source_spec.path
             destination = self.build_destination_for_source(
                 source_spec,
@@ -102,6 +109,36 @@ class BatchConversionService:
                 summary.register(failed_result)
                 if on_item_complete is not None:
                     on_item_complete(failed_result)
+
+        if request.options.packing.enabled:
+            pack_jobs = build_channel_pack_jobs(source_specs, request.output_root, request.options)
+            layout = request.options.packing.layout.label
+            write_log(f"---- Channel Packing {layout} ----")
+            write_log(summarize_channel_pack_jobs(pack_jobs))
+
+            pack_created = 0
+            pack_skipped = 0
+            pack_failed = 0
+
+            for job in pack_jobs:
+                try:
+                    pack_result = execute_channel_pack_job(job, request.options)
+                except Exception as exc:
+                    write_log(f"PACK {job.layout.label} {job.group_name} -> ОШИБКА: {exc}")
+                    pack_failed += 1
+                    continue
+
+                write_log(f"PACK {job.layout.label} {job.group_name} -> {pack_result.message}")
+                if pack_result.status is ConversionStatus.SUCCESS:
+                    pack_created += 1
+                elif pack_result.status is ConversionStatus.SKIPPED:
+                    pack_skipped += 1
+                else:
+                    pack_failed += 1
+
+            write_log(
+                f"Packing итоги: создано={pack_created}, пропущено={pack_skipped}, ошибок={pack_failed}"
+            )
 
         return summary
 
