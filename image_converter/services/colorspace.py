@@ -91,7 +91,7 @@ def _contains_any_alias(normalized_stem: str, aliases: tuple[str, ...]) -> bool:
             return True
         if normalized_stem.endswith(f"_{normalized_alias}"):
             return True
-        if alias_collapsed and collapsed.endswith(alias_collapsed):
+        if len(alias_collapsed) >= 4 and collapsed.endswith(alias_collapsed):
             return True
         if normalized_alias in tokens:
             return True

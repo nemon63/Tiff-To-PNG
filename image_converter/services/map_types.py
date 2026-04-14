@@ -8,11 +8,11 @@ from image_converter.domain.models import TextureMapType
 MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
     (
         TextureMapType.BASECOLOR,
-        ("basecolor", "base_color", "albedo", "diffuse", "diff", "color"),
+        ("basecolor", "base_color", "albedo", "alb", "diffuse", "diff", "dif", "color", "col"),
     ),
     (
         TextureMapType.NORMAL,
-        ("normal", "normalmap", "normal_gl", "normal_dx", "nrm", "nor"),
+        ("normal", "normalmap", "normal_gl", "normal_dx", "nrm", "nml", "nor"),
     ),
     (
         TextureMapType.ROUGHNESS,
@@ -20,27 +20,27 @@ MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
     ),
     (
         TextureMapType.SMOOTHNESS,
-        ("smoothness", "smooth", "gloss", "glossiness", "glossmap"),
+        ("smoothness", "smooth", "gloss", "glossiness", "glossmap", "gls"),
     ),
     (
         TextureMapType.METALLIC,
-        ("metallic", "metalness", "metal", "mtl"),
+        ("metallic", "metalness", "metal", "met", "mtl"),
     ),
     (
         TextureMapType.AO,
-        ("ao", "ambientocclusion", "ambient_occlusion", "occlusion"),
+        ("ao", "ambientocclusion", "ambient_occlusion", "occlusion", "occ"),
     ),
     (
         TextureMapType.OPACITY,
-        ("opacity", "alpha", "mask", "transparency", "transparent"),
+        ("opacity", "alpha", "mask", "transparency", "transparent", "opc"),
     ),
     (
         TextureMapType.EMISSIVE,
-        ("emissive", "emission", "emit", "glow", "selfillum"),
+        ("emissive", "emission", "emit", "emi", "glow", "selfillum"),
     ),
     (
         TextureMapType.HEIGHT,
-        ("height", "displacement", "displace", "disp", "bump"),
+        ("height", "hgt", "displacement", "displace", "disp", "bump"),
     ),
 )
 
@@ -83,19 +83,38 @@ def detect_texture_map_type(path: Path) -> TextureMapType:
 
     for map_type, aliases in MAP_TYPE_PATTERNS:
         for alias in aliases:
-            alias_tokens = tuple(token for token in alias.lower().split("_") if token)
-            alias_collapsed = "".join(alias_tokens)
-
-            if alias_collapsed and alias_collapsed == collapsed:
-                return map_type
-
-            if alias_collapsed and alias_collapsed in collapsed:
-                return map_type
-
-            if alias_tokens and all(token in tokens for token in alias_tokens):
-                return map_type
-
-            if alias in tokens:
+            if _matches_alias(normalized, collapsed, tokens, alias):
                 return map_type
 
     return TextureMapType.UNKNOWN
+
+
+def _matches_alias(
+    normalized_stem: str,
+    collapsed_stem: str,
+    tokens: set[str],
+    alias: str,
+) -> bool:
+    normalized_alias = re.sub(r"[^a-z0-9]+", "_", alias.lower()).strip("_")
+    if not normalized_alias:
+        return False
+
+    alias_tokens = tuple(token for token in normalized_alias.split("_") if token)
+    alias_collapsed = "".join(alias_tokens)
+
+    if normalized_stem == normalized_alias or collapsed_stem == alias_collapsed:
+        return True
+
+    if normalized_stem.endswith(f"_{normalized_alias}"):
+        return True
+
+    if normalized_alias in tokens:
+        return True
+
+    if alias_tokens and all(token in tokens for token in alias_tokens):
+        return True
+
+    if len(alias_collapsed) >= 4 and collapsed_stem.endswith(alias_collapsed):
+        return True
+
+    return False
