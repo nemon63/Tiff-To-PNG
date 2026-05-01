@@ -10,6 +10,7 @@ from image_converter.domain.node_graph import (
     NodeGraph,
     NodeGraphProject,
     NodeType,
+    default_node_properties,
 )
 
 GRAPH_PROJECT_FILENAME = "graph.texturegraph.json"
@@ -123,10 +124,12 @@ class NodeGraphProjectRepository:
         except ValueError:
             node_type = NodeType.TEXTURE_INPUT
 
-        properties = data.get("properties", {})
-        if not isinstance(properties, dict):
-            properties = {}
-        properties = dict(properties)
+        raw_properties = data.get("properties", {})
+        if not isinstance(raw_properties, dict):
+            raw_properties = {}
+        properties = {"display": False}
+        properties.update(default_node_properties(node_type))
+        properties.update(dict(raw_properties))
         if node_type is NodeType.TEXTURE_INPUT and properties.get("path"):
             properties["path"] = str(self._deserialize_path(str(properties["path"]), bundle_dir))
 

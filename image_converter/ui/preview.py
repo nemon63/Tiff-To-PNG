@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PIL import Image, ImageOps
 from PyQt6.QtCore import QPoint, QPointF, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
@@ -295,6 +296,9 @@ class PreviewPanel(QWidget):
         super().__init__(parent)
         self._preview_service = TexturePreviewService()
         self._current_item: QueueItem | None = None
+        self._graph_preview_image: Image.Image | None = None
+        self._graph_preview_title = ""
+        self._graph_preview_meta = ""
         self._selected_channel = PreviewChannel.COMPOSITE
         self._channel_buttons: dict[PreviewChannel, QToolButton] = {}
         self._allow_detach = allow_detach
@@ -363,6 +367,7 @@ class PreviewPanel(QWidget):
             (PreviewChannel.GREEN, "G"),
             (PreviewChannel.BLUE, "B"),
             (PreviewChannel.ALPHA, "A"),
+            (PreviewChannel.LUMA, "L"),
         )
         for channel, label in channel_specs:
             button = QToolButton(self.channel_host)
@@ -387,6 +392,7 @@ class PreviewPanel(QWidget):
         previous_path = self._current_item.path if self._current_item is not None else None
         next_path = item.path if item is not None else None
         self._current_item = item
+        self._graph_preview_image = None
         self._rebuild_channels(item)
         if previous_path != next_path:
             self.preview_canvas.reset_zoom()
@@ -396,20 +402,32 @@ class PreviewPanel(QWidget):
 
     def set_graph_preview(self, image, title: str, meta: str) -> None:
         self._current_item = None
+        self._graph_preview_image = image.convert("RGBA").copy()
+        self._graph_preview_title = title
+        self._graph_preview_meta = meta
         self._selected_channel = PreviewChannel.COMPOSITE
-        self._sync_channel_buttons([])
+        self._sync_channel_buttons(self._graph_preview_channels())
+        self._refresh_graph_preview(preserve_zoom=False)
+
+    def _refresh_graph_preview(self, *, preserve_zoom: bool = True) -> None:
+        image = self._graph_preview_image
+        if image is None:
+            return
         try:
-            preview_pixmap = QPixmap.fromImage(_qimage_from_pil(image))
+            preview_image = self._channel_preview_image(image, self._selected_channel)
+            preview_pixmap = QPixmap.fromImage(_qimage_from_pil(preview_image))
         except Exception as exc:
             self.preview_canvas.clear_preview(f"Ошибка graph preview: {exc}")
-            self.asset_label.setText(title)
+            self.asset_label.setText(self._graph_preview_title)
             self.asset_meta_label.setText(str(exc))
             self._sync_control_state(False)
             return
 
-        self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=False)
-        self.asset_label.setText(title)
-        self.asset_label.setToolTip(title)
+        self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=preserve_zoom)
+        self.asset_label.setText(self._graph_preview_title)
+        self.asset_label.setToolTip(self._graph_preview_title)
+        channel_meta = self._channel_stats_meta(image, self._selected_channel)
+        meta = f"{self._graph_preview_meta} · {channel_meta}"
         self.asset_meta_label.setText(meta)
         self.asset_meta_label.setToolTip(meta)
         self._sync_control_state(True)
@@ -431,6 +449,7 @@ class PreviewPanel(QWidget):
             PreviewChannel.RED,
             PreviewChannel.GREEN,
             PreviewChannel.BLUE,
+            PreviewChannel.LUMA,
         ]
         if item.metadata.has_alpha:
             channels.append(PreviewChannel.ALPHA)
@@ -502,8 +521,58 @@ class PreviewPanel(QWidget):
         if channel == self._selected_channel:
             return
         self._selected_channel = channel
+        if self._graph_preview_image is not None:
+            self._sync_channel_buttons(self._graph_preview_channels())
+            self._refresh_graph_preview()
+            return
         self._sync_channel_buttons(self._available_channels(self._current_item))
         self._refresh_preview()
+
+    def _graph_preview_channels(self) -> list[PreviewChannel]:
+        if self._graph_preview_image is None:
+            return []
+        return [
+            PreviewChannel.COMPOSITE,
+            PreviewChannel.RED,
+            PreviewChannel.GREEN,
+            PreviewChannel.BLUE,
+            PreviewChannel.ALPHA,
+            PreviewChannel.LUMA,
+        ]
+
+    @staticmethod
+    def _channel_preview_image(image: Image.Image, channel: PreviewChannel) -> Image.Image:
+        rgba_image = image.convert("RGBA")
+        if channel is PreviewChannel.COMPOSITE:
+            return rgba_image
+        if channel is PreviewChannel.LUMA:
+            grayscale = ImageOps.grayscale(rgba_image.convert("RGB"))
+            return Image.merge("RGBA", (grayscale, grayscale, grayscale, Image.new("L", grayscale.size, 255)))
+        mapping = {
+            PreviewChannel.RED: "R",
+            PreviewChannel.GREEN: "G",
+            PreviewChannel.BLUE: "B",
+            PreviewChannel.ALPHA: "A",
+        }
+        band = rgba_image.getchannel(mapping[channel])
+        return Image.merge("RGBA", (band, band, band, Image.new("L", band.size, 255)))
+
+    def _channel_stats_meta(self, image: Image.Image, channel: PreviewChannel) -> str:
+        if channel is PreviewChannel.COMPOSITE:
+            extrema = image.convert("RGB").getextrema()
+            return f"RGB min/max: {extrema}"
+        if channel is PreviewChannel.LUMA:
+            band = ImageOps.grayscale(image.convert("RGB"))
+        else:
+            mapping = {
+                PreviewChannel.RED: "R",
+                PreviewChannel.GREEN: "G",
+                PreviewChannel.BLUE: "B",
+                PreviewChannel.ALPHA: "A",
+            }
+            band = image.convert("RGBA").getchannel(mapping[channel])
+        minimum, maximum = band.getextrema()
+        return f"{_preview_channel_label(channel)} min/max: {minimum}/{maximum}"
 
     def _sync_channel_buttons(self, channels: list[PreviewChannel]) -> None:
         for channel, button in self._channel_buttons.items():
@@ -623,6 +692,7 @@ class DetachedPreviewWindow(QWidget):
             (PreviewChannel.GREEN, "G"),
             (PreviewChannel.BLUE, "B"),
             (PreviewChannel.ALPHA, "A"),
+            (PreviewChannel.LUMA, "L"),
         )
         for channel, label in channel_specs:
             button = QToolButton(toolbar_card)
@@ -702,6 +772,7 @@ class DetachedPreviewWindow(QWidget):
             PreviewChannel.RED,
             PreviewChannel.GREEN,
             PreviewChannel.BLUE,
+            PreviewChannel.LUMA,
         ]
         if item.metadata.has_alpha:
             channels.append(PreviewChannel.ALPHA)

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QMimeData, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QCloseEvent, QDrag, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import QByteArray, QMimeData, QSize, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction, QCloseEvent, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDockWidget,
@@ -87,6 +87,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._is_running = False
         self._queue_items: list[QueueItem] = []
+        self._asset_rows: list[QueueItem] = []
         self._preset_repository: PresetRepository | None = None
         self._presets_by_id: dict[str, ConversionPreset] = {}
         self.setWindowTitle("Texture Pipeline Workbench")
@@ -273,15 +274,24 @@ class MainWindow(QMainWindow):
         add_folder = QPushButton("+ Folder")
         add_folder.clicked.connect(self.queue_panel._pick_folder)
         buttons.addWidget(add_folder)
+        reload_asset = QPushButton("Reload")
+        reload_asset.clicked.connect(self._reload_selected_asset)
+        buttons.addWidget(reload_asset)
         layout.addLayout(buttons)
 
+        self.asset_filter_edit = QLineEdit()
+        self.asset_filter_edit.setPlaceholderText("Filter assets")
+        self.asset_filter_edit.textChanged.connect(self._render_asset_browser)
+        layout.addWidget(self.asset_filter_edit)
+
         self.asset_table = AssetTableWidget()
-        self.asset_table.setColumnCount(3)
-        self.asset_table.setHorizontalHeaderLabels(("Name", "Type", "Res"))
+        self.asset_table.setColumnCount(4)
+        self.asset_table.setHorizontalHeaderLabels(("", "Name", "Type", "Res"))
         self.asset_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.asset_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.asset_table.verticalHeader().setVisible(False)
         self.asset_table.horizontalHeader().setStretchLastSection(True)
+        self.asset_table.setIconSize(QSize(42, 42))
         self.asset_table.itemDoubleClicked.connect(self._preview_selected_asset)
         layout.addWidget(self.asset_table, 1)
 
@@ -305,18 +315,32 @@ class MainWindow(QMainWindow):
 
     def _render_asset_browser(self) -> None:
         table = self.asset_table
-        table.setRowCount(len(self._queue_items))
-        for row, item in enumerate(self._queue_items):
+        filter_text = self.asset_filter_edit.text().strip().casefold() if hasattr(self, "asset_filter_edit") else ""
+        self._asset_rows = [
+            item
+            for item in self._queue_items
+            if not filter_text
+            or filter_text in item.path.name.casefold()
+            or filter_text in _map_type_label(item.effective_map_type).casefold()
+        ]
+        table.setRowCount(len(self._asset_rows))
+        for row, item in enumerate(self._asset_rows):
             metadata = item.metadata
+            exists = item.path.exists()
             values = (
+                "",
                 item.path.name,
-                _map_type_label(item.effective_map_type),
+                _map_type_label(item.effective_map_type) if exists else "Missing",
                 metadata.resolution_text if metadata else "-",
             )
             for column, value in enumerate(values):
                 table_item = QTableWidgetItem(value)
                 table_item.setToolTip(str(item.path))
                 table_item.setData(Qt.ItemDataRole.UserRole, self._queue_key(item.path))
+                if column == 0:
+                    icon = self._asset_thumbnail_icon(item)
+                    if icon is not None:
+                        table_item.setIcon(icon)
                 table.setItem(row, column, table_item)
         self.graph_workspace.set_assets(list(self._queue_items))
 
@@ -334,6 +358,27 @@ class MainWindow(QMainWindow):
         self.preview_dock.show()
         self.preview_dock.raise_()
 
+    def _reload_selected_asset(self) -> None:
+        item = self._selected_asset_item()
+        if item is None:
+            return
+        self.queue_paths_received.emit([str(item.path)])
+
+    def _asset_thumbnail_icon(self, item: QueueItem) -> QIcon | None:
+        if not item.path.exists():
+            return None
+        pixmap = QPixmap(str(item.path))
+        if pixmap.isNull():
+            return None
+        return QIcon(
+            pixmap.scaled(
+                42,
+                42,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
     def _show_graph_preview(self, image, title: str, meta: str) -> None:
         self.preview_panel.set_graph_preview(image, title, meta)
         self.preview_dock.show()
@@ -344,9 +389,9 @@ class MainWindow(QMainWindow):
         if not selected_rows:
             return None
         row = selected_rows[0].row()
-        if row >= len(self._queue_items):
+        if row >= len(self._asset_rows):
             return None
-        return self._queue_items[row]
+        return self._asset_rows[row]
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _extract_local_paths(event):
@@ -536,6 +581,24 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        if self.graph_workspace.has_unsaved_changes():
+            button = QMessageBox.question(
+                self,
+                "Graph не сохранен",
+                "В графе есть несохраненные изменения. Сохранить проект перед закрытием?",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save,
+            )
+            if button is QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+            if button is QMessageBox.StandardButton.Save:
+                self.graph_workspace.save_project_dialog()
+                if self.graph_workspace.has_unsaved_changes():
+                    event.ignore()
+                    return
         self.preview_window.hide()
         super().closeEvent(event)
 

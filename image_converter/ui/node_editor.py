@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 from PIL import Image
 from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
+    QKeySequence,
     QPainter,
     QPainterPath,
     QPainterPathStroker,
     QPen,
     QPixmap,
+    QShortcut,
+    QUndoStack,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -47,17 +51,31 @@ from image_converter.domain.node_graph import (
     NodeGraphProject,
     NodeType,
     OutputMode,
+    OutputProfile,
     SocketDirection,
+    TextureDataRole,
+    TextureNodeColorSpace,
     create_graph_node,
     incoming_connection,
     make_connection_id,
+    make_node_id,
     node_has_enable_flag,
     node_has_resettable_parameters,
     node_type_label,
-    remove_node,
     reset_node_parameters,
-    replace_input_connection,
     socket_definitions,
+)
+from image_converter.ui.graph_commands import (
+    AddNodesCommand,
+    DeleteItemsCommand,
+    InsertNodeInConnectionCommand,
+    MoveNodesCommand,
+    RemoveConnectionsCommand,
+    ReplaceInputConnectionCommand,
+    SetDisplayFlagCommand,
+    SetNodeStateCommand,
+    clone_graph_connection,
+    clone_graph_node,
 )
 from image_converter.services.node_graph_executor import (
     GraphExecutionError,
@@ -103,6 +121,23 @@ class ConnectionItem(QGraphicsPathItem):
             end,
         )
         self.setPath(path)
+
+    def shape(self) -> QPainterPath:
+        stroker = QPainterPathStroker()
+        stroker.setWidth(10.0)
+        return stroker.createStroke(self.path())
+
+    def mousePressEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.AltModifier
+        ):
+            scene = self.scene()
+            if isinstance(scene, GraphScene):
+                scene.connection_delete_requested.emit(self.connection)
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
 
 class PortItem(QGraphicsEllipseItem):
@@ -158,6 +193,7 @@ class GraphNodeItem(QGraphicsRectItem):
         self.render_flag_label: QGraphicsSimpleTextItem | None = None
         self.reset_button_item: QGraphicsRectItem | None = None
         self.reset_button_label: QGraphicsSimpleTextItem | None = None
+        self._drag_start_position: tuple[float, float] | None = None
         sockets = socket_definitions(node.node_type)
         input_count = sum(1 for socket in sockets if socket.direction is SocketDirection.INPUT)
         output_count = sum(1 for socket in sockets if socket.direction is SocketDirection.OUTPUT)
@@ -382,7 +418,26 @@ class GraphNodeItem(QGraphicsRectItem):
                     scene.node_render_flag_clicked.emit(self.node)
                     event.accept()
                     return
+            self._drag_start_position = self.node.position
+            if isinstance(scene, GraphScene):
+                scene.begin_node_move(self.node.node_id)
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._drag_start_position is None:
+            return
+        next_position = (float(self.pos().x()), float(self.pos().y()))
+        previous_position = self._drag_start_position
+        self._drag_start_position = None
+        scene = self.scene()
+        if isinstance(scene, GraphScene):
+            scene.finish_node_move()
+            return
+        if next_position == previous_position:
+            return
 
     def mouseDoubleClickEvent(self, event) -> None:
         scene = self.scene()
@@ -396,7 +451,6 @@ class GraphNodeItem(QGraphicsRectItem):
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):
         result = super().itemChange(change, value)
         if change is QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            self.node.position = (float(self.pos().x()), float(self.pos().y()))
             scene = self.scene()
             if isinstance(scene, GraphScene):
                 scene.update_connections_for_node(self.node.node_id)
@@ -412,14 +466,21 @@ class GraphNodeItem(QGraphicsRectItem):
 
 
 class GraphScene(QGraphicsScene):
+    connection_delete_requested = pyqtSignal(object)
+    connection_insert_node_requested = pyqtSignal(object, object, object)
+    connection_requested = pyqtSignal(object, object)
+    connections_delete_requested = pyqtSignal(object)
     graph_changed = pyqtSignal()
     node_display_flag_clicked = pyqtSignal(object)
     node_double_clicked = pyqtSignal(object)
     node_enable_flag_clicked = pyqtSignal(object)
+    node_moved = pyqtSignal(object, object, object)
+    nodes_moved = pyqtSignal(object, object)
     node_render_flag_clicked = pyqtSignal(object)
     node_reset_clicked = pyqtSignal(object)
     node_selection_changed = pyqtSignal(object)
     status_message = pyqtSignal(str)
+    wire_node_requested = pyqtSignal(object, object)
 
     def __init__(self, project: NodeGraphProject, parent: QWidget | None = None):
         super().__init__(parent)
@@ -427,7 +488,10 @@ class GraphScene(QGraphicsScene):
         self.node_items: dict[str, GraphNodeItem] = {}
         self.connection_items: dict[str, ConnectionItem] = {}
         self.drag_port: PortItem | None = None
+        self.drag_rewire_connection: GraphConnection | None = None
+        self.drag_start_scene_pos: QPointF | None = None
         self.drag_wire: QGraphicsPathItem | None = None
+        self.move_start_positions: dict[str, tuple[float, float]] = {}
         self.selectionChanged.connect(self._emit_selection)
         self.setSceneRect(-3000, -3000, 6000, 6000)
 
@@ -436,7 +500,10 @@ class GraphScene(QGraphicsScene):
         self.node_items = {}
         self.connection_items = {}
         self.drag_port = None
+        self.drag_rewire_connection = None
+        self.drag_start_scene_pos = None
         self.drag_wire = None
+        self.move_start_positions = {}
         for node in self.project.graph.nodes:
             item = GraphNodeItem(node)
             self.addItem(item)
@@ -457,20 +524,38 @@ class GraphScene(QGraphicsScene):
         selected = list(self.selectedItems())
         if not selected:
             return
-        for item in selected:
-            if isinstance(item, GraphNodeItem):
-                remove_node(self.project.graph, item.node.node_id)
-            elif isinstance(item, ConnectionItem):
-                self.project.graph.connections = [
-                    connection
-                    for connection in self.project.graph.connections
-                    if connection.connection_id != item.connection.connection_id
-                ]
-        self.rebuild()
-        self.graph_changed.emit()
+        node_ids = [
+            item.node.node_id
+            for item in selected
+            if isinstance(item, GraphNodeItem)
+        ]
+        connection_ids = [
+            item.connection.connection_id
+            for item in selected
+            if isinstance(item, ConnectionItem)
+        ]
+        self.connections_delete_requested.emit((node_ids, connection_ids))
 
     def start_wire_drag(self, port: PortItem, scene_pos: QPointF) -> None:
+        self.drag_rewire_connection = None
         self.drag_port = port
+        self.drag_start_scene_pos = QPointF(scene_pos)
+        if port.direction is SocketDirection.INPUT:
+            existing_connection = incoming_connection(
+                self.project.graph,
+                target_node_id=port.node_item.node.node_id,
+                target_socket_id=port.socket_id,
+            )
+            if existing_connection is not None:
+                source_item = self.node_items.get(existing_connection.source_node_id)
+                source_port = (
+                    source_item.port_items.get(existing_connection.source_socket_id)
+                    if source_item is not None
+                    else None
+                )
+                if source_port is not None:
+                    self.drag_port = source_port
+                    self.drag_rewire_connection = existing_connection
         self.drag_wire = QGraphicsPathItem()
         self.drag_wire.setZValue(-5)
         pen = QPen(QColor("#9DC7FF"), 2.0)
@@ -496,14 +581,29 @@ class GraphScene(QGraphicsScene):
         self.drag_wire.setPath(path)
 
     def finish_wire_drag(self, scene_pos: QPointF) -> None:
+        started_port = self.drag_port
+        rewire_connection = self.drag_rewire_connection
+        start_scene_pos = self.drag_start_scene_pos
         source_port, target_port = self._resolve_drag_ports(scene_pos)
         if self.drag_wire is not None:
             self.removeItem(self.drag_wire)
         self.drag_wire = None
         self.drag_port = None
+        self.drag_rewire_connection = None
+        self.drag_start_scene_pos = None
 
         if source_port is None or target_port is None:
-            self.status_message.emit("Connection canceled.")
+            moved_far_enough = False
+            if start_scene_pos is not None:
+                moved_far_enough = (
+                    abs(scene_pos.x() - start_scene_pos.x())
+                    + abs(scene_pos.y() - start_scene_pos.y())
+                    > 8.0
+                )
+            if started_port is not None and moved_far_enough:
+                self.wire_node_requested.emit(started_port, scene_pos)
+            else:
+                self.status_message.emit("Connection canceled.")
             return
         connection = GraphConnection(
             connection_id=make_connection_id(),
@@ -512,15 +612,16 @@ class GraphScene(QGraphicsScene):
             target_node_id=target_port.node_item.node.node_id,
             target_socket_id=target_port.socket_id,
         )
-        target_node_id = connection.target_node_id
-        replace_input_connection(self.project.graph, connection)
-        self.rebuild()
-        target_item = self.node_items.get(target_node_id)
-        if target_item is not None:
-            self.clearSelection()
-            target_item.setSelected(True)
-        self.graph_changed.emit()
-        self.status_message.emit("Connection created.")
+        if (
+            rewire_connection is not None
+            and rewire_connection.source_node_id == connection.source_node_id
+            and rewire_connection.source_socket_id == connection.source_socket_id
+            and rewire_connection.target_node_id == connection.target_node_id
+            and rewire_connection.target_socket_id == connection.target_socket_id
+        ):
+            self.status_message.emit("Connection unchanged.")
+            return
+        self.connection_requested.emit(connection, rewire_connection)
 
     def cut_connections_by_path(self, cut_path: QPainterPath) -> int:
         if not self.connection_items:
@@ -535,14 +636,7 @@ class GraphScene(QGraphicsScene):
         ]
         if not cut_ids:
             return 0
-        self.project.graph.connections = [
-            connection
-            for connection in self.project.graph.connections
-            if connection.connection_id not in cut_ids
-        ]
-        self.rebuild()
-        self.graph_changed.emit()
-        self.status_message.emit(f"Cut connections: {len(cut_ids)}")
+        self.connections_delete_requested.emit(([], cut_ids))
         return len(cut_ids)
 
     def _resolve_drag_ports(self, scene_pos: QPointF) -> tuple[PortItem | None, PortItem | None]:
@@ -569,11 +663,65 @@ class GraphScene(QGraphicsScene):
             if connection.source_node_id == node_id or connection.target_node_id == node_id:
                 connection_item.update_path()
 
+    def begin_node_move(self, active_node_id: str) -> None:
+        selected_ids = set(self.selected_node_ids())
+        if active_node_id not in selected_ids:
+            selected_ids = {active_node_id}
+        self.move_start_positions = {
+            node_id: item.node.position
+            for node_id, item in self.node_items.items()
+            if node_id in selected_ids
+        }
+
+    def finish_node_move(self) -> None:
+        if not self.move_start_positions:
+            return
+        before_positions = dict(self.move_start_positions)
+        self.move_start_positions = {}
+        after_positions = {}
+        for node_id in before_positions:
+            item = self.node_items.get(node_id)
+            if item is not None:
+                after_positions[node_id] = (float(item.pos().x()), float(item.pos().y()))
+        changed_after = {
+            node_id: position
+            for node_id, position in after_positions.items()
+            if before_positions.get(node_id) != position
+        }
+        if changed_after:
+            changed_before = {
+                node_id: before_positions[node_id]
+                for node_id in changed_after
+            }
+            self.nodes_moved.emit(changed_before, changed_after)
+
     def selected_node(self) -> GraphNode | None:
         for item in self.selectedItems():
             if isinstance(item, GraphNodeItem):
                 return item.node
         return None
+
+    def selected_node_ids(self) -> list[str]:
+        return [
+            item.node.node_id
+            for item in self.selectedItems()
+            if isinstance(item, GraphNodeItem)
+        ]
+
+    def selected_connection_ids(self) -> list[str]:
+        return [
+            item.connection.connection_id
+            for item in self.selectedItems()
+            if isinstance(item, ConnectionItem)
+        ]
+
+    def select_node_ids(self, node_ids: Iterable[str]) -> None:
+        target_ids = set(node_ids)
+        self.clearSelection()
+        for node_id in target_ids:
+            item = self.node_items.get(node_id)
+            if item is not None:
+                item.setSelected(True)
 
     def _add_connection_item(self, connection: GraphConnection) -> None:
         source_node_item = self.node_items.get(connection.source_node_id)
@@ -593,8 +741,10 @@ class GraphScene(QGraphicsScene):
 
 
 class GraphView(QGraphicsView):
+    connection_delete_requested = pyqtSignal(object)
+    connection_insert_node_requested = pyqtSignal(object, object, object)
     texture_dropped = pyqtSignal(str, object)
-    node_add_requested = pyqtSignal(object, object)
+    node_add_requested = pyqtSignal(object, object, object)
 
     def __init__(self, scene: GraphScene, parent: QWidget | None = None):
         super().__init__(scene, parent)
@@ -713,33 +863,78 @@ class GraphView(QGraphicsView):
 
     def contextMenuEvent(self, event) -> None:
         scene_position = self.mapToScene(event.pos())
+        connection_item = self._connection_item_at(scene_position)
+        if connection_item is not None:
+            self._open_connection_menu(connection_item.connection, scene_position, event.globalPos())
+            event.accept()
+            return
+
+        self.open_node_menu(scene_position, event.globalPos())
+        event.accept()
+
+    def open_node_menu(
+        self,
+        scene_position: QPointF,
+        global_position: QPoint | None = None,
+        wire_port: PortItem | None = None,
+    ) -> None:
         menu = QMenu(self)
 
-        input_menu = menu.addMenu("Input")
-        self._add_node_menu_action(input_menu, "Texture", NodeType.TEXTURE_INPUT, scene_position)
-        self._add_node_menu_action(input_menu, "Constant", NodeType.CONSTANT_CHANNEL, scene_position)
+        if wire_port is None or wire_port.direction is SocketDirection.INPUT:
+            input_menu = menu.addMenu("Input")
+            self._add_node_menu_action(input_menu, "Texture", NodeType.TEXTURE_INPUT, scene_position, wire_port)
+            self._add_node_menu_action(input_menu, "Constant", NodeType.CONSTANT_CHANNEL, scene_position, wire_port)
 
         channel_menu = menu.addMenu("Channel")
-        self._add_node_menu_action(channel_menu, "Invert", NodeType.INVERT_CHANNEL, scene_position)
-        self._add_node_menu_action(channel_menu, "Levels", NodeType.LEVELS_CHANNEL, scene_position)
-        self._add_node_menu_action(channel_menu, "Clamp", NodeType.CLAMP_CHANNEL, scene_position)
-        self._add_node_menu_action(channel_menu, "Threshold", NodeType.THRESHOLD_CHANNEL, scene_position)
-        self._add_node_menu_action(channel_menu, "Luminance", NodeType.LUMINANCE, scene_position)
+        self._add_node_menu_action(channel_menu, "Invert", NodeType.INVERT_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(channel_menu, "Levels", NodeType.LEVELS_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(channel_menu, "Clamp", NodeType.CLAMP_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(channel_menu, "Threshold", NodeType.THRESHOLD_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(channel_menu, "Luminance", NodeType.LUMINANCE, scene_position, wire_port)
 
         math_menu = menu.addMenu("Math")
-        self._add_node_menu_action(math_menu, "Blend", NodeType.BLEND_CHANNEL, scene_position)
+        self._add_node_menu_action(math_menu, "Blend", NodeType.BLEND_CHANNEL, scene_position, wire_port)
 
-        utility_menu = menu.addMenu("Utility")
-        self._add_node_menu_action(utility_menu, "View", NodeType.VIEW, scene_position)
+        if wire_port is None or wire_port.direction is SocketDirection.OUTPUT:
+            utility_menu = menu.addMenu("Utility")
+            self._add_node_menu_action(utility_menu, "View", NodeType.VIEW, scene_position, wire_port)
 
-        output_menu = menu.addMenu("Output")
-        self._add_node_menu_action(output_menu, "Output RGBA", NodeType.OUTPUT_RGBA, scene_position)
+            output_menu = menu.addMenu("Output")
+            self._add_node_menu_action(output_menu, "Output RGBA", NodeType.OUTPUT_RGBA, scene_position, wire_port)
 
         menu.addSeparator()
         fit_action = menu.addAction("Fit View")
         fit_action.triggered.connect(self.fit_graph)
-        menu.exec(event.globalPos())
-        event.accept()
+        if global_position is None:
+            global_position = self.viewport().mapToGlobal(self.mapFromScene(scene_position))
+        menu.exec(global_position)
+
+    def _open_connection_menu(
+        self,
+        connection: GraphConnection,
+        scene_position: QPointF,
+        global_position: QPoint,
+    ) -> None:
+        menu = QMenu(self)
+        insert_menu = menu.addMenu("Insert Node")
+        for label, node_type in (
+            ("Invert", NodeType.INVERT_CHANNEL),
+            ("Levels", NodeType.LEVELS_CHANNEL),
+            ("Clamp", NodeType.CLAMP_CHANNEL),
+            ("Threshold", NodeType.THRESHOLD_CHANNEL),
+        ):
+            action = insert_menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, current_type=node_type: self.connection_insert_node_requested.emit(
+                    connection,
+                    current_type,
+                    scene_position,
+                )
+            )
+
+        delete_action = menu.addAction("Delete Connection")
+        delete_action.triggered.connect(lambda: self.connection_delete_requested.emit(connection))
+        menu.exec(global_position)
 
     def _add_node_menu_action(
         self,
@@ -747,14 +942,25 @@ class GraphView(QGraphicsView):
         label: str,
         node_type: NodeType,
         scene_position: QPointF,
+        context: object | None = None,
     ) -> None:
         action = menu.addAction(label)
         action.triggered.connect(
             lambda _checked=False, current_type=node_type: self.node_add_requested.emit(
                 current_type,
                 scene_position,
+                context,
             )
         )
+
+    def _connection_item_at(self, scene_position: QPointF) -> ConnectionItem | None:
+        scene = self.scene()
+        if scene is None:
+            return None
+        for item in scene.items(scene_position):
+            if isinstance(item, ConnectionItem):
+                return item
+        return None
 
     def fit_graph(self) -> None:
         items_rect = self.scene().itemsBoundingRect()
@@ -780,7 +986,8 @@ class GraphView(QGraphicsView):
 
 
 class NodePropertiesPanel(QWidget):
-    node_changed = pyqtSignal(bool)
+    node_changed = pyqtSignal(object, object, object, bool)
+    node_reset_requested = pyqtSignal(object)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -820,7 +1027,7 @@ class NodePropertiesPanel(QWidget):
         self.form.setContentsMargins(0, 0, 0, 0)
 
         self.title_edit = QLineEdit()
-        self.title_edit.textEdited.connect(self._apply_changes)
+        self.title_edit.editingFinished.connect(self._apply_changes)
         self.form.addRow("Title", self.title_edit)
 
         self.node_enabled_checkbox = QCheckBox("Enabled")
@@ -828,7 +1035,7 @@ class NodePropertiesPanel(QWidget):
         self.form.addRow("Node", self.node_enabled_checkbox)
 
         self.path_edit = QLineEdit()
-        self.path_edit.textEdited.connect(self._apply_changes)
+        self.path_edit.editingFinished.connect(self._apply_changes)
         self.path_button = QPushButton("...")
         self.path_button.clicked.connect(self._browse_texture)
         path_row = QHBoxLayout()
@@ -839,6 +1046,27 @@ class NodePropertiesPanel(QWidget):
         path_host.setLayout(path_row)
         self.path_host = path_host
         self.form.addRow("Texture", path_host)
+
+        self.texture_color_space_combo = QComboBox()
+        for label, value in (
+            ("Auto", TextureNodeColorSpace.AUTO.value),
+            ("sRGB", TextureNodeColorSpace.SRGB.value),
+            ("Linear", TextureNodeColorSpace.LINEAR.value),
+        ):
+            self.texture_color_space_combo.addItem(label, value)
+        self.texture_color_space_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Color Space", self.texture_color_space_combo)
+
+        self.texture_data_role_combo = QComboBox()
+        for label, value in (
+            ("Data", TextureDataRole.DATA.value),
+            ("Color", TextureDataRole.COLOR.value),
+            ("Normal", TextureDataRole.NORMAL.value),
+            ("Mask", TextureDataRole.MASK.value),
+        ):
+            self.texture_data_role_combo.addItem(label, value)
+        self.texture_data_role_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Data Role", self.texture_data_role_combo)
 
         self.value_spin = QSpinBox()
         self.value_spin.setRange(0, 255)
@@ -890,12 +1118,12 @@ class NodePropertiesPanel(QWidget):
         self.form.addRow("Opacity", self.blend_opacity_spin)
 
         self.filename_edit = QLineEdit()
-        self.filename_edit.textEdited.connect(self._apply_changes)
+        self.filename_edit.editingFinished.connect(self._apply_changes)
         self.form.addRow("Filename", self.filename_edit)
 
         self.output_path_edit = QLineEdit()
         self.output_path_edit.setPlaceholderText("Optional full output PNG path")
-        self.output_path_edit.textEdited.connect(self._apply_changes)
+        self.output_path_edit.editingFinished.connect(self._apply_changes)
         self.output_path_button = QPushButton("...")
         self.output_path_button.clicked.connect(self._browse_output_path)
         output_path_row = QHBoxLayout()
@@ -905,6 +1133,18 @@ class NodePropertiesPanel(QWidget):
         self.output_path_host = QWidget()
         self.output_path_host.setLayout(output_path_row)
         self.form.addRow("Output Path", self.output_path_host)
+
+        self.output_profile_combo = QComboBox()
+        for label, value in (
+            ("Generic RGBA", OutputProfile.GENERIC_RGBA.value),
+            ("Unity URP", OutputProfile.UNITY_URP.value),
+            ("Unity HDRP", OutputProfile.UNITY_HDRP.value),
+            ("Unreal ORM", OutputProfile.UNREAL_ORM.value),
+            ("MetaHuman Repack", OutputProfile.METAHUMAN_REPACK.value),
+        ):
+            self.output_profile_combo.addItem(label, value)
+        self.output_profile_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Profile", self.output_profile_combo)
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("RGB", OutputMode.RGB.value)
@@ -933,6 +1173,14 @@ class NodePropertiesPanel(QWidget):
             self.title_edit.setText(node.title)
             self.node_enabled_checkbox.setChecked(bool(node.properties.get("enabled", True)))
             self.path_edit.setText(str(node.properties.get("path", "")))
+            self._set_combo_value(
+                self.texture_color_space_combo,
+                str(node.properties.get("color_space", TextureNodeColorSpace.AUTO.value)),
+            )
+            self._set_combo_value(
+                self.texture_data_role_combo,
+                str(node.properties.get("data_role", TextureDataRole.DATA.value)),
+            )
             self.value_spin.setValue(self._coerce_int(node.properties.get("value"), 255))
             self.level_black_spin.setValue(self._coerce_int(node.properties.get("black"), 0))
             self.level_white_spin.setValue(self._coerce_int(node.properties.get("white"), 255))
@@ -951,13 +1199,13 @@ class NodePropertiesPanel(QWidget):
             self.blend_opacity_spin.setValue(self._coerce_int(node.properties.get("opacity"), 100))
             self.filename_edit.setText(str(node.properties.get("filename", "packed.png")))
             self.output_path_edit.setText(str(node.properties.get("output_path", "")))
+            self._set_combo_value(
+                self.output_profile_combo,
+                str(node.properties.get("profile", OutputProfile.GENERIC_RGBA.value)),
+            )
             self.enabled_checkbox.setChecked(bool(node.properties.get("enabled", True)))
             mode_value = str(node.properties.get("mode", OutputMode.RGBA.value))
-            self.mode_combo.setCurrentIndex(1)
-            for index in range(self.mode_combo.count()):
-                if self.mode_combo.itemData(index) == mode_value:
-                    self.mode_combo.setCurrentIndex(index)
-                    break
+            self._set_combo_value(self.mode_combo, mode_value, fallback_index=1)
             self._sync_visibility(node.node_type)
         finally:
             self._suppress = False
@@ -965,6 +1213,8 @@ class NodePropertiesPanel(QWidget):
     def _sync_visibility(self, node_type: NodeType) -> None:
         self._set_row_visible(self.node_enabled_checkbox, node_has_enable_flag(node_type))
         self._set_row_visible(self.path_host, node_type is NodeType.TEXTURE_INPUT)
+        self._set_row_visible(self.texture_color_space_combo, node_type is NodeType.TEXTURE_INPUT)
+        self._set_row_visible(self.texture_data_role_combo, node_type is NodeType.TEXTURE_INPUT)
         self._set_row_visible(self.value_spin, node_type is NodeType.CONSTANT_CHANNEL)
         self._set_row_visible(self.level_black_spin, node_type is NodeType.LEVELS_CHANNEL)
         self._set_row_visible(self.level_white_spin, node_type is NodeType.LEVELS_CHANNEL)
@@ -978,6 +1228,7 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.blend_opacity_spin, node_type is NodeType.BLEND_CHANNEL)
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_path_host, node_type is NodeType.OUTPUT_RGBA)
+        self._set_row_visible(self.output_profile_combo, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.mode_combo, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.enabled_checkbox, node_type is NodeType.OUTPUT_RGBA)
 
@@ -1011,45 +1262,58 @@ class NodePropertiesPanel(QWidget):
     def _reset_parameters(self) -> None:
         if self._node is None or not node_has_resettable_parameters(self._node.node_type):
             return
-        reset_node_parameters(self._node)
-        self.set_node(self._node)
-        self.node_changed.emit(False)
+        self.node_reset_requested.emit(self._node)
 
     def _apply_changes(self, *_args: object) -> None:
         if self._suppress or self._node is None:
             return
         previous_title = self._node.title
         previous_path = str(self._node.properties.get("path", ""))
-        self._node.title = self.title_edit.text().strip() or self._node.title
+        next_title = self.title_edit.text().strip() or self._node.title
+        next_properties = dict(self._node.properties)
         if node_has_enable_flag(self._node.node_type):
-            self._node.properties["enabled"] = self.node_enabled_checkbox.isChecked()
+            next_properties["enabled"] = self.node_enabled_checkbox.isChecked()
         if self._node.node_type is NodeType.TEXTURE_INPUT:
-            self._node.properties["path"] = self.path_edit.text().strip()
+            next_properties["path"] = self.path_edit.text().strip()
+            next_properties["color_space"] = str(
+                self.texture_color_space_combo.currentData()
+                or TextureNodeColorSpace.AUTO.value
+            )
+            next_properties["data_role"] = str(
+                self.texture_data_role_combo.currentData()
+                or TextureDataRole.DATA.value
+            )
         elif self._node.node_type is NodeType.CONSTANT_CHANNEL:
-            self._node.properties["value"] = self.value_spin.value()
+            next_properties["value"] = self.value_spin.value()
         elif self._node.node_type is NodeType.LEVELS_CHANNEL:
-            self._node.properties["black"] = self.level_black_spin.value()
-            self._node.properties["white"] = self.level_white_spin.value()
-            self._node.properties["gamma"] = self.level_gamma_spin.value()
-            self._node.properties["out_min"] = self.level_out_min_spin.value()
-            self._node.properties["out_max"] = self.level_out_max_spin.value()
+            next_properties["black"] = self.level_black_spin.value()
+            next_properties["white"] = self.level_white_spin.value()
+            next_properties["gamma"] = self.level_gamma_spin.value()
+            next_properties["out_min"] = self.level_out_min_spin.value()
+            next_properties["out_max"] = self.level_out_max_spin.value()
         elif self._node.node_type is NodeType.CLAMP_CHANNEL:
-            self._node.properties["min"] = self.clamp_min_spin.value()
-            self._node.properties["max"] = self.clamp_max_spin.value()
+            next_properties["min"] = self.clamp_min_spin.value()
+            next_properties["max"] = self.clamp_max_spin.value()
         elif self._node.node_type is NodeType.THRESHOLD_CHANNEL:
-            self._node.properties["threshold"] = self.threshold_spin.value()
+            next_properties["threshold"] = self.threshold_spin.value()
         elif self._node.node_type is NodeType.BLEND_CHANNEL:
-            self._node.properties["mode"] = str(self.blend_mode_combo.currentData() or "multiply")
-            self._node.properties["opacity"] = self.blend_opacity_spin.value()
+            next_properties["mode"] = str(self.blend_mode_combo.currentData() or "multiply")
+            next_properties["opacity"] = self.blend_opacity_spin.value()
         elif self._node.node_type is NodeType.OUTPUT_RGBA:
-            self._node.properties["filename"] = self.filename_edit.text().strip() or "packed.png"
-            self._node.properties["output_path"] = self.output_path_edit.text().strip()
-            self._node.properties["mode"] = str(self.mode_combo.currentData() or OutputMode.RGBA.value)
-            self._node.properties["enabled"] = self.enabled_checkbox.isChecked()
-        needs_rebuild = previous_title != self._node.title
+            next_properties["filename"] = self.filename_edit.text().strip() or "packed.png"
+            next_properties["output_path"] = self.output_path_edit.text().strip()
+            next_properties["profile"] = str(
+                self.output_profile_combo.currentData()
+                or OutputProfile.GENERIC_RGBA.value
+            )
+            next_properties["mode"] = str(self.mode_combo.currentData() or OutputMode.RGBA.value)
+            next_properties["enabled"] = self.enabled_checkbox.isChecked()
+        if next_title == self._node.title and next_properties == self._node.properties:
+            return
+        needs_rebuild = previous_title != next_title
         if self._node.node_type is NodeType.TEXTURE_INPUT:
-            needs_rebuild = needs_rebuild or previous_path != str(self._node.properties.get("path", ""))
-        self.node_changed.emit(needs_rebuild)
+            needs_rebuild = needs_rebuild or previous_path != str(next_properties.get("path", ""))
+        self.node_changed.emit(self._node, next_title, next_properties, needs_rebuild)
 
     @staticmethod
     def _coerce_int(value: object, default: int) -> int:
@@ -1065,6 +1329,14 @@ class NodePropertiesPanel(QWidget):
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _set_combo_value(combo: QComboBox, value: str, *, fallback_index: int = 0) -> None:
+        combo.setCurrentIndex(fallback_index)
+        for index in range(combo.count()):
+            if combo.itemData(index) == value:
+                combo.setCurrentIndex(index)
+                return
+
 
 class GraphWorkspace(QWidget):
     export_requested = pyqtSignal()
@@ -1076,20 +1348,36 @@ class GraphWorkspace(QWidget):
         self.project = NodeGraphProject()
         self.project_dir: Path | None = None
         self._assets: list[QueueItem] = []
+        self._clipboard_nodes: list[GraphNode] = []
+        self._clipboard_connections: list[GraphConnection] = []
+        self._shortcuts = []
         self._repository = NodeGraphProjectRepository()
         self._executor = NodeGraphExecutor()
         self._preview_cache = NodeGraphPreviewCache(max_side=1024)
+        self.undo_stack = QUndoStack(self)
+        self.undo_stack.cleanChanged.connect(lambda _clean: self._update_project_label())
+        self.undo_stack.indexChanged.connect(lambda _index: self._update_project_label())
         self._scene = GraphScene(self.project, self)
+        self._scene.connection_delete_requested.connect(self._on_connection_delete_requested)
+        self._scene.connection_insert_node_requested.connect(self._on_connection_insert_node_requested)
+        self._scene.connection_requested.connect(self._on_connection_requested)
+        self._scene.connections_delete_requested.connect(self._on_delete_items_requested)
         self._scene.graph_changed.connect(self._on_graph_changed)
         self._scene.node_display_flag_clicked.connect(self._on_display_flag_clicked)
         self._scene.node_double_clicked.connect(self._on_node_double_clicked)
         self._scene.node_enable_flag_clicked.connect(self._on_enable_flag_clicked)
+        self._scene.node_moved.connect(self._on_node_moved)
+        self._scene.nodes_moved.connect(self._on_nodes_moved)
         self._scene.node_render_flag_clicked.connect(self._on_render_flag_clicked)
         self._scene.node_reset_clicked.connect(self._on_node_reset_clicked)
         self._scene.node_selection_changed.connect(self._on_node_selected)
         self._scene.status_message.connect(self.status_message.emit)
+        self._scene.wire_node_requested.connect(self._on_wire_node_requested)
         self._build_ui()
         self._scene.rebuild()
+        self._refresh_validation()
+        self.undo_stack.setClean()
+        self._update_project_label()
 
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
@@ -1109,7 +1397,7 @@ class GraphWorkspace(QWidget):
 
         self.delete_button = QPushButton("Delete")
         self.delete_button.setObjectName("DangerButton")
-        self.delete_button.clicked.connect(self._scene.delete_selected)
+        self.delete_button.clicked.connect(self._delete_selection)
         toolbar.addWidget(self.delete_button)
         toolbar.addStretch(1)
         self.new_button = QPushButton("New")
@@ -1131,10 +1419,14 @@ class GraphWorkspace(QWidget):
         root_layout.addLayout(toolbar)
 
         self.view = GraphView(self._scene)
+        self.view.connection_delete_requested.connect(self._on_connection_delete_requested)
+        self.view.connection_insert_node_requested.connect(self._on_connection_insert_node_requested)
         self.view.texture_dropped.connect(self.add_texture_node_for_path)
         self.view.node_add_requested.connect(self.add_node_of_type)
         self.properties_panel = NodePropertiesPanel()
-        self.properties_panel.node_changed.connect(self._rebuild_after_property_change)
+        self.properties_panel.node_changed.connect(self._on_node_properties_changed)
+        self.properties_panel.node_reset_requested.connect(self._on_node_reset_clicked)
+        self._install_shortcuts()
 
         self.result_table = QTableWidget()
         self.result_table.setColumnCount(4)
@@ -1147,6 +1439,17 @@ class GraphWorkspace(QWidget):
         self.result_table.setMaximumHeight(150)
         self.result_table.setMinimumWidth(0)
 
+        self.validation_table = QTableWidget()
+        self.validation_table.setColumnCount(3)
+        self.validation_table.setHorizontalHeaderLabels(("Severity", "Node", "Message"))
+        self.validation_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.validation_table.verticalHeader().setVisible(False)
+        self.validation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.validation_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.validation_table.horizontalHeader().setStretchLastSection(True)
+        self.validation_table.setMaximumHeight(160)
+        self.validation_table.itemSelectionChanged.connect(self._select_validation_issue_node)
+
         root_layout.addWidget(self.view, 1)
 
     def build_properties_widget(self) -> QWidget:
@@ -1156,9 +1459,26 @@ class GraphWorkspace(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
         layout.addWidget(self.properties_panel, 1)
+        layout.addWidget(QLabel("Graph Validation"))
+        layout.addWidget(self.validation_table)
         layout.addWidget(QLabel("Graph Export Queue"))
         layout.addWidget(self.result_table)
         return panel
+
+    def _install_shortcuts(self) -> None:
+        shortcuts = (
+            ("Ctrl+Z", self.undo_stack.undo),
+            ("Ctrl+Y", self.undo_stack.redo),
+            ("Ctrl+C", self._copy_selection),
+            ("Ctrl+V", self._paste_clipboard),
+            ("Ctrl+D", self._duplicate_selection),
+            ("Delete", self._delete_selection),
+        )
+        for sequence, slot in shortcuts:
+            shortcut = QShortcut(QKeySequence(sequence), self.view)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(slot)
+            self._shortcuts.append(shortcut)
 
     def set_assets(self, items: list[QueueItem]) -> None:
         self._assets = [item for item in items if item.metadata is not None]
@@ -1167,10 +1487,13 @@ class GraphWorkspace(QWidget):
         self.project = NodeGraphProject()
         self.project_dir = None
         self._preview_cache.clear()
+        self.undo_stack.clear()
         self._scene.project = self.project
         self._scene.rebuild()
-        self.project_label.setText(self.project.name)
+        self.undo_stack.setClean()
+        self._update_project_label()
         self.result_table.setRowCount(0)
+        self._refresh_validation()
         self.status_message.emit("New graph project.")
 
     def load_project_dialog(self) -> None:
@@ -1184,9 +1507,12 @@ class GraphWorkspace(QWidget):
             return
         self.project_dir = Path(path)
         self._preview_cache.clear()
+        self.undo_stack.clear()
         self._scene.project = self.project
         self._scene.rebuild()
-        self.project_label.setText(self.project.name)
+        self.undo_stack.setClean()
+        self._update_project_label()
+        self._refresh_validation()
         self.status_message.emit(f"Loaded graph: {self.project.name}")
 
     def save_project_dialog(self) -> None:
@@ -1205,7 +1531,8 @@ class GraphWorkspace(QWidget):
             return
         self.project_dir = bundle_dir
         self.project.name = bundle_dir.stem
-        self.project_label.setText(self.project.name)
+        self.undo_stack.setClean()
+        self._update_project_label()
         self.status_message.emit(f"Saved graph: {bundle_dir}")
 
     def add_texture_node_from_selected_asset(self) -> None:
@@ -1220,16 +1547,23 @@ class GraphWorkspace(QWidget):
             position = (scene_position.x(), scene_position.y())
         else:
             position = self._next_node_position()
-        self._scene.add_node(
-            create_graph_node(
-                NodeType.TEXTURE_INPUT,
-                title=name,
-                position=position,
-                properties={"path": str(path)},
-            )
+        node = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            title=name,
+            position=position,
+            properties={"path": str(path)},
+        )
+        self._push_graph_command(
+            AddNodesCommand(self.project.graph, self._on_graph_command_changed, [node], text="Add texture"),
+            select_node_ids=[node.node_id],
         )
 
-    def add_node_of_type(self, node_type: object, scene_position: object | None = None) -> None:
+    def add_node_of_type(
+        self,
+        node_type: object,
+        scene_position: object | None = None,
+        context: object | None = None,
+    ) -> None:
         try:
             resolved_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
         except ValueError:
@@ -1249,13 +1583,22 @@ class GraphWorkspace(QWidget):
         elif resolved_type is NodeType.VIEW:
             title = f"View {count + 1}"
 
-        self._scene.add_node(
-            create_graph_node(
-                resolved_type,
-                title=title,
-                position=position,
-                properties=properties,
-            )
+        node = create_graph_node(
+            resolved_type,
+            title=title,
+            position=position,
+            properties=properties,
+        )
+        connections = self._connections_for_new_node_context(node, context)
+        self._push_graph_command(
+            AddNodesCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                [node],
+                connections,
+                text=f"Add {node_type_label(resolved_type)}",
+            ),
+            select_node_ids=[node.node_id],
         )
 
     def add_constant_node(self) -> None:
@@ -1276,6 +1619,7 @@ class GraphWorkspace(QWidget):
         options: ConversionOptions,
         logger,
     ) -> GraphExportSummary:
+        self._refresh_validation()
         warnings = self._executor.validate(self.project)
         if warnings:
             for warning in warnings:
@@ -1302,6 +1646,44 @@ class GraphWorkspace(QWidget):
                 item = QTableWidgetItem(value)
                 self.result_table.setItem(row, column, item)
 
+    def _refresh_validation(self) -> None:
+        issues = self._executor.validate_issues(self.project)
+        self.validation_table.blockSignals(True)
+        try:
+            self.validation_table.setRowCount(len(issues))
+            for row, issue in enumerate(issues):
+                node_title = self._node_title(issue.node_id)
+                values = (
+                    issue.severity.value.upper(),
+                    node_title,
+                    issue.message,
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.ItemDataRole.UserRole, issue.node_id)
+                    item.setToolTip(issue.message)
+                    self.validation_table.setItem(row, column, item)
+        finally:
+            self.validation_table.blockSignals(False)
+
+    def _select_validation_issue_node(self) -> None:
+        selected_rows = self.validation_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return
+        row = selected_rows[0].row()
+        item = self.validation_table.item(row, 0)
+        if item is None:
+            return
+        node_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if node_id:
+            self._scene.select_node_ids([node_id])
+
+    def _node_title(self, node_id: str) -> str:
+        for node in self.project.graph.nodes:
+            if node.node_id == node_id:
+                return node.title
+        return "-"
+
     def _next_node_position(self) -> tuple[float, float]:
         view_center = self.view.mapToScene(self.view.viewport().rect().center())
         offset = 28 * len(self.project.graph.nodes)
@@ -1312,11 +1694,312 @@ class GraphWorkspace(QWidget):
             return (scene_position.x(), scene_position.y())
         return self._next_node_position()
 
-    def _on_graph_changed(self) -> None:
+    def _push_graph_command(self, command, *, select_node_ids: Iterable[str] = ()) -> None:
+        selected_ids = list(select_node_ids)
+        self.undo_stack.push(command)
+        if selected_ids:
+            self._scene.select_node_ids(selected_ids)
+        self._update_project_label()
+
+    def _on_graph_command_changed(self, needs_rebuild: bool = True) -> None:
+        selected_ids = self._scene.selected_node_ids()
+        if not selected_ids and self.properties_panel._node is not None:
+            selected_ids = [self.properties_panel._node.node_id]
+
         self._preview_cache.clear()
-        selected_node = self._scene.selected_node()
-        self.properties_panel.set_node(selected_node)
+        if needs_rebuild:
+            self._scene.rebuild()
+            self._scene.select_node_ids(selected_ids)
+        else:
+            self._refresh_node_flags()
+
+        self._refresh_validation()
+        self.properties_panel.set_node(self._scene.selected_node())
         self._preview_active_display_node()
+        self._update_project_label()
+
+    def _delete_selection(self) -> None:
+        self._scene.delete_selected()
+
+    def _on_delete_items_requested(self, payload: object) -> None:
+        try:
+            node_ids, connection_ids = payload
+        except (TypeError, ValueError):
+            return
+        if not node_ids and not connection_ids:
+            return
+        self._push_graph_command(
+            DeleteItemsCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                node_ids=node_ids,
+                connection_ids=connection_ids,
+            )
+        )
+
+    def _on_connection_requested(
+        self,
+        connection: GraphConnection,
+        rewire_connection: object | None = None,
+    ) -> None:
+        remove_connections = (
+            [rewire_connection]
+            if isinstance(rewire_connection, GraphConnection)
+            else []
+        )
+        self._push_graph_command(
+            ReplaceInputConnectionCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                connection,
+                remove_connections=remove_connections,
+            ),
+            select_node_ids=[connection.target_node_id],
+        )
+        self.status_message.emit("Connection created.")
+
+    def _on_connection_delete_requested(self, connection: GraphConnection) -> None:
+        self._push_graph_command(
+            RemoveConnectionsCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                [connection],
+                text="Delete connection",
+            )
+        )
+
+    def _on_connection_insert_node_requested(
+        self,
+        connection: GraphConnection,
+        node_type: object,
+        scene_position: object,
+    ) -> None:
+        try:
+            resolved_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
+        except ValueError:
+            return
+        input_socket_id = self._first_channel_input_socket_id(resolved_type)
+        output_socket_id = self._first_channel_output_socket_id(resolved_type)
+        if input_socket_id is None or output_socket_id is None:
+            self.status_message.emit(f"{node_type_label(resolved_type)} cannot be inserted in a wire.")
+            return
+
+        position = self._node_position_for(scene_position)
+        count = sum(1 for node in self.project.graph.nodes if node.node_type is resolved_type)
+        node = create_graph_node(
+            resolved_type,
+            title=f"{node_type_label(resolved_type)} {count + 1}",
+            position=position,
+        )
+        input_connection = GraphConnection(
+            connection_id=make_connection_id(),
+            source_node_id=connection.source_node_id,
+            source_socket_id=connection.source_socket_id,
+            target_node_id=node.node_id,
+            target_socket_id=input_socket_id,
+        )
+        output_connection = GraphConnection(
+            connection_id=make_connection_id(),
+            source_node_id=node.node_id,
+            source_socket_id=output_socket_id,
+            target_node_id=connection.target_node_id,
+            target_socket_id=connection.target_socket_id,
+        )
+        self._push_graph_command(
+            InsertNodeInConnectionCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                connection,
+                node,
+                input_connection,
+                output_connection,
+            ),
+            select_node_ids=[node.node_id],
+        )
+
+    def _on_wire_node_requested(self, port: PortItem, scene_position: object) -> None:
+        if isinstance(scene_position, QPointF):
+            self.view.open_node_menu(scene_position, wire_port=port)
+
+    def _on_node_moved(
+        self,
+        node: GraphNode,
+        previous_position: object,
+        next_position: object,
+    ) -> None:
+        if not isinstance(previous_position, tuple) or not isinstance(next_position, tuple):
+            return
+        if previous_position == next_position:
+            return
+        self._push_graph_command(
+            MoveNodesCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                {node.node_id: previous_position},
+                {node.node_id: next_position},
+            ),
+            select_node_ids=[node.node_id],
+        )
+
+    def _on_nodes_moved(self, previous_positions: object, next_positions: object) -> None:
+        if not isinstance(previous_positions, dict) or not isinstance(next_positions, dict):
+            return
+        if not previous_positions or not next_positions:
+            return
+        self._push_graph_command(
+            MoveNodesCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                previous_positions,
+                next_positions,
+            ),
+            select_node_ids=list(next_positions.keys()),
+        )
+
+    def _on_node_properties_changed(
+        self,
+        node: GraphNode,
+        title: object,
+        properties: object,
+        needs_rebuild: bool,
+    ) -> None:
+        if not isinstance(title, str) or not isinstance(properties, dict):
+            return
+        self._push_graph_command(
+            SetNodeStateCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                node,
+                title=title,
+                properties=properties,
+                text="Edit node properties",
+                needs_rebuild=needs_rebuild,
+            ),
+            select_node_ids=[node.node_id],
+        )
+
+    def _connections_for_new_node_context(
+        self,
+        node: GraphNode,
+        context: object | None,
+    ) -> list[GraphConnection]:
+        if not isinstance(context, PortItem):
+            return []
+        if context.direction is SocketDirection.OUTPUT:
+            target_socket_id = self._first_channel_input_socket_id(node.node_type)
+            if target_socket_id is None:
+                return []
+            return [
+                GraphConnection(
+                    connection_id=make_connection_id(),
+                    source_node_id=context.node_item.node.node_id,
+                    source_socket_id=context.socket_id,
+                    target_node_id=node.node_id,
+                    target_socket_id=target_socket_id,
+                )
+            ]
+
+        source_socket_id = self._first_channel_output_socket_id(node.node_type)
+        if source_socket_id is None:
+            return []
+        return [
+            GraphConnection(
+                connection_id=make_connection_id(),
+                source_node_id=node.node_id,
+                source_socket_id=source_socket_id,
+                target_node_id=context.node_item.node.node_id,
+                target_socket_id=context.socket_id,
+            )
+        ]
+
+    def _copy_selection(self) -> None:
+        node_ids = set(self._scene.selected_node_ids())
+        if not node_ids:
+            self.status_message.emit("No graph nodes selected.")
+            return
+        self._clipboard_nodes = [
+            clone_graph_node(node)
+            for node in self.project.graph.nodes
+            if node.node_id in node_ids
+        ]
+        self._clipboard_connections = [
+            clone_graph_connection(connection)
+            for connection in self.project.graph.connections
+            if connection.source_node_id in node_ids and connection.target_node_id in node_ids
+        ]
+        self.status_message.emit(f"Copied nodes: {len(self._clipboard_nodes)}")
+
+    def _paste_clipboard(self) -> None:
+        if not self._clipboard_nodes:
+            self.status_message.emit("Clipboard is empty.")
+            return
+        id_map = {node.node_id: make_node_id() for node in self._clipboard_nodes}
+        pasted_nodes: list[GraphNode] = []
+        for node in self._clipboard_nodes:
+            pasted = clone_graph_node(node, node_id=id_map[node.node_id])
+            pasted.position = (pasted.position[0] + 36.0, pasted.position[1] + 36.0)
+            pasted_nodes.append(pasted)
+        pasted_connections = [
+            clone_graph_connection(
+                connection,
+                connection_id=make_connection_id(),
+                source_node_id=id_map[connection.source_node_id],
+                target_node_id=id_map[connection.target_node_id],
+            )
+            for connection in self._clipboard_connections
+            if connection.source_node_id in id_map and connection.target_node_id in id_map
+        ]
+        self._push_graph_command(
+            AddNodesCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                pasted_nodes,
+                pasted_connections,
+                text="Paste nodes",
+            ),
+            select_node_ids=[node.node_id for node in pasted_nodes],
+        )
+        self._clipboard_nodes = [clone_graph_node(node) for node in pasted_nodes]
+        self._clipboard_connections = [
+            clone_graph_connection(connection)
+            for connection in pasted_connections
+        ]
+
+    def _duplicate_selection(self) -> None:
+        self._copy_selection()
+        self._paste_clipboard()
+
+    def has_unsaved_changes(self) -> bool:
+        return not self.undo_stack.isClean()
+
+    def _update_project_label(self) -> None:
+        suffix = "*" if self.has_unsaved_changes() else ""
+        self.project_label.setText(f"{self.project.name}{suffix}")
+
+    @staticmethod
+    def _first_channel_input_socket_id(node_type: NodeType) -> str | None:
+        return next(
+            (
+                socket.socket_id
+                for socket in socket_definitions(node_type)
+                if socket.direction is SocketDirection.INPUT
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _first_channel_output_socket_id(node_type: NodeType) -> str | None:
+        return next(
+            (
+                socket.socket_id
+                for socket in socket_definitions(node_type)
+                if socket.direction is SocketDirection.OUTPUT
+            ),
+            None,
+        )
+
+    def _on_graph_changed(self) -> None:
+        self._on_graph_command_changed(True)
 
     def _on_node_selected(self, node: GraphNode | None) -> None:
         self.properties_panel.set_node(node)
@@ -1335,59 +2018,73 @@ class GraphWorkspace(QWidget):
     def _on_display_flag_clicked(self, node: GraphNode | None) -> None:
         if node is None:
             return
-        for graph_node in self.project.graph.nodes:
-            graph_node.properties["display"] = graph_node.node_id == node.node_id
-        self._refresh_node_flags()
-        self._preview_display_node(node)
+        self._push_graph_command(
+            SetDisplayFlagCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                node.node_id,
+            ),
+            select_node_ids=[node.node_id],
+        )
 
     def _on_render_flag_clicked(self, node: GraphNode | None) -> None:
         if node is None or node.node_type is not NodeType.OUTPUT_RGBA:
             return
-        node.properties["enabled"] = not bool(node.properties.get("enabled", True))
-        self._refresh_node_flags()
-        if self.properties_panel._node is node:
-            self.properties_panel.set_node(node)
-        state = "on" if node.properties.get("enabled", True) else "off"
+        properties = dict(node.properties)
+        properties["enabled"] = not bool(properties.get("enabled", True))
+        self._push_graph_command(
+            SetNodeStateCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                node,
+                title=node.title,
+                properties=properties,
+                text="Toggle render flag",
+                needs_rebuild=False,
+            ),
+            select_node_ids=[node.node_id],
+        )
+        state = "on" if properties.get("enabled", True) else "off"
         self.status_message.emit(f"{node.title}: render flag {state}.")
 
     def _on_enable_flag_clicked(self, node: GraphNode | None) -> None:
         if node is None or not node_has_enable_flag(node.node_type):
             return
-        node.properties["enabled"] = not bool(node.properties.get("enabled", True))
-        self._invalidate_preview_from_node(node)
-        self._refresh_node_flags()
-        if self.properties_panel._node is node:
-            self.properties_panel.set_node(node)
-        self._preview_active_display_node()
-        state = "enabled" if node.properties.get("enabled", True) else "bypassed"
+        properties = dict(node.properties)
+        properties["enabled"] = not bool(properties.get("enabled", True))
+        self._push_graph_command(
+            SetNodeStateCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                node,
+                title=node.title,
+                properties=properties,
+                text="Toggle node enabled",
+                needs_rebuild=False,
+            ),
+            select_node_ids=[node.node_id],
+        )
+        state = "enabled" if properties.get("enabled", True) else "bypassed"
         self.status_message.emit(f"{node.title}: {state}.")
 
     def _on_node_reset_clicked(self, node: GraphNode | None) -> None:
         if node is None or not node_has_resettable_parameters(node.node_type):
             return
-        reset_node_parameters(node)
-        self._invalidate_preview_from_node(node)
-        if self.properties_panel._node is node:
-            self.properties_panel.set_node(node)
-        self._refresh_node_flags()
-        self._preview_active_display_node()
+        shadow = clone_graph_node(node)
+        reset_node_parameters(shadow)
+        self._push_graph_command(
+            SetNodeStateCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                node,
+                title=node.title,
+                properties=shadow.properties,
+                text="Reset node parameters",
+                needs_rebuild=False,
+            ),
+            select_node_ids=[node.node_id],
+        )
         self.status_message.emit(f"{node.title}: parameters reset.")
-
-    def _rebuild_after_property_change(self, needs_rebuild: bool = False) -> None:
-        selected_node = self.properties_panel._node
-        selected_id = selected_node.node_id if selected_node is not None else None
-        if selected_node is not None:
-            self._invalidate_preview_from_node(selected_node)
-        if not needs_rebuild:
-            self._refresh_node_flags()
-            self._preview_active_display_node()
-            return
-        self._scene.rebuild()
-        if selected_id is not None:
-            item = self._scene.node_items.get(selected_id)
-            if item is not None:
-                item.setSelected(True)
-        self._preview_active_display_node()
 
     def _refresh_node_flags(self) -> None:
         for item in self._scene.node_items.values():

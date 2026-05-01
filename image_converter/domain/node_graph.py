@@ -34,6 +34,32 @@ class OutputMode(str, Enum):
     RGBA = "rgba"
 
 
+class OutputProfile(str, Enum):
+    GENERIC_RGBA = "generic_rgba"
+    UNITY_URP = "unity_urp"
+    UNITY_HDRP = "unity_hdrp"
+    UNREAL_ORM = "unreal_orm"
+    METAHUMAN_REPACK = "metahuman_repack"
+
+
+class TextureNodeColorSpace(str, Enum):
+    AUTO = "auto"
+    SRGB = "srgb"
+    LINEAR = "linear"
+
+
+class TextureDataRole(str, Enum):
+    COLOR = "color"
+    DATA = "data"
+    NORMAL = "normal"
+    MASK = "mask"
+
+
+class GraphValidationSeverity(str, Enum):
+    WARNING = "warning"
+    ERROR = "error"
+
+
 OPERATION_NODE_TYPES = (
     NodeType.INVERT_CHANNEL,
     NodeType.LEVELS_CHANNEL,
@@ -85,6 +111,14 @@ class NodeGraphProject:
     version: int = 1
 
 
+@dataclass(slots=True, frozen=True)
+class GraphValidationIssue:
+    severity: GraphValidationSeverity
+    message: str
+    node_id: str = ""
+    socket_id: str = ""
+
+
 def make_node_id() -> str:
     return f"node_{uuid4().hex[:12]}"
 
@@ -115,7 +149,11 @@ def default_node_title(node_type: NodeType) -> str:
 
 def default_node_properties(node_type: NodeType) -> dict[str, Any]:
     if node_type is NodeType.TEXTURE_INPUT:
-        return {"path": ""}
+        return {
+            "path": "",
+            "color_space": TextureNodeColorSpace.AUTO.value,
+            "data_role": TextureDataRole.DATA.value,
+        }
     if node_type is NodeType.CONSTANT_CHANNEL:
         return {"value": 255}
     if node_type is NodeType.INVERT_CHANNEL:
@@ -144,6 +182,7 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
             "filename": "packed.png",
             "output_path": "",
             "mode": OutputMode.RGBA.value,
+            "profile": OutputProfile.GENERIC_RGBA.value,
             "enabled": True,
         }
     return {}

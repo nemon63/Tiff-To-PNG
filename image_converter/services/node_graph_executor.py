@@ -10,6 +10,8 @@ from image_converter.domain.models import ConversionOptions, ConversionStatus
 from image_converter.domain.node_graph import (
     GraphConnection,
     GraphNode,
+    GraphValidationIssue,
+    GraphValidationSeverity,
     NodeGraph,
     NodeGraphProject,
     NodeType,
@@ -206,34 +208,85 @@ class NodeGraphExecutor:
         return Image.merge("RGBA", (channel, channel, channel, alpha))
 
     def validate(self, project: NodeGraphProject) -> tuple[str, ...]:
-        warnings: list[str] = []
+        return tuple(issue.message for issue in self.validate_issues(project))
+
+    def validate_issues(self, project: NodeGraphProject) -> tuple[GraphValidationIssue, ...]:
+        issues: list[GraphValidationIssue] = []
         graph = project.graph
         node_ids = {node.node_id for node in graph.nodes}
 
         for node in graph.nodes:
             if not node.node_id:
-                warnings.append("Graph содержит node без id.")
+                issues.append(
+                    GraphValidationIssue(
+                        GraphValidationSeverity.ERROR,
+                        "Graph содержит node без id.",
+                    )
+                )
             if node.node_type is NodeType.TEXTURE_INPUT:
                 path = Path(str(node.properties.get("path", "")))
                 if not str(path):
-                    warnings.append(f"{node.title}: texture path не задан.")
+                    issues.append(
+                        GraphValidationIssue(
+                            GraphValidationSeverity.ERROR,
+                            f"{node.title}: texture path не задан.",
+                            node.node_id,
+                            "path",
+                        )
+                    )
                 elif not path.exists():
-                    warnings.append(f"{node.title}: texture не найден: {path}")
+                    issues.append(
+                        GraphValidationIssue(
+                            GraphValidationSeverity.ERROR,
+                            f"{node.title}: texture не найден: {path}",
+                            node.node_id,
+                            "path",
+                        )
+                    )
             if node.node_type is NodeType.OUTPUT_RGBA and node.properties.get("enabled", True):
                 missing = self._missing_required_output_inputs(graph, node)
                 if missing:
-                    warnings.append(f"{node.title}: не подключены каналы {', '.join(missing)}.")
+                    issues.append(
+                        GraphValidationIssue(
+                            GraphValidationSeverity.ERROR,
+                            f"{node.title}: не подключены каналы {', '.join(missing)}.",
+                            node.node_id,
+                            ",".join(missing),
+                        )
+                    )
 
         for connection in graph.connections:
             if connection.source_node_id not in node_ids:
-                warnings.append(f"Broken connection: source node {connection.source_node_id} не найден.")
+                issues.append(
+                    GraphValidationIssue(
+                        GraphValidationSeverity.ERROR,
+                        f"Broken connection: source node {connection.source_node_id} не найден.",
+                        connection.source_node_id,
+                        connection.source_socket_id,
+                    )
+                )
             if connection.target_node_id not in node_ids:
-                warnings.append(f"Broken connection: target node {connection.target_node_id} не найден.")
+                issues.append(
+                    GraphValidationIssue(
+                        GraphValidationSeverity.ERROR,
+                        f"Broken connection: target node {connection.target_node_id} не найден.",
+                        connection.target_node_id,
+                        connection.target_socket_id,
+                    )
+                )
 
         if not self._enabled_output_nodes(graph):
-            warnings.append("Нет включенных Output nodes для экспорта.")
+            issues.append(
+                GraphValidationIssue(
+                    GraphValidationSeverity.WARNING,
+                    "Нет включенных Output nodes для экспорта.",
+                )
+            )
 
-        return tuple(dict.fromkeys(warnings))
+        deduped: dict[tuple[str, str, str], GraphValidationIssue] = {}
+        for issue in issues:
+            deduped[(issue.node_id, issue.socket_id, issue.message)] = issue
+        return tuple(deduped.values())
 
     def export_enabled_outputs(
         self,
