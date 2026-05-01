@@ -10,6 +10,11 @@ class NodeType(str, Enum):
     TEXTURE_INPUT = "texture_input"
     CONSTANT_CHANNEL = "constant_channel"
     INVERT_CHANNEL = "invert_channel"
+    LEVELS_CHANNEL = "levels_channel"
+    CLAMP_CHANNEL = "clamp_channel"
+    THRESHOLD_CHANNEL = "threshold_channel"
+    BLEND_CHANNEL = "blend_channel"
+    LUMINANCE = "luminance"
     VIEW = "view"
     OUTPUT_RGBA = "output_rgba"
 
@@ -27,6 +32,16 @@ class SocketType(str, Enum):
 class OutputMode(str, Enum):
     RGB = "rgb"
     RGBA = "rgba"
+
+
+OPERATION_NODE_TYPES = (
+    NodeType.INVERT_CHANNEL,
+    NodeType.LEVELS_CHANNEL,
+    NodeType.CLAMP_CHANNEL,
+    NodeType.THRESHOLD_CHANNEL,
+    NodeType.BLEND_CHANNEL,
+    NodeType.LUMINANCE,
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -83,6 +98,11 @@ def node_type_label(node_type: NodeType) -> str:
         NodeType.TEXTURE_INPUT: "Texture",
         NodeType.CONSTANT_CHANNEL: "Constant",
         NodeType.INVERT_CHANNEL: "Invert",
+        NodeType.LEVELS_CHANNEL: "Levels",
+        NodeType.CLAMP_CHANNEL: "Clamp",
+        NodeType.THRESHOLD_CHANNEL: "Threshold",
+        NodeType.BLEND_CHANNEL: "Blend",
+        NodeType.LUMINANCE: "Luminance",
         NodeType.VIEW: "View",
         NodeType.OUTPUT_RGBA: "Output",
     }
@@ -99,7 +119,24 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
     if node_type is NodeType.CONSTANT_CHANNEL:
         return {"value": 255}
     if node_type is NodeType.INVERT_CHANNEL:
-        return {}
+        return {"enabled": True}
+    if node_type is NodeType.LEVELS_CHANNEL:
+        return {
+            "enabled": True,
+            "black": 0,
+            "white": 255,
+            "gamma": 1.0,
+            "out_min": 0,
+            "out_max": 255,
+        }
+    if node_type is NodeType.CLAMP_CHANNEL:
+        return {"enabled": True, "min": 0, "max": 255}
+    if node_type is NodeType.THRESHOLD_CHANNEL:
+        return {"enabled": True, "threshold": 128}
+    if node_type is NodeType.BLEND_CHANNEL:
+        return {"enabled": True, "mode": "multiply", "opacity": 100}
+    if node_type is NodeType.LUMINANCE:
+        return {"enabled": True}
     if node_type is NodeType.VIEW:
         return {}
     if node_type is NodeType.OUTPUT_RGBA:
@@ -112,6 +149,32 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
     return {}
 
 
+def resettable_node_property_keys(node_type: NodeType) -> tuple[str, ...]:
+    mapping = {
+        NodeType.CONSTANT_CHANNEL: ("value",),
+        NodeType.LEVELS_CHANNEL: ("black", "white", "gamma", "out_min", "out_max"),
+        NodeType.CLAMP_CHANNEL: ("min", "max"),
+        NodeType.THRESHOLD_CHANNEL: ("threshold",),
+        NodeType.BLEND_CHANNEL: ("mode", "opacity"),
+    }
+    return mapping.get(node_type, ())
+
+
+def node_has_resettable_parameters(node_type: NodeType) -> bool:
+    return bool(resettable_node_property_keys(node_type))
+
+
+def node_has_enable_flag(node_type: NodeType) -> bool:
+    return node_type in OPERATION_NODE_TYPES
+
+
+def reset_node_parameters(node: GraphNode) -> None:
+    defaults = default_node_properties(node.node_type)
+    for key in resettable_node_property_keys(node.node_type):
+        if key in defaults:
+            node.properties[key] = defaults[key]
+
+
 def create_graph_node(
     node_type: NodeType,
     *,
@@ -119,7 +182,8 @@ def create_graph_node(
     position: tuple[float, float] = (0.0, 0.0),
     properties: dict[str, Any] | None = None,
 ) -> GraphNode:
-    node_properties = default_node_properties(node_type)
+    node_properties = {"display": False}
+    node_properties.update(default_node_properties(node_type))
     if properties:
         node_properties.update(properties)
     return GraphNode(
@@ -145,6 +209,34 @@ def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
         return (
             GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.LEVELS_CHANNEL:
+        return (
+            GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.CLAMP_CHANNEL:
+        return (
+            GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.THRESHOLD_CHANNEL:
+        return (
+            GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.BLEND_CHANNEL:
+        return (
+            GraphSocket("a", "A", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("b", "B", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.LUMINANCE:
+        return (
+            GraphSocket("r", "R", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("g", "G", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("b", "B", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "L", SocketDirection.OUTPUT, SocketType.CHANNEL),
         )
     if node_type is NodeType.VIEW:
         return (

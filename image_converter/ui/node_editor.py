@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PIL import Image
-from PyQt6.QtCore import QPoint, QPointF, QSize, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QPainter,
@@ -11,12 +11,12 @@ from PyQt6.QtGui import (
     QPainterPathStroker,
     QPen,
     QPixmap,
-    QTransform,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -31,8 +31,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
-    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -49,10 +49,13 @@ from image_converter.domain.node_graph import (
     OutputMode,
     SocketDirection,
     create_graph_node,
-    find_node,
     incoming_connection,
     make_connection_id,
+    node_has_enable_flag,
+    node_has_resettable_parameters,
+    node_type_label,
     remove_node,
+    reset_node_parameters,
     replace_input_connection,
     socket_definitions,
 )
@@ -60,6 +63,7 @@ from image_converter.services.node_graph_executor import (
     GraphExecutionError,
     GraphExportSummary,
     NodeGraphExecutor,
+    NodeGraphPreviewCache,
 )
 from image_converter.services.node_graph_project import NodeGraphProjectRepository
 
@@ -67,6 +71,9 @@ NODE_WIDTH = 190
 TITLE_HEIGHT = 28
 ROW_HEIGHT = 22
 PORT_RADIUS = 6
+FLAG_SIZE = 14
+FLAG_TOP = 7
+FLAG_GAP = 6
 
 
 class ConnectionItem(QGraphicsPathItem):
@@ -143,6 +150,14 @@ class GraphNodeItem(QGraphicsRectItem):
         super().__init__()
         self.node = node
         self.port_items: dict[str, PortItem] = {}
+        self.display_flag_item: QGraphicsRectItem | None = None
+        self.display_flag_label: QGraphicsSimpleTextItem | None = None
+        self.enable_flag_item: QGraphicsRectItem | None = None
+        self.enable_flag_label: QGraphicsSimpleTextItem | None = None
+        self.render_flag_item: QGraphicsRectItem | None = None
+        self.render_flag_label: QGraphicsSimpleTextItem | None = None
+        self.reset_button_item: QGraphicsRectItem | None = None
+        self.reset_button_label: QGraphicsSimpleTextItem | None = None
         sockets = socket_definitions(node.node_type)
         input_count = sum(1 for socket in sockets if socket.direction is SocketDirection.INPUT)
         output_count = sum(1 for socket in sockets if socket.direction is SocketDirection.OUTPUT)
@@ -167,6 +182,8 @@ class GraphNodeItem(QGraphicsRectItem):
         title = QGraphicsSimpleTextItem(self.node.title, self)
         title.setBrush(QColor("#E4EAF1"))
         title.setPos(10, 6)
+
+        self._build_flag_items()
 
         subtitle = QGraphicsSimpleTextItem(self.node.node_type.value, self)
         subtitle.setBrush(QColor("#8E9AA8"))
@@ -227,6 +244,146 @@ class GraphNodeItem(QGraphicsRectItem):
         pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(qimage))
         return pixmap_item
 
+    def _build_flag_items(self) -> None:
+        if node_has_resettable_parameters(self.node.node_type):
+            reset_rect = self._reset_button_rect()
+            self.reset_button_item = QGraphicsRectItem(reset_rect, self)
+            self.reset_button_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.reset_button_label = QGraphicsSimpleTextItem("0", self)
+            self.reset_button_label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.reset_button_label.setPos(reset_rect.x() + 4, reset_rect.y() - 1)
+
+        if node_has_enable_flag(self.node.node_type):
+            enable_rect = self._enable_flag_rect()
+            self.enable_flag_item = QGraphicsRectItem(enable_rect, self)
+            self.enable_flag_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.enable_flag_label = QGraphicsSimpleTextItem("E", self)
+            self.enable_flag_label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.enable_flag_label.setPos(enable_rect.x() + 4, enable_rect.y() - 1)
+
+        display_rect = self._display_flag_rect()
+        self.display_flag_item = QGraphicsRectItem(display_rect, self)
+        self.display_flag_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.display_flag_label = QGraphicsSimpleTextItem("D", self)
+        self.display_flag_label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.display_flag_label.setPos(display_rect.x() + 4, display_rect.y() - 1)
+
+        if self.node.node_type is NodeType.OUTPUT_RGBA:
+            render_rect = self._render_flag_rect()
+            self.render_flag_item = QGraphicsRectItem(render_rect, self)
+            self.render_flag_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.render_flag_label = QGraphicsSimpleTextItem("R", self)
+            self.render_flag_label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.render_flag_label.setPos(render_rect.x() + 4, render_rect.y() - 1)
+
+        self.refresh_flags()
+
+    def refresh_flags(self) -> None:
+        self._sync_flag_item(
+            self.reset_button_item,
+            self.reset_button_label,
+            "Reset parameters",
+            False,
+            QColor("#3A434D"),
+        )
+
+        operation_enabled = bool(self.node.properties.get("enabled", True))
+        self._sync_flag_item(
+            self.enable_flag_item,
+            self.enable_flag_label,
+            "Enable node",
+            operation_enabled,
+            QColor("#C4932E"),
+        )
+
+        display_enabled = bool(self.node.properties.get("display", False))
+        self._sync_flag_item(
+            self.display_flag_item,
+            self.display_flag_label,
+            "Display flag",
+            display_enabled,
+            QColor("#2F82FF"),
+        )
+
+        if self.node.node_type is NodeType.OUTPUT_RGBA:
+            render_enabled = bool(self.node.properties.get("enabled", True))
+            self._sync_flag_item(
+                self.render_flag_item,
+                self.render_flag_label,
+                "Render flag",
+                render_enabled,
+                QColor("#34A853"),
+            )
+
+    def _sync_flag_item(
+        self,
+        flag_item: QGraphicsRectItem | None,
+        flag_label: QGraphicsSimpleTextItem | None,
+        tooltip: str,
+        enabled: bool,
+        active_color: QColor,
+    ) -> None:
+        if flag_item is None or flag_label is None:
+            return
+        flag_item.setBrush(active_color if enabled else QColor("#3A434D"))
+        flag_item.setPen(QPen(QColor("#89B7FF") if enabled else QColor("#111820"), 1.0))
+        flag_item.setToolTip(tooltip)
+        flag_label.setBrush(QColor("#FFFFFF") if enabled else QColor("#9AA6B2"))
+        flag_label.setToolTip(tooltip)
+
+    def _display_flag_rect(self) -> QRectF:
+        if self.node.node_type is NodeType.OUTPUT_RGBA:
+            return self._flag_rect_from_right(1)
+        return self._flag_rect_from_right(0)
+
+    def _enable_flag_rect(self) -> QRectF:
+        return self._flag_rect_from_right(1)
+
+    def _reset_button_rect(self) -> QRectF:
+        if self.node.node_type is NodeType.OUTPUT_RGBA:
+            return self._flag_rect_from_right(2)
+        if node_has_enable_flag(self.node.node_type):
+            return self._flag_rect_from_right(2)
+        return self._flag_rect_from_right(1)
+
+    def _flag_rect_from_right(self, index: int) -> QRectF:
+        x = NODE_WIDTH - FLAG_SIZE - 8 - index * (FLAG_SIZE + FLAG_GAP)
+        return QRectF(x, FLAG_TOP, FLAG_SIZE, FLAG_SIZE)
+
+    def _render_flag_rect(self) -> QRectF:
+        return QRectF(NODE_WIDTH - FLAG_SIZE - 8, FLAG_TOP, FLAG_SIZE, FLAG_SIZE)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            scene = self.scene()
+            if isinstance(scene, GraphScene):
+                if (
+                    node_has_resettable_parameters(self.node.node_type)
+                    and self._reset_button_rect().contains(event.pos())
+                ):
+                    scene.node_reset_clicked.emit(self.node)
+                    event.accept()
+                    return
+                if (
+                    node_has_enable_flag(self.node.node_type)
+                    and self._enable_flag_rect().contains(event.pos())
+                ):
+                    scene.node_enable_flag_clicked.emit(self.node)
+                    event.accept()
+                    return
+                if self._display_flag_rect().contains(event.pos()):
+                    scene.node_display_flag_clicked.emit(self.node)
+                    event.accept()
+                    return
+                if (
+                    self.node.node_type is NodeType.OUTPUT_RGBA
+                    and self._render_flag_rect().contains(event.pos())
+                ):
+                    scene.node_render_flag_clicked.emit(self.node)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
     def mouseDoubleClickEvent(self, event) -> None:
         scene = self.scene()
         if isinstance(scene, GraphScene):
@@ -256,7 +413,11 @@ class GraphNodeItem(QGraphicsRectItem):
 
 class GraphScene(QGraphicsScene):
     graph_changed = pyqtSignal()
+    node_display_flag_clicked = pyqtSignal(object)
     node_double_clicked = pyqtSignal(object)
+    node_enable_flag_clicked = pyqtSignal(object)
+    node_render_flag_clicked = pyqtSignal(object)
+    node_reset_clicked = pyqtSignal(object)
     node_selection_changed = pyqtSignal(object)
     status_message = pyqtSignal(str)
 
@@ -433,6 +594,7 @@ class GraphScene(QGraphicsScene):
 
 class GraphView(QGraphicsView):
     texture_dropped = pyqtSignal(str, object)
+    node_add_requested = pyqtSignal(object, object)
 
     def __init__(self, scene: GraphScene, parent: QWidget | None = None):
         super().__init__(scene, parent)
@@ -549,6 +711,51 @@ class GraphView(QGraphicsView):
             return
         super().dropEvent(event)
 
+    def contextMenuEvent(self, event) -> None:
+        scene_position = self.mapToScene(event.pos())
+        menu = QMenu(self)
+
+        input_menu = menu.addMenu("Input")
+        self._add_node_menu_action(input_menu, "Texture", NodeType.TEXTURE_INPUT, scene_position)
+        self._add_node_menu_action(input_menu, "Constant", NodeType.CONSTANT_CHANNEL, scene_position)
+
+        channel_menu = menu.addMenu("Channel")
+        self._add_node_menu_action(channel_menu, "Invert", NodeType.INVERT_CHANNEL, scene_position)
+        self._add_node_menu_action(channel_menu, "Levels", NodeType.LEVELS_CHANNEL, scene_position)
+        self._add_node_menu_action(channel_menu, "Clamp", NodeType.CLAMP_CHANNEL, scene_position)
+        self._add_node_menu_action(channel_menu, "Threshold", NodeType.THRESHOLD_CHANNEL, scene_position)
+        self._add_node_menu_action(channel_menu, "Luminance", NodeType.LUMINANCE, scene_position)
+
+        math_menu = menu.addMenu("Math")
+        self._add_node_menu_action(math_menu, "Blend", NodeType.BLEND_CHANNEL, scene_position)
+
+        utility_menu = menu.addMenu("Utility")
+        self._add_node_menu_action(utility_menu, "View", NodeType.VIEW, scene_position)
+
+        output_menu = menu.addMenu("Output")
+        self._add_node_menu_action(output_menu, "Output RGBA", NodeType.OUTPUT_RGBA, scene_position)
+
+        menu.addSeparator()
+        fit_action = menu.addAction("Fit View")
+        fit_action.triggered.connect(self.fit_graph)
+        menu.exec(event.globalPos())
+        event.accept()
+
+    def _add_node_menu_action(
+        self,
+        menu: QMenu,
+        label: str,
+        node_type: NodeType,
+        scene_position: QPointF,
+    ) -> None:
+        action = menu.addAction(label)
+        action.triggered.connect(
+            lambda _checked=False, current_type=node_type: self.node_add_requested.emit(
+                current_type,
+                scene_position,
+            )
+        )
+
     def fit_graph(self) -> None:
         items_rect = self.scene().itemsBoundingRect()
         if items_rect.isNull():
@@ -573,7 +780,7 @@ class GraphView(QGraphicsView):
 
 
 class NodePropertiesPanel(QWidget):
-    node_changed = pyqtSignal()
+    node_changed = pyqtSignal(bool)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -581,6 +788,13 @@ class NodePropertiesPanel(QWidget):
         self._suppress = False
         self._build_ui()
         self.set_node(None)
+
+    def _make_byte_spin(self) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(0, 255)
+        spin.setKeyboardTracking(False)
+        spin.valueChanged.connect(self._apply_changes)
+        return spin
 
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
@@ -591,6 +805,10 @@ class NodePropertiesPanel(QWidget):
         title = QLabel("Node Properties")
         title.setObjectName("PanelTitle")
         layout.addWidget(title)
+
+        self.reset_parameters_button = QPushButton("Reset Params")
+        self.reset_parameters_button.clicked.connect(self._reset_parameters)
+        layout.addWidget(self.reset_parameters_button)
 
         self.empty_label = QLabel("Select a node to edit its properties.")
         self.empty_label.setObjectName("SummaryText")
@@ -604,6 +822,10 @@ class NodePropertiesPanel(QWidget):
         self.title_edit = QLineEdit()
         self.title_edit.textEdited.connect(self._apply_changes)
         self.form.addRow("Title", self.title_edit)
+
+        self.node_enabled_checkbox = QCheckBox("Enabled")
+        self.node_enabled_checkbox.toggled.connect(self._apply_changes)
+        self.form.addRow("Node", self.node_enabled_checkbox)
 
         self.path_edit = QLineEdit()
         self.path_edit.textEdited.connect(self._apply_changes)
@@ -620,8 +842,52 @@ class NodePropertiesPanel(QWidget):
 
         self.value_spin = QSpinBox()
         self.value_spin.setRange(0, 255)
+        self.value_spin.setKeyboardTracking(False)
         self.value_spin.valueChanged.connect(self._apply_changes)
         self.form.addRow("Value", self.value_spin)
+
+        self.level_black_spin = self._make_byte_spin()
+        self.form.addRow("Black", self.level_black_spin)
+        self.level_white_spin = self._make_byte_spin()
+        self.form.addRow("White", self.level_white_spin)
+        self.level_gamma_spin = QDoubleSpinBox()
+        self.level_gamma_spin.setRange(0.05, 8.0)
+        self.level_gamma_spin.setSingleStep(0.05)
+        self.level_gamma_spin.setDecimals(2)
+        self.level_gamma_spin.setKeyboardTracking(False)
+        self.level_gamma_spin.valueChanged.connect(self._apply_changes)
+        self.form.addRow("Gamma", self.level_gamma_spin)
+        self.level_out_min_spin = self._make_byte_spin()
+        self.form.addRow("Output Min", self.level_out_min_spin)
+        self.level_out_max_spin = self._make_byte_spin()
+        self.form.addRow("Output Max", self.level_out_max_spin)
+
+        self.clamp_min_spin = self._make_byte_spin()
+        self.form.addRow("Min", self.clamp_min_spin)
+        self.clamp_max_spin = self._make_byte_spin()
+        self.form.addRow("Max", self.clamp_max_spin)
+
+        self.threshold_spin = self._make_byte_spin()
+        self.form.addRow("Threshold", self.threshold_spin)
+
+        self.blend_mode_combo = QComboBox()
+        for label, value in (
+            ("Multiply", "multiply"),
+            ("Add", "add"),
+            ("Subtract", "subtract"),
+            ("Max", "max"),
+            ("Min", "min"),
+            ("Average", "average"),
+        ):
+            self.blend_mode_combo.addItem(label, value)
+        self.blend_mode_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Blend Mode", self.blend_mode_combo)
+        self.blend_opacity_spin = QSpinBox()
+        self.blend_opacity_spin.setRange(0, 100)
+        self.blend_opacity_spin.setKeyboardTracking(False)
+        self.blend_opacity_spin.setSuffix("%")
+        self.blend_opacity_spin.valueChanged.connect(self._apply_changes)
+        self.form.addRow("Opacity", self.blend_opacity_spin)
 
         self.filename_edit = QLineEdit()
         self.filename_edit.textEdited.connect(self._apply_changes)
@@ -659,15 +925,35 @@ class NodePropertiesPanel(QWidget):
         try:
             self.empty_label.setVisible(node is None)
             self.form_host.setVisible(node is not None)
+            self.reset_parameters_button.setVisible(
+                node is not None and node_has_resettable_parameters(node.node_type)
+            )
             if node is None:
                 return
             self.title_edit.setText(node.title)
+            self.node_enabled_checkbox.setChecked(bool(node.properties.get("enabled", True)))
             self.path_edit.setText(str(node.properties.get("path", "")))
             self.value_spin.setValue(self._coerce_int(node.properties.get("value"), 255))
+            self.level_black_spin.setValue(self._coerce_int(node.properties.get("black"), 0))
+            self.level_white_spin.setValue(self._coerce_int(node.properties.get("white"), 255))
+            self.level_gamma_spin.setValue(self._coerce_float(node.properties.get("gamma"), 1.0))
+            self.level_out_min_spin.setValue(self._coerce_int(node.properties.get("out_min"), 0))
+            self.level_out_max_spin.setValue(self._coerce_int(node.properties.get("out_max"), 255))
+            self.clamp_min_spin.setValue(self._coerce_int(node.properties.get("min"), 0))
+            self.clamp_max_spin.setValue(self._coerce_int(node.properties.get("max"), 255))
+            self.threshold_spin.setValue(self._coerce_int(node.properties.get("threshold"), 128))
+            blend_mode = str(node.properties.get("mode", "multiply"))
+            self.blend_mode_combo.setCurrentIndex(0)
+            for index in range(self.blend_mode_combo.count()):
+                if self.blend_mode_combo.itemData(index) == blend_mode:
+                    self.blend_mode_combo.setCurrentIndex(index)
+                    break
+            self.blend_opacity_spin.setValue(self._coerce_int(node.properties.get("opacity"), 100))
             self.filename_edit.setText(str(node.properties.get("filename", "packed.png")))
             self.output_path_edit.setText(str(node.properties.get("output_path", "")))
             self.enabled_checkbox.setChecked(bool(node.properties.get("enabled", True)))
             mode_value = str(node.properties.get("mode", OutputMode.RGBA.value))
+            self.mode_combo.setCurrentIndex(1)
             for index in range(self.mode_combo.count()):
                 if self.mode_combo.itemData(index) == mode_value:
                     self.mode_combo.setCurrentIndex(index)
@@ -677,8 +963,19 @@ class NodePropertiesPanel(QWidget):
             self._suppress = False
 
     def _sync_visibility(self, node_type: NodeType) -> None:
+        self._set_row_visible(self.node_enabled_checkbox, node_has_enable_flag(node_type))
         self._set_row_visible(self.path_host, node_type is NodeType.TEXTURE_INPUT)
         self._set_row_visible(self.value_spin, node_type is NodeType.CONSTANT_CHANNEL)
+        self._set_row_visible(self.level_black_spin, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.level_white_spin, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.level_gamma_spin, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.level_out_min_spin, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.level_out_max_spin, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.clamp_min_spin, node_type is NodeType.CLAMP_CHANNEL)
+        self._set_row_visible(self.clamp_max_spin, node_type is NodeType.CLAMP_CHANNEL)
+        self._set_row_visible(self.threshold_spin, node_type is NodeType.THRESHOLD_CHANNEL)
+        self._set_row_visible(self.blend_mode_combo, node_type is NodeType.BLEND_CHANNEL)
+        self._set_row_visible(self.blend_opacity_spin, node_type is NodeType.BLEND_CHANNEL)
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_path_host, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.mode_combo, node_type is NodeType.OUTPUT_RGBA)
@@ -711,25 +1008,60 @@ class NodePropertiesPanel(QWidget):
             self.output_path_edit.setText(path)
             self._apply_changes()
 
+    def _reset_parameters(self) -> None:
+        if self._node is None or not node_has_resettable_parameters(self._node.node_type):
+            return
+        reset_node_parameters(self._node)
+        self.set_node(self._node)
+        self.node_changed.emit(False)
+
     def _apply_changes(self, *_args: object) -> None:
         if self._suppress or self._node is None:
             return
+        previous_title = self._node.title
+        previous_path = str(self._node.properties.get("path", ""))
         self._node.title = self.title_edit.text().strip() or self._node.title
+        if node_has_enable_flag(self._node.node_type):
+            self._node.properties["enabled"] = self.node_enabled_checkbox.isChecked()
         if self._node.node_type is NodeType.TEXTURE_INPUT:
             self._node.properties["path"] = self.path_edit.text().strip()
         elif self._node.node_type is NodeType.CONSTANT_CHANNEL:
             self._node.properties["value"] = self.value_spin.value()
+        elif self._node.node_type is NodeType.LEVELS_CHANNEL:
+            self._node.properties["black"] = self.level_black_spin.value()
+            self._node.properties["white"] = self.level_white_spin.value()
+            self._node.properties["gamma"] = self.level_gamma_spin.value()
+            self._node.properties["out_min"] = self.level_out_min_spin.value()
+            self._node.properties["out_max"] = self.level_out_max_spin.value()
+        elif self._node.node_type is NodeType.CLAMP_CHANNEL:
+            self._node.properties["min"] = self.clamp_min_spin.value()
+            self._node.properties["max"] = self.clamp_max_spin.value()
+        elif self._node.node_type is NodeType.THRESHOLD_CHANNEL:
+            self._node.properties["threshold"] = self.threshold_spin.value()
+        elif self._node.node_type is NodeType.BLEND_CHANNEL:
+            self._node.properties["mode"] = str(self.blend_mode_combo.currentData() or "multiply")
+            self._node.properties["opacity"] = self.blend_opacity_spin.value()
         elif self._node.node_type is NodeType.OUTPUT_RGBA:
             self._node.properties["filename"] = self.filename_edit.text().strip() or "packed.png"
             self._node.properties["output_path"] = self.output_path_edit.text().strip()
             self._node.properties["mode"] = str(self.mode_combo.currentData() or OutputMode.RGBA.value)
             self._node.properties["enabled"] = self.enabled_checkbox.isChecked()
-        self.node_changed.emit()
+        needs_rebuild = previous_title != self._node.title
+        if self._node.node_type is NodeType.TEXTURE_INPUT:
+            needs_rebuild = needs_rebuild or previous_path != str(self._node.properties.get("path", ""))
+        self.node_changed.emit(needs_rebuild)
 
     @staticmethod
     def _coerce_int(value: object, default: int) -> int:
         try:
             return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _coerce_float(value: object, default: float) -> float:
+        try:
+            return float(value)
         except (TypeError, ValueError):
             return default
 
@@ -746,9 +1078,14 @@ class GraphWorkspace(QWidget):
         self._assets: list[QueueItem] = []
         self._repository = NodeGraphProjectRepository()
         self._executor = NodeGraphExecutor()
+        self._preview_cache = NodeGraphPreviewCache(max_side=1024)
         self._scene = GraphScene(self.project, self)
         self._scene.graph_changed.connect(self._on_graph_changed)
+        self._scene.node_display_flag_clicked.connect(self._on_display_flag_clicked)
         self._scene.node_double_clicked.connect(self._on_node_double_clicked)
+        self._scene.node_enable_flag_clicked.connect(self._on_enable_flag_clicked)
+        self._scene.node_render_flag_clicked.connect(self._on_render_flag_clicked)
+        self._scene.node_reset_clicked.connect(self._on_node_reset_clicked)
         self._scene.node_selection_changed.connect(self._on_node_selected)
         self._scene.status_message.connect(self.status_message.emit)
         self._build_ui()
@@ -766,26 +1103,10 @@ class GraphWorkspace(QWidget):
         self.project_label.setObjectName("PanelTitle")
         toolbar.addWidget(self.project_label)
 
-        self.asset_combo = QComboBox()
-        self.asset_combo.setMinimumWidth(120)
-        self.asset_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        toolbar.addWidget(self.asset_combo)
+        menu_hint = QLabel("Right-click graph to add nodes")
+        menu_hint.setObjectName("SummaryText")
+        toolbar.addWidget(menu_hint)
 
-        self.add_texture_button = QPushButton("+ Texture")
-        self.add_texture_button.clicked.connect(self.add_texture_node_from_selected_asset)
-        toolbar.addWidget(self.add_texture_button)
-        self.add_constant_button = QPushButton("+ Constant")
-        self.add_constant_button.clicked.connect(self.add_constant_node)
-        toolbar.addWidget(self.add_constant_button)
-        self.add_invert_button = QPushButton("+ Invert")
-        self.add_invert_button.clicked.connect(self.add_invert_node)
-        toolbar.addWidget(self.add_invert_button)
-        self.add_view_button = QPushButton("+ View")
-        self.add_view_button.clicked.connect(self.add_view_node)
-        toolbar.addWidget(self.add_view_button)
-        self.add_output_button = QPushButton("+ Output")
-        self.add_output_button.clicked.connect(self.add_output_node)
-        toolbar.addWidget(self.add_output_button)
         self.delete_button = QPushButton("Delete")
         self.delete_button.setObjectName("DangerButton")
         self.delete_button.clicked.connect(self._scene.delete_selected)
@@ -811,6 +1132,7 @@ class GraphWorkspace(QWidget):
 
         self.view = GraphView(self._scene)
         self.view.texture_dropped.connect(self.add_texture_node_for_path)
+        self.view.node_add_requested.connect(self.add_node_of_type)
         self.properties_panel = NodePropertiesPanel()
         self.properties_panel.node_changed.connect(self._rebuild_after_property_change)
 
@@ -820,6 +1142,7 @@ class GraphWorkspace(QWidget):
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.verticalHeader().setVisible(False)
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.result_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.result_table.horizontalHeader().setStretchLastSection(True)
         self.result_table.setMaximumHeight(150)
         self.result_table.setMinimumWidth(0)
@@ -839,16 +1162,11 @@ class GraphWorkspace(QWidget):
 
     def set_assets(self, items: list[QueueItem]) -> None:
         self._assets = [item for item in items if item.metadata is not None]
-        self.asset_combo.clear()
-        if not self._assets:
-            self.asset_combo.addItem("No assets in Queue", None)
-            return
-        for item in self._assets:
-            self.asset_combo.addItem(item.path.name, str(item.path))
 
     def new_project(self) -> None:
         self.project = NodeGraphProject()
         self.project_dir = None
+        self._preview_cache.clear()
         self._scene.project = self.project
         self._scene.rebuild()
         self.project_label.setText(self.project.name)
@@ -865,6 +1183,7 @@ class GraphWorkspace(QWidget):
             self.status_message.emit(f"Graph load failed: {exc}")
             return
         self.project_dir = Path(path)
+        self._preview_cache.clear()
         self._scene.project = self.project
         self._scene.rebuild()
         self.project_label.setText(self.project.name)
@@ -890,11 +1209,10 @@ class GraphWorkspace(QWidget):
         self.status_message.emit(f"Saved graph: {bundle_dir}")
 
     def add_texture_node_from_selected_asset(self) -> None:
-        path = self.asset_combo.currentData()
-        if not path:
+        if not self._assets:
             self.status_message.emit("Add assets to Queue first, then create Texture nodes.")
             return
-        self.add_texture_node_for_path(str(path), None)
+        self.add_texture_node_for_path(str(self._assets[0].path), None)
 
     def add_texture_node_for_path(self, path: str, scene_position: object | None = None) -> None:
         name = Path(str(path)).stem[:28]
@@ -911,36 +1229,46 @@ class GraphWorkspace(QWidget):
             )
         )
 
-    def add_constant_node(self) -> None:
+    def add_node_of_type(self, node_type: object, scene_position: object | None = None) -> None:
+        try:
+            resolved_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
+        except ValueError:
+            self.status_message.emit(f"Unknown node type: {node_type}")
+            return
+
+        position = self._node_position_for(scene_position)
+        count = sum(1 for node in self.project.graph.nodes if node.node_type is resolved_type)
+        properties: dict[str, object] = {}
+        title = f"{node_type_label(resolved_type)} {count + 1}"
+
+        if resolved_type is NodeType.OUTPUT_RGBA:
+            title = f"Output {count + 1}"
+            properties["filename"] = f"graph_output_{count + 1}.png"
+        elif resolved_type is NodeType.TEXTURE_INPUT:
+            title = f"Texture {count + 1}"
+        elif resolved_type is NodeType.VIEW:
+            title = f"View {count + 1}"
+
         self._scene.add_node(
-            create_graph_node(NodeType.CONSTANT_CHANNEL, position=self._next_node_position())
+            create_graph_node(
+                resolved_type,
+                title=title,
+                position=position,
+                properties=properties,
+            )
         )
+
+    def add_constant_node(self) -> None:
+        self.add_node_of_type(NodeType.CONSTANT_CHANNEL)
 
     def add_invert_node(self) -> None:
-        self._scene.add_node(
-            create_graph_node(NodeType.INVERT_CHANNEL, position=self._next_node_position())
-        )
+        self.add_node_of_type(NodeType.INVERT_CHANNEL)
 
     def add_view_node(self) -> None:
-        count = sum(1 for node in self.project.graph.nodes if node.node_type is NodeType.VIEW)
-        self._scene.add_node(
-            create_graph_node(
-                NodeType.VIEW,
-                title=f"View {count + 1}",
-                position=self._next_node_position(),
-            )
-        )
+        self.add_node_of_type(NodeType.VIEW)
 
     def add_output_node(self) -> None:
-        count = sum(1 for node in self.project.graph.nodes if node.node_type is NodeType.OUTPUT_RGBA)
-        self._scene.add_node(
-            create_graph_node(
-                NodeType.OUTPUT_RGBA,
-                title=f"Output {count + 1}",
-                position=self._next_node_position(),
-                properties={"filename": f"graph_output_{count + 1}.png"},
-            )
-        )
+        self.add_node_of_type(NodeType.OUTPUT_RGBA)
 
     def export_graph(
         self,
@@ -979,13 +1307,21 @@ class GraphWorkspace(QWidget):
         offset = 28 * len(self.project.graph.nodes)
         return (view_center.x() + offset, view_center.y() + offset)
 
+    def _node_position_for(self, scene_position: object | None) -> tuple[float, float]:
+        if isinstance(scene_position, QPointF):
+            return (scene_position.x(), scene_position.y())
+        return self._next_node_position()
+
     def _on_graph_changed(self) -> None:
+        self._preview_cache.clear()
         selected_node = self._scene.selected_node()
         self.properties_panel.set_node(selected_node)
+        self._preview_active_display_node()
 
     def _on_node_selected(self, node: GraphNode | None) -> None:
         self.properties_panel.set_node(node)
-        self._preview_view_node(node)
+        if self._active_display_node() is None:
+            self._preview_view_node(node)
 
     def _on_node_double_clicked(self, node: GraphNode | None) -> None:
         if node is None:
@@ -996,14 +1332,96 @@ class GraphWorkspace(QWidget):
         if node.node_type is NodeType.VIEW:
             self._preview_view_node(node)
 
-    def _rebuild_after_property_change(self) -> None:
-        selected_id = self.properties_panel._node.node_id if self.properties_panel._node is not None else None
+    def _on_display_flag_clicked(self, node: GraphNode | None) -> None:
+        if node is None:
+            return
+        for graph_node in self.project.graph.nodes:
+            graph_node.properties["display"] = graph_node.node_id == node.node_id
+        self._refresh_node_flags()
+        self._preview_display_node(node)
+
+    def _on_render_flag_clicked(self, node: GraphNode | None) -> None:
+        if node is None or node.node_type is not NodeType.OUTPUT_RGBA:
+            return
+        node.properties["enabled"] = not bool(node.properties.get("enabled", True))
+        self._refresh_node_flags()
+        if self.properties_panel._node is node:
+            self.properties_panel.set_node(node)
+        state = "on" if node.properties.get("enabled", True) else "off"
+        self.status_message.emit(f"{node.title}: render flag {state}.")
+
+    def _on_enable_flag_clicked(self, node: GraphNode | None) -> None:
+        if node is None or not node_has_enable_flag(node.node_type):
+            return
+        node.properties["enabled"] = not bool(node.properties.get("enabled", True))
+        self._invalidate_preview_from_node(node)
+        self._refresh_node_flags()
+        if self.properties_panel._node is node:
+            self.properties_panel.set_node(node)
+        self._preview_active_display_node()
+        state = "enabled" if node.properties.get("enabled", True) else "bypassed"
+        self.status_message.emit(f"{node.title}: {state}.")
+
+    def _on_node_reset_clicked(self, node: GraphNode | None) -> None:
+        if node is None or not node_has_resettable_parameters(node.node_type):
+            return
+        reset_node_parameters(node)
+        self._invalidate_preview_from_node(node)
+        if self.properties_panel._node is node:
+            self.properties_panel.set_node(node)
+        self._refresh_node_flags()
+        self._preview_active_display_node()
+        self.status_message.emit(f"{node.title}: parameters reset.")
+
+    def _rebuild_after_property_change(self, needs_rebuild: bool = False) -> None:
+        selected_node = self.properties_panel._node
+        selected_id = selected_node.node_id if selected_node is not None else None
+        if selected_node is not None:
+            self._invalidate_preview_from_node(selected_node)
+        if not needs_rebuild:
+            self._refresh_node_flags()
+            self._preview_active_display_node()
+            return
         self._scene.rebuild()
         if selected_id is not None:
             item = self._scene.node_items.get(selected_id)
             if item is not None:
                 item.setSelected(True)
-                self._preview_view_node(item.node)
+        self._preview_active_display_node()
+
+    def _refresh_node_flags(self) -> None:
+        for item in self._scene.node_items.values():
+            item.refresh_flags()
+
+    def _invalidate_preview_from_node(self, node: GraphNode) -> None:
+        self._preview_cache.invalidate_node_and_downstream(self.project.graph, node.node_id)
+
+    def _active_display_node(self) -> GraphNode | None:
+        return next(
+            (
+                node
+                for node in self.project.graph.nodes
+                if bool(node.properties.get("display", False))
+            ),
+            None,
+        )
+
+    def _preview_active_display_node(self) -> None:
+        display_node = self._active_display_node()
+        if display_node is not None:
+            self._preview_display_node(display_node)
+
+    def _preview_display_node(self, node: GraphNode) -> None:
+        try:
+            preview_image, meta = self._executor.render_display_node(
+                self.project.graph,
+                node,
+                preview_cache=self._preview_cache,
+            )
+        except (GraphExecutionError, OSError, ValueError) as exc:
+            self.status_message.emit(f"{node.title}: display failed: {exc}")
+            return
+        self.preview_image_requested.emit(preview_image, node.title, meta)
 
     def _preview_view_node(self, node: GraphNode | None) -> None:
         if node is None or node.node_type is not NodeType.VIEW:
@@ -1015,7 +1433,11 @@ class GraphWorkspace(QWidget):
         ) is None:
             return
         try:
-            preview_image = self._executor.render_view_node(self.project.graph, node)
+            preview_image = self._executor.render_view_node(
+                self.project.graph,
+                node,
+                preview_cache=self._preview_cache,
+            )
         except (GraphExecutionError, OSError, ValueError) as exc:
             self.status_message.emit(f"{node.title}: {exc}")
             return
@@ -1024,7 +1446,11 @@ class GraphWorkspace(QWidget):
 
     def _preview_output_node(self, node: GraphNode) -> None:
         try:
-            preview_image = self._executor.render_output_node(self.project.graph, node)
+            preview_image, _meta = self._executor.render_display_node(
+                self.project.graph,
+                node,
+                preview_cache=self._preview_cache,
+            )
         except (GraphExecutionError, OSError, ValueError) as exc:
             self.status_message.emit(f"{node.title}: preview failed: {exc}")
             return

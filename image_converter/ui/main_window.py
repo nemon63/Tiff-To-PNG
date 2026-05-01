@@ -324,11 +324,7 @@ class MainWindow(QMainWindow):
         item = self._selected_asset_item()
         if item is None:
             return
-        for index in range(self.graph_workspace.asset_combo.count()):
-            if self.graph_workspace.asset_combo.itemData(index) == str(item.path):
-                self.graph_workspace.asset_combo.setCurrentIndex(index)
-                break
-        self.graph_workspace.add_texture_node_from_selected_asset()
+        self.graph_workspace.add_texture_node_for_path(str(item.path), None)
 
     def _preview_selected_asset(self, *_args: object) -> None:
         item = self._selected_asset_item()
