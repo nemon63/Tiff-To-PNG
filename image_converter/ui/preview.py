@@ -394,6 +394,26 @@ class PreviewPanel(QWidget):
         if self._allow_detach and self._detached_window is not None:
             self._detached_window.set_queue_item(item)
 
+    def set_graph_preview(self, image, title: str, meta: str) -> None:
+        self._current_item = None
+        self._selected_channel = PreviewChannel.COMPOSITE
+        self._sync_channel_buttons([])
+        try:
+            preview_pixmap = QPixmap.fromImage(_qimage_from_pil(image))
+        except Exception as exc:
+            self.preview_canvas.clear_preview(f"Ошибка graph preview: {exc}")
+            self.asset_label.setText(title)
+            self.asset_meta_label.setText(str(exc))
+            self._sync_control_state(False)
+            return
+
+        self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=False)
+        self.asset_label.setText(title)
+        self.asset_label.setToolTip(title)
+        self.asset_meta_label.setText(meta)
+        self.asset_meta_label.setToolTip(meta)
+        self._sync_control_state(True)
+
     def _rebuild_channels(self, item: QueueItem | None) -> None:
         channels = self._available_channels(item)
         if self._selected_channel not in channels:

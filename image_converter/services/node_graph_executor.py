@@ -67,6 +67,46 @@ class GraphExportSummary:
 
 
 class NodeGraphExecutor:
+    def render_output_node(self, graph: NodeGraph, output_node: GraphNode) -> Image.Image:
+        if output_node.node_type is not NodeType.OUTPUT_RGBA:
+            raise GraphExecutionError(f"{output_node.title}: node is not an Output node.")
+
+        missing = self._missing_required_output_inputs(graph, output_node)
+        if missing:
+            raise GraphExecutionError(f"не подключены каналы {', '.join(missing)}")
+
+        target_size = self._determine_output_size(graph, output_node)
+        if target_size is None:
+            raise GraphExecutionError("output должен зависеть хотя бы от одной texture-ноды")
+
+        return self._compose_output_image(graph, output_node, target_size)
+
+    def render_view_node(
+        self,
+        graph: NodeGraph,
+        view_node: GraphNode,
+        *,
+        fallback_size: tuple[int, int] = (256, 256),
+    ) -> Image.Image:
+        if view_node.node_type is not NodeType.VIEW:
+            raise GraphExecutionError(f"{view_node.title}: node is not a View node.")
+
+        connection = incoming_connection(
+            graph,
+            target_node_id=view_node.node_id,
+            target_socket_id="in",
+        )
+        if connection is None:
+            raise GraphExecutionError(f"{view_node.title}: input is not connected.")
+
+        target_size = self._find_upstream_texture_size(graph, connection, set())
+        if target_size is None:
+            target_size = fallback_size
+
+        channel = self._evaluate_channel_socket(graph, connection, target_size, set()).convert("L")
+        alpha = Image.new("L", channel.size, 255)
+        return Image.merge("RGBA", (channel, channel, channel, alpha))
+
     def validate(self, project: NodeGraphProject) -> tuple[str, ...]:
         warnings: list[str] = []
         graph = project.graph
@@ -132,8 +172,6 @@ class NodeGraphExecutor:
         destination: Path,
         options: ConversionOptions,
     ) -> GraphExportResult:
-        mode = self._output_mode(output_node)
-        required_inputs = ("r", "g", "b")
         missing = self._missing_required_output_inputs(graph, output_node)
         if missing:
             return GraphExportResult(
@@ -163,15 +201,7 @@ class NodeGraphExecutor:
                 message="ОШИБКА: output должен зависеть хотя бы от одной texture-ноды",
             )
 
-        channels = [
-            self._evaluate_output_input(graph, output_node, socket_id, target_size)
-            for socket_id in required_inputs
-        ]
-        if mode is OutputMode.RGBA:
-            alpha = self._evaluate_optional_output_input(graph, output_node, "a", target_size)
-            channels.append(alpha)
-
-        merged = Image.merge("RGBA" if mode is OutputMode.RGBA else "RGB", tuple(channels))
+        merged = self._compose_output_image(graph, output_node, target_size)
         destination.parent.mkdir(parents=True, exist_ok=True)
         merged.save(
             destination,
@@ -186,6 +216,23 @@ class NodeGraphExecutor:
             status=ConversionStatus.SUCCESS,
             message=f"exported: {destination.name}",
         )
+
+    def _compose_output_image(
+        self,
+        graph: NodeGraph,
+        output_node: GraphNode,
+        target_size: tuple[int, int],
+    ) -> Image.Image:
+        mode = self._output_mode(output_node)
+        channels = [
+            self._evaluate_output_input(graph, output_node, socket_id, target_size)
+            for socket_id in ("r", "g", "b")
+        ]
+        if mode is OutputMode.RGBA:
+            alpha = self._evaluate_optional_output_input(graph, output_node, "a", target_size)
+            channels.append(alpha)
+
+        return Image.merge("RGBA" if mode is OutputMode.RGBA else "RGB", tuple(channels))
 
     def _evaluate_output_input(
         self,

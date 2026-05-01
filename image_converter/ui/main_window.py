@@ -91,7 +91,7 @@ class MainWindow(QMainWindow):
         self._presets_by_id: dict[str, ConversionPreset] = {}
         self.setWindowTitle("Texture Pipeline Workbench")
         self.resize(1280, 820)
-        self.setMinimumSize(980, 680)
+        self.setMinimumSize(720, 480)
         self.setAcceptDrops(True)
         self._build_ui()
         self.statusBar().showMessage("Готово")
@@ -133,6 +133,7 @@ class MainWindow(QMainWindow):
         self.metadata_panel.map_type_override_changed.connect(self._apply_selected_map_type_override)
         self.graph_workspace = GraphWorkspace()
         self.graph_workspace.export_requested.connect(self._export_graph)
+        self.graph_workspace.preview_image_requested.connect(self._show_graph_preview)
         self.graph_workspace.status_message.connect(self.set_status)
         self.graph_workspace.status_message.connect(self.append_log)
         self.log_panel = LogPanel()
@@ -334,6 +335,11 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         self.preview_panel.set_queue_item(item)
+        self.preview_dock.show()
+        self.preview_dock.raise_()
+
+    def _show_graph_preview(self, image, title: str, meta: str) -> None:
+        self.preview_panel.set_graph_preview(image, title, meta)
         self.preview_dock.show()
         self.preview_dock.raise_()
 

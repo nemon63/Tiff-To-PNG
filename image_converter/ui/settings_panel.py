@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -645,3 +645,9 @@ class SettingsPanel(QWidget):
     def set_packing_preflight_summary(self, text: str) -> None:
         self._packing_preflight_text = text
         self._refresh_packing_ui()
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(260, 480)
+
+    def sizeHint(self) -> QSize:
+        return QSize(360, 900)

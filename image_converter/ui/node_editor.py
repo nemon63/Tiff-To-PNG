@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PIL import Image
-from PyQt6.QtCore import QPoint, QPointF, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QSize, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QPainter,
@@ -50,12 +50,14 @@ from image_converter.domain.node_graph import (
     SocketDirection,
     create_graph_node,
     find_node,
+    incoming_connection,
     make_connection_id,
     remove_node,
     replace_input_connection,
     socket_definitions,
 )
 from image_converter.services.node_graph_executor import (
+    GraphExecutionError,
     GraphExportSummary,
     NodeGraphExecutor,
 )
@@ -225,6 +227,15 @@ class GraphNodeItem(QGraphicsRectItem):
         pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(qimage))
         return pixmap_item
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        scene = self.scene()
+        if isinstance(scene, GraphScene):
+            self.setSelected(True)
+            scene.node_double_clicked.emit(self.node)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):
         result = super().itemChange(change, value)
         if change is QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -245,6 +256,7 @@ class GraphNodeItem(QGraphicsRectItem):
 
 class GraphScene(QGraphicsScene):
     graph_changed = pyqtSignal()
+    node_double_clicked = pyqtSignal(object)
     node_selection_changed = pyqtSignal(object)
     status_message = pyqtSignal(str)
 
@@ -339,8 +351,13 @@ class GraphScene(QGraphicsScene):
             target_node_id=target_port.node_item.node.node_id,
             target_socket_id=target_port.socket_id,
         )
+        target_node_id = connection.target_node_id
         replace_input_connection(self.project.graph, connection)
         self.rebuild()
+        target_item = self.node_items.get(target_node_id)
+        if target_item is not None:
+            self.clearSelection()
+            target_item.setSelected(True)
         self.graph_changed.emit()
         self.status_message.emit("Connection created.")
 
@@ -719,6 +736,7 @@ class NodePropertiesPanel(QWidget):
 
 class GraphWorkspace(QWidget):
     export_requested = pyqtSignal()
+    preview_image_requested = pyqtSignal(object, str, str)
     status_message = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None):
@@ -730,6 +748,7 @@ class GraphWorkspace(QWidget):
         self._executor = NodeGraphExecutor()
         self._scene = GraphScene(self.project, self)
         self._scene.graph_changed.connect(self._on_graph_changed)
+        self._scene.node_double_clicked.connect(self._on_node_double_clicked)
         self._scene.node_selection_changed.connect(self._on_node_selected)
         self._scene.status_message.connect(self.status_message.emit)
         self._build_ui()
@@ -748,7 +767,8 @@ class GraphWorkspace(QWidget):
         toolbar.addWidget(self.project_label)
 
         self.asset_combo = QComboBox()
-        self.asset_combo.setMinimumWidth(260)
+        self.asset_combo.setMinimumWidth(120)
+        self.asset_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         toolbar.addWidget(self.asset_combo)
 
         self.add_texture_button = QPushButton("+ Texture")
@@ -760,6 +780,9 @@ class GraphWorkspace(QWidget):
         self.add_invert_button = QPushButton("+ Invert")
         self.add_invert_button.clicked.connect(self.add_invert_node)
         toolbar.addWidget(self.add_invert_button)
+        self.add_view_button = QPushButton("+ View")
+        self.add_view_button.clicked.connect(self.add_view_node)
+        toolbar.addWidget(self.add_view_button)
         self.add_output_button = QPushButton("+ Output")
         self.add_output_button.clicked.connect(self.add_output_node)
         toolbar.addWidget(self.add_output_button)
@@ -799,6 +822,7 @@ class GraphWorkspace(QWidget):
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.horizontalHeader().setStretchLastSection(True)
         self.result_table.setMaximumHeight(150)
+        self.result_table.setMinimumWidth(0)
 
         root_layout.addWidget(self.view, 1)
 
@@ -897,6 +921,16 @@ class GraphWorkspace(QWidget):
             create_graph_node(NodeType.INVERT_CHANNEL, position=self._next_node_position())
         )
 
+    def add_view_node(self) -> None:
+        count = sum(1 for node in self.project.graph.nodes if node.node_type is NodeType.VIEW)
+        self._scene.add_node(
+            create_graph_node(
+                NodeType.VIEW,
+                title=f"View {count + 1}",
+                position=self._next_node_position(),
+            )
+        )
+
     def add_output_node(self) -> None:
         count = sum(1 for node in self.project.graph.nodes if node.node_type is NodeType.OUTPUT_RGBA)
         self._scene.add_node(
@@ -946,10 +980,21 @@ class GraphWorkspace(QWidget):
         return (view_center.x() + offset, view_center.y() + offset)
 
     def _on_graph_changed(self) -> None:
-        self.properties_panel.set_node(self._scene.selected_node())
+        selected_node = self._scene.selected_node()
+        self.properties_panel.set_node(selected_node)
 
     def _on_node_selected(self, node: GraphNode | None) -> None:
         self.properties_panel.set_node(node)
+        self._preview_view_node(node)
+
+    def _on_node_double_clicked(self, node: GraphNode | None) -> None:
+        if node is None:
+            return
+        if node.node_type is NodeType.OUTPUT_RGBA:
+            self._preview_output_node(node)
+            return
+        if node.node_type is NodeType.VIEW:
+            self._preview_view_node(node)
 
     def _rebuild_after_property_change(self) -> None:
         selected_id = self.properties_panel._node.node_id if self.properties_panel._node is not None else None
@@ -958,6 +1003,46 @@ class GraphWorkspace(QWidget):
             item = self._scene.node_items.get(selected_id)
             if item is not None:
                 item.setSelected(True)
+                self._preview_view_node(item.node)
+
+    def _preview_view_node(self, node: GraphNode | None) -> None:
+        if node is None or node.node_type is not NodeType.VIEW:
+            return
+        if incoming_connection(
+            self.project.graph,
+            target_node_id=node.node_id,
+            target_socket_id="in",
+        ) is None:
+            return
+        try:
+            preview_image = self._executor.render_view_node(self.project.graph, node)
+        except (GraphExecutionError, OSError, ValueError) as exc:
+            self.status_message.emit(f"{node.title}: {exc}")
+            return
+        meta = f"Graph channel preview · {preview_image.width}x{preview_image.height} · {preview_image.mode}"
+        self.preview_image_requested.emit(preview_image, node.title, meta)
+
+    def _preview_output_node(self, node: GraphNode) -> None:
+        try:
+            preview_image = self._executor.render_output_node(self.project.graph, node)
+        except (GraphExecutionError, OSError, ValueError) as exc:
+            self.status_message.emit(f"{node.title}: preview failed: {exc}")
+            return
+
+        mode = self._output_mode_label(node)
+        filename = str(node.properties.get("filename", "")).strip()
+        if node.properties.get("output_path"):
+            filename = Path(str(node.properties.get("output_path"))).name
+        suffix = f" · {filename}" if filename else ""
+        meta = f"Output preview · {preview_image.width}x{preview_image.height} · {mode}{suffix}"
+        self.preview_image_requested.emit(preview_image, node.title, meta)
+
+    @staticmethod
+    def _output_mode_label(node: GraphNode) -> str:
+        try:
+            return OutputMode(str(node.properties.get("mode", OutputMode.RGBA.value))).value.upper()
+        except ValueError:
+            return OutputMode.RGBA.value.upper()
 
     @staticmethod
     def _status_text(status: ConversionStatus) -> str:
@@ -966,3 +1051,9 @@ class GraphWorkspace(QWidget):
         if status is ConversionStatus.SKIPPED:
             return "Skipped"
         return "Error"
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(360, 260)
+
+    def sizeHint(self) -> QSize:
+        return QSize(980, 620)

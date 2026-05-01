@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import QSize, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QVBoxLayout,
     QWidget,
@@ -59,9 +60,10 @@ class QueuePanel(QWidget):
 
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
         title_label = QLabel("Очередь конвертации")
         title_label.setObjectName("PanelTitle")
@@ -73,19 +75,20 @@ class QueuePanel(QWidget):
         layout.addWidget(subtitle_label)
 
         controls_row = QHBoxLayout()
-        self.add_files_button = QPushButton("Добавить файлы")
+        controls_row.setSpacing(6)
+        self.add_files_button = QPushButton("+ Files")
         self.add_files_button.clicked.connect(self._pick_files)
         controls_row.addWidget(self.add_files_button)
 
-        self.add_folder_button = QPushButton("Добавить папку")
+        self.add_folder_button = QPushButton("+ Folder")
         self.add_folder_button.clicked.connect(self._pick_folder)
         controls_row.addWidget(self.add_folder_button)
 
-        self.remove_selected_button = QPushButton("Удалить выбранные")
+        self.remove_selected_button = QPushButton("Remove")
         self.remove_selected_button.clicked.connect(self.remove_requested.emit)
         controls_row.addWidget(self.remove_selected_button)
 
-        self.clear_button = QPushButton("Очистить")
+        self.clear_button = QPushButton("Clear")
         self.clear_button.setObjectName("DangerButton")
         self.clear_button.clicked.connect(self.clear_requested.emit)
         controls_row.addWidget(self.clear_button)
@@ -109,14 +112,17 @@ class QueuePanel(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
+        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setMinimumSectionSize(48)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(0, 150)
+        header.resizeSection(1, 90)
+        header.resizeSection(2, 80)
+        header.resizeSection(3, 90)
+        header.resizeSection(4, 150)
+        header.resizeSection(5, 180)
         self.table.paths_dropped.connect(self.paths_dropped.emit)
         layout.addWidget(self.table, 1)
 
@@ -144,3 +150,9 @@ class QueuePanel(QWidget):
     def set_controls_enabled(self, enabled: bool) -> None:
         for widget in self._interactive_widgets:
             widget.setEnabled(enabled)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(240, 180)
+
+    def sizeHint(self) -> QSize:
+        return QSize(720, 360)

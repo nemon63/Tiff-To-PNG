@@ -10,6 +10,7 @@ class NodeType(str, Enum):
     TEXTURE_INPUT = "texture_input"
     CONSTANT_CHANNEL = "constant_channel"
     INVERT_CHANNEL = "invert_channel"
+    VIEW = "view"
     OUTPUT_RGBA = "output_rgba"
 
 
@@ -82,6 +83,7 @@ def node_type_label(node_type: NodeType) -> str:
         NodeType.TEXTURE_INPUT: "Texture",
         NodeType.CONSTANT_CHANNEL: "Constant",
         NodeType.INVERT_CHANNEL: "Invert",
+        NodeType.VIEW: "View",
         NodeType.OUTPUT_RGBA: "Output",
     }
     return mapping[node_type]
@@ -97,6 +99,8 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
     if node_type is NodeType.CONSTANT_CHANNEL:
         return {"value": 255}
     if node_type is NodeType.INVERT_CHANNEL:
+        return {}
+    if node_type is NodeType.VIEW:
         return {}
     if node_type is NodeType.OUTPUT_RGBA:
         return {
@@ -141,6 +145,10 @@ def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
         return (
             GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.VIEW:
+        return (
+            GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
         )
     if node_type is NodeType.OUTPUT_RGBA:
         return (
