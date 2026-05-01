@@ -10,7 +10,7 @@ from image_converter.services.options_codec import (
     serialize_conversion_options,
 )
 
-LAYOUT_VERSION = 3
+LAYOUT_VERSION = 5
 
 
 class AppSettingsRepository:
@@ -51,6 +51,8 @@ class AppSettingsRepository:
                 "workspace_splitter_sizes": list(settings.workspace_splitter_sizes),
                 "detail_splitter_sizes": list(settings.detail_splitter_sizes),
                 "inspector_splitter_sizes": list(settings.inspector_splitter_sizes),
+                "geometry": settings.window_geometry,
+                "state": settings.window_state,
             },
         }
 
@@ -67,20 +69,22 @@ class AppSettingsRepository:
             window_height=self._coerce_int(window_data.get("height"), 820),
             splitter_sizes=self._coerce_pair(
                 window_data.get("splitter_sizes") if use_saved_layout else None,
-                (340, 940),
+                (300, 980),
             ),
             workspace_splitter_sizes=self._coerce_pair(
                 window_data.get("workspace_splitter_sizes") if use_saved_layout else None,
-                (500, 440),
+                (980, 340),
             ),
             detail_splitter_sizes=self._coerce_pair(
                 window_data.get("detail_splitter_sizes") if use_saved_layout else None,
-                (420, 220),
+                (640, 180),
             ),
             inspector_splitter_sizes=self._coerce_pair(
                 window_data.get("inspector_splitter_sizes") if use_saved_layout else None,
                 (500, 190),
             ),
+            window_geometry=str(window_data.get("geometry", "")) if use_saved_layout else "",
+            window_state=str(window_data.get("state", "")) if use_saved_layout else "",
         )
 
     @staticmethod

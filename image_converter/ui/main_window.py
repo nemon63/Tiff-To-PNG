@@ -2,66 +2,33 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QPoint, QPointF, QRect, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import (
-    QColor,
-    QCloseEvent,
-    QDragEnterEvent,
-    QDropEvent,
-    QGuiApplication,
-    QImage,
-    QKeySequence,
-    QPainter,
-    QPixmap,
-    QShortcut,
-    QWheelEvent,
-)
+from PyQt6.QtCore import QByteArray, QMimeData, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction, QCloseEvent, QDrag, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QButtonGroup,
-    QCheckBox,
-    QComboBox,
-    QFileDialog,
-    QFormLayout,
+    QDockWidget,
     QFrame,
-    QGridLayout,
-    QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
-    QRadioButton,
     QScrollArea,
-    QSizePolicy,
-    QSpinBox,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from image_converter.domain.constants import FILE_DIALOG_FILTER
 from image_converter.domain.models import (
     AppSettings,
     BatchRequest,
     BatchSource,
-    ChannelPackLayout,
-    ChannelPackingOptions,
-    ConversionOptions,
     ConversionPreset,
-    NamingRules,
-    PreviewChannel,
     QueueItem,
     QueueStatus,
-    ResizeMode,
-    TextureColorSpace,
     TextureMapType,
 )
 from image_converter.services.colorspace import (
@@ -71,1968 +38,45 @@ from image_converter.services.colorspace import (
     recommended_colorspace_for_map_type,
 )
 from image_converter.services.conversion import BatchConversionService
-from image_converter.services.inspection import build_output_estimate
-from image_converter.services.naming import build_output_filename
-from image_converter.services.packing import (
-    build_channel_pack_jobs,
-    channel_pack_mapping_text,
-    summarize_channel_pack_jobs,
-)
-from image_converter.services.preview import TexturePreviewService
+from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
 from image_converter.services.presets import PresetRepository
-
-QUEUE_HEADERS = ("Имя", "Карта", "Размер", "Разрешение", "Статус", "Выходной путь")
-AUTO_MAP_TYPE_DATA = "__auto__"
-CURRENT_PRESET_DATA = "__current_preset__"
-
-
-def _extract_local_paths(event) -> list[str]:
-    mime_data = event.mimeData()
-    if not mime_data.hasUrls():
-        return []
-
-    paths: list[str] = []
-    for url in mime_data.urls():
-        if url.isLocalFile():
-            local_path = url.toLocalFile()
-            if local_path:
-                paths.append(local_path)
-    return paths
+from image_converter.ui.common import (
+    _colorspace_label,
+    _extract_local_paths,
+    _map_type_label,
+    _queue_status_display,
+    _status_colors,
+)
+from image_converter.ui.inspector import MetadataPanel
+from image_converter.ui.log_panel import LogPanel
+from image_converter.ui.node_editor import GraphWorkspace
+from image_converter.ui.preview import DetachedPreviewWindow, PreviewPanel
+from image_converter.ui.queue_panel import QueuePanel
+from image_converter.ui.settings_panel import SettingsPanel
 
 
-def _status_text(status: QueueStatus) -> str:
-    mapping = {
-        QueueStatus.PENDING: "Ожидает",
-        QueueStatus.READY: "Готово к запуску",
-        QueueStatus.RUNNING: "В обработке",
-        QueueStatus.DONE: "Успех",
-        QueueStatus.SKIPPED: "Пропущено",
-        QueueStatus.ERROR: "Ошибка",
-    }
-    return mapping[status]
-
-
-def _queue_status_display(item: QueueItem) -> str:
-    base_text = _status_text(item.status)
-    warning_count = item_warning_count(item)
-    if item.status in (QueueStatus.READY, QueueStatus.PENDING) and warning_count:
-        return f"{base_text} ({warning_count} предупрежд.)"
-    return base_text
-
-
-def _preview_channel_label(channel: PreviewChannel) -> str:
-    mapping = {
-        PreviewChannel.COMPOSITE: "RGB",
-        PreviewChannel.RED: "R",
-        PreviewChannel.GREEN: "G",
-        PreviewChannel.BLUE: "B",
-        PreviewChannel.ALPHA: "A",
-        PreviewChannel.LUMA: "Luma",
-    }
-    return mapping[channel]
-
-
-def _map_type_label(map_type: TextureMapType) -> str:
-    return map_type.label
-
-
-def _colorspace_label(colorspace: TextureColorSpace) -> str:
-    return colorspace.label
-
-
-def _qimage_from_pil(image) -> QImage:
-    rgba_image = image.convert("RGBA")
-    raw_data = rgba_image.tobytes("raw", "RGBA")
-    qimage = QImage(
-        raw_data,
-        rgba_image.width,
-        rgba_image.height,
-        rgba_image.width * 4,
-        QImage.Format.Format_RGBA8888,
-    )
-    return qimage.copy()
-
-
-def _status_colors(item: QueueItem) -> tuple[QColor, QColor]:
-    status = item.status
-    if status is QueueStatus.RUNNING:
-        return QColor("#16314F"), QColor("#D8EEFF")
-    if status is QueueStatus.DONE:
-        return QColor("#17351C"), QColor("#DCF7DD")
-    if status is QueueStatus.SKIPPED:
-        return QColor("#2A2A2A"), QColor("#E7E7E7")
-    if status is QueueStatus.ERROR:
-        return QColor("#4A1717"), QColor("#FFD7D7")
-    if item_warning_count(item):
-        return QColor("#4C3B10"), QColor("#FFF0B8")
-    return QColor("#1F1F1F"), QColor("#F3F3F3")
-
-
-class SettingsPanel(QWidget):
-    convert_requested = pyqtSignal()
-    output_path_changed = pyqtSignal(str)
-    preset_apply_requested = pyqtSignal(str)
-    preset_save_requested = pyqtSignal()
-    preset_delete_requested = pyqtSignal(str)
-    options_changed = pyqtSignal()
+class AssetTableWidget(QTableWidget):
+    asset_dropped = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._interactive_widgets: list[QWidget] = []
-        self._presets_by_id: dict[str, ConversionPreset] = {}
-        self._suppress_option_signal = False
-        self._packing_preflight_text = "Подходящих наборов для packing пока нет."
-        self._build_ui()
-        self._connect_option_change_signals()
-        self._update_resize_state()
-        self._update_png8_state()
-        self._refresh_naming_ui()
-        self._refresh_packing_ui()
-        self.set_available_presets([])
-
-    def _build_ui(self) -> None:
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(18, 18, 18, 18)
-        root_layout.setSpacing(16)
-
-        title_label = QLabel("Параметры экспорта")
-        title_label.setObjectName("PanelTitle")
-        root_layout.addWidget(title_label)
-
-        subtitle_label = QLabel(
-            "Соберите batch-проход: источники, выходной путь, формат PNG и масштабирование."
-        )
-        subtitle_label.setObjectName("PanelSubtitle")
-        subtitle_label.setWordWrap(True)
-        root_layout.addWidget(subtitle_label)
-
-        root_layout.addWidget(self._build_presets_group())
-        root_layout.addWidget(self._build_paths_group())
-        root_layout.addWidget(self._build_naming_group())
-        root_layout.addWidget(self._build_packing_group())
-        root_layout.addWidget(self._build_basic_group())
-        root_layout.addWidget(self._build_png_group())
-        root_layout.addWidget(self._build_resize_group())
-        root_layout.addStretch(1)
-
-        controls_row = QHBoxLayout()
-        self.convert_button = QPushButton("Конвертировать")
-        self.convert_button.setObjectName("PrimaryButton")
-        self.convert_button.setMinimumHeight(42)
-        self.convert_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.convert_button.setDefault(True)
-        self.convert_button.clicked.connect(self.convert_requested.emit)
-        self.convert_button.setToolTip("Запустить пакетную конвертацию в PNG.")
-        controls_row.addWidget(self.convert_button)
-        root_layout.addLayout(controls_row)
-        self._register_interactive(self.convert_button)
-
-    def _build_presets_group(self) -> QGroupBox:
-        group = QGroupBox("Workflow Presets")
-        layout = QVBoxLayout(group)
-        layout.setSpacing(10)
-
-        self.preset_combo = QComboBox()
-        self.preset_combo.currentIndexChanged.connect(self._refresh_preset_ui)
-        layout.addWidget(self.preset_combo)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(8)
-
-        self.apply_preset_button = QPushButton("Применить")
-        self.apply_preset_button.clicked.connect(self._emit_apply_selected_preset)
-        actions_row.addWidget(self.apply_preset_button, 1)
-
-        self.save_preset_button = QPushButton("Сохранить как...")
-        self.save_preset_button.setObjectName("GhostButton")
-        self.save_preset_button.clicked.connect(self.preset_save_requested.emit)
-        actions_row.addWidget(self.save_preset_button, 1)
-
-        self.delete_preset_button = QPushButton("Удалить")
-        self.delete_preset_button.setObjectName("DangerButton")
-        self.delete_preset_button.clicked.connect(self._emit_delete_selected_preset)
-        actions_row.addWidget(self.delete_preset_button)
-
-        layout.addLayout(actions_row)
-
-        self.preset_summary_label = QLabel()
-        self.preset_summary_label.setObjectName("SummaryText")
-        self.preset_summary_label.setWordWrap(True)
-        layout.addWidget(self.preset_summary_label)
-
-        self._register_interactive(
-            self.preset_combo,
-            self.apply_preset_button,
-            self.save_preset_button,
-            self.delete_preset_button,
-        )
-        return group
-
-    def _build_paths_group(self) -> QGroupBox:
-        group = QGroupBox("Пути")
-        layout = QFormLayout(group)
-        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Файл или папка с исходниками")
-        self.input_edit.editingFinished.connect(self._on_input_editing_finished)
-        self.input_edit.setToolTip(
-            "Путь к файлу или папке.\nПоддерживаются DDS, PNG, TIFF, TGA, JPEG, BMP, GIF, WEBP и PSD."
-        )
-
-        input_row = QHBoxLayout()
-        input_row.addWidget(self.input_edit)
-        self.input_file_button = QPushButton("Файл")
-        self.input_file_button.clicked.connect(self._pick_input_file)
-        input_row.addWidget(self.input_file_button)
-        self.input_folder_button = QPushButton("Папка")
-        self.input_folder_button.clicked.connect(self._pick_input_folder)
-        input_row.addWidget(self.input_folder_button)
-
-        input_wrapper = QWidget()
-        input_wrapper.setLayout(input_row)
-        layout.addRow("Вход:", input_wrapper)
-
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Папка назначения")
-        self.output_edit.textChanged.connect(self.output_path_changed.emit)
-        self.output_edit.setToolTip(
-            "Папка для PNG. Если оставить пустой, файлы будут сохранены рядом с исходниками."
-        )
-
-        output_row = QHBoxLayout()
-        output_row.addWidget(self.output_edit)
-        self.output_button = QPushButton("Выбрать")
-        self.output_button.clicked.connect(self._pick_output_folder)
-        output_row.addWidget(self.output_button)
-
-        output_wrapper = QWidget()
-        output_wrapper.setLayout(output_row)
-        layout.addRow("Выход:", output_wrapper)
-
-        self._register_interactive(
-            self.input_edit,
-            self.output_edit,
-            self.input_file_button,
-            self.input_folder_button,
-            self.output_button,
-        )
-        return group
-
-    def _build_naming_group(self) -> QGroupBox:
-        group = QGroupBox("Naming Rules")
-        layout = QVBoxLayout(group)
-        layout.setSpacing(10)
-
-        self.naming_lowercase_checkbox = QCheckBox("Приводить имена к lowercase")
-        layout.addWidget(self.naming_lowercase_checkbox)
-
-        self.naming_replace_spaces_checkbox = QCheckBox("Заменять пробелы на _")
-        layout.addWidget(self.naming_replace_spaces_checkbox)
-
-        self.naming_normalize_suffix_checkbox = QCheckBox(
-            "Нормализовать suffix карты по map type"
-        )
-        layout.addWidget(self.naming_normalize_suffix_checkbox)
-
-        self.naming_summary_label = QLabel()
-        self.naming_summary_label.setObjectName("SummaryText")
-        self.naming_summary_label.setWordWrap(True)
-        layout.addWidget(self.naming_summary_label)
-
-        self.naming_lowercase_checkbox.toggled.connect(self._refresh_naming_ui)
-        self.naming_replace_spaces_checkbox.toggled.connect(self._refresh_naming_ui)
-        self.naming_normalize_suffix_checkbox.toggled.connect(self._refresh_naming_ui)
-
-        self._register_interactive(
-            self.naming_lowercase_checkbox,
-            self.naming_replace_spaces_checkbox,
-            self.naming_normalize_suffix_checkbox,
-        )
-        return group
-
-    def _build_packing_group(self) -> QGroupBox:
-        group = QGroupBox("Channel Packing")
-        layout = QVBoxLayout(group)
-        layout.setSpacing(10)
-
-        self.pack_enable_checkbox = QCheckBox("Собирать packed-textures после batch")
-        self.pack_enable_checkbox.toggled.connect(self._refresh_packing_ui)
-        layout.addWidget(self.pack_enable_checkbox)
-
-        layout_row = QHBoxLayout()
-        layout_row.addWidget(QLabel("Layout:"))
-        self.pack_layout_combo = QComboBox()
-        for pack_layout in ChannelPackLayout:
-            self.pack_layout_combo.addItem(pack_layout.label, pack_layout)
-        self.pack_layout_combo.currentIndexChanged.connect(self._refresh_packing_ui)
-        layout_row.addWidget(self.pack_layout_combo, 1)
-        layout.addLayout(layout_row)
-
-        self.packing_mapping_label = QLabel()
-        self.packing_mapping_label.setObjectName("SummaryText")
-        self.packing_mapping_label.setWordWrap(True)
-        layout.addWidget(self.packing_mapping_label)
-
-        self.packing_queue_label = QLabel()
-        self.packing_queue_label.setObjectName("SummaryText")
-        self.packing_queue_label.setWordWrap(True)
-        layout.addWidget(self.packing_queue_label)
-
-        self._register_interactive(self.pack_enable_checkbox, self.pack_layout_combo)
-        return group
-
-    def _build_basic_group(self) -> QGroupBox:
-        group = QGroupBox("Основные параметры")
-        layout = QVBoxLayout(group)
-
-        self.recursive_checkbox = QCheckBox("Рекурсивно обрабатывать подпапки")
-        self.recursive_checkbox.setChecked(True)
-        layout.addWidget(self.recursive_checkbox)
-
-        self.force_rgba_checkbox = QCheckBox("Принудительно сохранять как RGBA")
-        layout.addWidget(self.force_rgba_checkbox)
-
-        self.overwrite_checkbox = QCheckBox("Перезаписывать существующие PNG")
-        layout.addWidget(self.overwrite_checkbox)
-
-        self.delete_source_checkbox = QCheckBox("Удалять исходники после успешной конвертации")
-        layout.addWidget(self.delete_source_checkbox)
-
-        self._register_interactive(
-            self.recursive_checkbox,
-            self.force_rgba_checkbox,
-            self.overwrite_checkbox,
-            self.delete_source_checkbox,
-        )
-        return group
-
-    def _build_png_group(self) -> QGroupBox:
-        group = QGroupBox("Параметры PNG")
-        layout = QVBoxLayout(group)
-
-        self.optimize_checkbox = QCheckBox("Optimize")
-        self.optimize_checkbox.setChecked(True)
-        layout.addWidget(self.optimize_checkbox)
-
-        compress_row = QHBoxLayout()
-        compress_row.addWidget(QLabel("Степень сжатия:"))
-        self.compress_spin = QSpinBox()
-        self.compress_spin.setRange(0, 9)
-        self.compress_spin.setValue(6)
-        compress_row.addWidget(self.compress_spin)
-        compress_row.addStretch(1)
-        layout.addLayout(compress_row)
-
-        palette_row = QHBoxLayout()
-        self.png8_checkbox = QCheckBox("PNG-8")
-        self.png8_checkbox.toggled.connect(self._update_png8_state)
-        palette_row.addWidget(self.png8_checkbox)
-        palette_row.addWidget(QLabel("Цветов:"))
-        self.png8_colors_spin = QSpinBox()
-        self.png8_colors_spin.setRange(2, 256)
-        self.png8_colors_spin.setValue(256)
-        palette_row.addWidget(self.png8_colors_spin)
-        self.dither_checkbox = QCheckBox("Dithering")
-        self.dither_checkbox.setChecked(True)
-        palette_row.addWidget(self.dither_checkbox)
-        palette_row.addStretch(1)
-        layout.addLayout(palette_row)
-
-        self._register_interactive(
-            self.optimize_checkbox,
-            self.compress_spin,
-            self.png8_checkbox,
-            self.png8_colors_spin,
-            self.dither_checkbox,
-        )
-        return group
-
-    def _build_resize_group(self) -> QGroupBox:
-        group = QGroupBox("Масштабирование")
-        layout = QVBoxLayout(group)
-
-        self.resize_none_radio = QRadioButton("Без изменения")
-        self.resize_none_radio.setChecked(True)
-        self.resize_none_radio.toggled.connect(self._update_resize_state)
-        layout.addWidget(self.resize_none_radio)
-
-        percent_row = QHBoxLayout()
-        self.resize_percent_radio = QRadioButton("Процент от оригинала")
-        self.resize_percent_radio.toggled.connect(self._update_resize_state)
-        percent_row.addWidget(self.resize_percent_radio)
-        self.resize_percent_spin = QSpinBox()
-        self.resize_percent_spin.setRange(1, 1000)
-        self.resize_percent_spin.setValue(100)
-        self.resize_percent_spin.setSuffix(" %")
-        percent_row.addWidget(self.resize_percent_spin)
-        percent_row.addStretch(1)
-        layout.addLayout(percent_row)
-
-        max_side_row = QHBoxLayout()
-        self.resize_max_side_radio = QRadioButton("Ограничить длинную сторону")
-        self.resize_max_side_radio.toggled.connect(self._update_resize_state)
-        max_side_row.addWidget(self.resize_max_side_radio)
-        self.max_side_spin = QSpinBox()
-        self.max_side_spin.setRange(1, 20000)
-        self.max_side_spin.setValue(2048)
-        self.max_side_spin.setSuffix(" px")
-        max_side_row.addWidget(self.max_side_spin)
-        max_side_row.addStretch(1)
-        layout.addLayout(max_side_row)
-
-        self._register_interactive(
-            self.resize_none_radio,
-            self.resize_percent_radio,
-            self.resize_percent_spin,
-            self.resize_max_side_radio,
-            self.max_side_spin,
-        )
-        return group
-
-    def _register_interactive(self, *widgets: QWidget) -> None:
-        self._interactive_widgets.extend(widgets)
-
-    def _connect_option_change_signals(self) -> None:
-        toggles = (
-            self.recursive_checkbox,
-            self.force_rgba_checkbox,
-            self.overwrite_checkbox,
-            self.delete_source_checkbox,
-            self.optimize_checkbox,
-            self.png8_checkbox,
-            self.dither_checkbox,
-            self.resize_none_radio,
-            self.resize_percent_radio,
-            self.resize_max_side_radio,
-            self.naming_lowercase_checkbox,
-            self.naming_replace_spaces_checkbox,
-            self.naming_normalize_suffix_checkbox,
-            self.pack_enable_checkbox,
-        )
-        for widget in toggles:
-            widget.toggled.connect(self._notify_options_changed)
-
-        for widget in (
-            self.compress_spin,
-            self.png8_colors_spin,
-            self.resize_percent_spin,
-            self.max_side_spin,
-        ):
-            widget.valueChanged.connect(self._notify_options_changed)
-
-        self.pack_layout_combo.currentIndexChanged.connect(self._notify_options_changed)
-
-    def _set_input_path(self, path: str) -> None:
-        self.input_edit.setText(path)
-        self._auto_fill_output_from_input(force=True)
-
-    def _on_input_editing_finished(self) -> None:
-        self._auto_fill_output_from_input(force=False)
-
-    def _auto_fill_output_from_input(self, force: bool = False) -> None:
-        if not force and self.output_edit.text().strip():
-            return
-
-        raw_input = self.input_edit.text().strip()
-        if not raw_input:
-            return
-
-        input_path = Path(raw_input)
-        if input_path.exists():
-            output_path = input_path if input_path.is_dir() else input_path.parent
-        else:
-            output_path = input_path.parent if input_path.suffix else input_path
-
-        if str(output_path):
-            self.output_edit.setText(str(output_path))
-
-    def _pick_input_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Выберите файл изображения",
-            "",
-            FILE_DIALOG_FILTER,
-        )
-        if path:
-            self._set_input_path(path)
-
-    def _pick_input_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Выберите входную папку")
-        if path:
-            self._set_input_path(path)
-
-    def _pick_output_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Выберите выходную папку")
-        if path:
-            self.output_edit.setText(path)
-
-    def _update_resize_state(self, *_args: object) -> None:
-        self.resize_percent_spin.setEnabled(self.resize_percent_radio.isChecked())
-        self.max_side_spin.setEnabled(self.resize_max_side_radio.isChecked())
-
-    def _update_png8_state(self, *_args: object) -> None:
-        enabled = self.png8_checkbox.isChecked()
-        self.png8_colors_spin.setEnabled(enabled)
-        self.dither_checkbox.setEnabled(enabled)
-
-    def selected_resize_mode(self) -> ResizeMode:
-        if self.resize_percent_radio.isChecked():
-            return ResizeMode.PERCENT
-        if self.resize_max_side_radio.isChecked():
-            return ResizeMode.MAX_SIDE
-        return ResizeMode.NONE
-
-    def build_naming_rules(self) -> NamingRules:
-        return NamingRules(
-            lowercase=self.naming_lowercase_checkbox.isChecked(),
-            replace_spaces=self.naming_replace_spaces_checkbox.isChecked(),
-            normalize_map_suffix=self.naming_normalize_suffix_checkbox.isChecked(),
-        )
-
-    def build_channel_packing_options(self) -> ChannelPackingOptions:
-        layout_data = self.pack_layout_combo.currentData()
-        if not isinstance(layout_data, ChannelPackLayout):
-            layout_data = ChannelPackLayout.ORM
-        return ChannelPackingOptions(
-            enabled=self.pack_enable_checkbox.isChecked(),
-            layout=layout_data,
-        )
-
-    def build_conversion_options(self) -> ConversionOptions:
-        return ConversionOptions(
-            recursive=self.recursive_checkbox.isChecked(),
-            force_rgba=self.force_rgba_checkbox.isChecked(),
-            overwrite=self.overwrite_checkbox.isChecked(),
-            delete_source=self.delete_source_checkbox.isChecked(),
-            optimize=self.optimize_checkbox.isChecked(),
-            compress_level=self.compress_spin.value(),
-            resize_mode=self.selected_resize_mode(),
-            resize_percent=self.resize_percent_spin.value(),
-            max_side=self.max_side_spin.value(),
-            png8=self.png8_checkbox.isChecked(),
-            png8_colors=self.png8_colors_spin.value(),
-            dither=self.dither_checkbox.isChecked(),
-            naming=self.build_naming_rules(),
-            packing=self.build_channel_packing_options(),
-        )
-
-    def build_request(self) -> BatchRequest:
-        input_text = self.input_edit.text().strip()
-        output_text = self.output_edit.text().strip()
-        return BatchRequest(
-            input_path=Path(input_text) if input_text else None,
-            output_root=Path(output_text) if output_text else None,
-            options=self.build_conversion_options(),
-        )
-
-    def apply_conversion_options(self, options: ConversionOptions) -> None:
-        self._suppress_option_signal = True
-        try:
-            self.recursive_checkbox.setChecked(options.recursive)
-            self.force_rgba_checkbox.setChecked(options.force_rgba)
-            self.overwrite_checkbox.setChecked(options.overwrite)
-            self.delete_source_checkbox.setChecked(options.delete_source)
-            self.optimize_checkbox.setChecked(options.optimize)
-            self.compress_spin.setValue(options.compress_level)
-            self.png8_checkbox.setChecked(options.png8)
-            self.png8_colors_spin.setValue(options.png8_colors)
-            self.dither_checkbox.setChecked(options.dither)
-            self.naming_lowercase_checkbox.setChecked(options.naming.lowercase)
-            self.naming_replace_spaces_checkbox.setChecked(options.naming.replace_spaces)
-            self.naming_normalize_suffix_checkbox.setChecked(options.naming.normalize_map_suffix)
-            self.pack_enable_checkbox.setChecked(options.packing.enabled)
-            for index in range(self.pack_layout_combo.count()):
-                if self.pack_layout_combo.itemData(index) == options.packing.layout:
-                    self.pack_layout_combo.setCurrentIndex(index)
-                    break
-            self.resize_percent_spin.setValue(options.resize_percent)
-            self.max_side_spin.setValue(options.max_side)
-
-            if options.resize_mode is ResizeMode.PERCENT:
-                self.resize_percent_radio.setChecked(True)
-            elif options.resize_mode is ResizeMode.MAX_SIDE:
-                self.resize_max_side_radio.setChecked(True)
-            else:
-                self.resize_none_radio.setChecked(True)
-        finally:
-            self._suppress_option_signal = False
-
-        self._update_resize_state()
-        self._update_png8_state()
-        self._refresh_naming_ui()
-        self._refresh_packing_ui()
-        self._notify_options_changed()
-
-    def apply_app_settings(self, settings: AppSettings) -> None:
-        self.input_edit.setText(settings.input_path)
-        self.output_edit.setText(settings.output_path)
-        self.apply_conversion_options(settings.options)
-
-    def set_controls_enabled(self, enabled: bool) -> None:
-        for widget in self._interactive_widgets:
-            widget.setEnabled(enabled)
-
-        if enabled:
-            self._update_resize_state()
-            self._update_png8_state()
-            self._refresh_naming_ui()
-            self._refresh_packing_ui()
-            self._refresh_preset_ui()
-
-    def set_available_presets(self, presets: list[ConversionPreset]) -> None:
-        self._presets_by_id = {preset.preset_id: preset for preset in presets}
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.clear()
-        self.preset_combo.addItem("Текущие настройки", CURRENT_PRESET_DATA)
-
-        for preset in presets:
-            source_label = "Системный" if preset.is_system else "Пользовательский"
-            self.preset_combo.addItem(f"{source_label} · {preset.name}", preset.preset_id)
-
-        self.preset_combo.blockSignals(False)
-        self.set_selected_preset_id(None)
-        self._refresh_preset_ui()
-
-    def set_selected_preset_id(self, preset_id: str | None) -> None:
-        target_data = preset_id or CURRENT_PRESET_DATA
-        self.preset_combo.blockSignals(True)
-        for index in range(self.preset_combo.count()):
-            if self.preset_combo.itemData(index) == target_data:
-                self.preset_combo.setCurrentIndex(index)
-                break
-        else:
-            self.preset_combo.setCurrentIndex(0)
-        self.preset_combo.blockSignals(False)
-        self._refresh_preset_ui()
-
-    def selected_preset_id(self) -> str | None:
-        current_data = self.preset_combo.currentData()
-        if current_data in (None, CURRENT_PRESET_DATA):
-            return None
-        return str(current_data)
-
-    def _emit_apply_selected_preset(self) -> None:
-        preset_id = self.selected_preset_id()
-        if preset_id is not None:
-            self.preset_apply_requested.emit(preset_id)
-
-    def _emit_delete_selected_preset(self) -> None:
-        preset_id = self.selected_preset_id()
-        if preset_id is not None:
-            self.preset_delete_requested.emit(preset_id)
-
-    def _refresh_preset_ui(self, *_args: object) -> None:
-        preset_id = self.selected_preset_id()
-        preset = self._presets_by_id.get(preset_id or "")
-
-        self.apply_preset_button.setEnabled(preset is not None)
-        self.delete_preset_button.setEnabled(preset is not None and not preset.is_system)
-
-        if preset is None:
-            self.preset_summary_label.setText(
-                "Рабочее состояние. Сохраните его как preset, если этот сетап нужен регулярно."
-            )
-            return
-
-        source_label = "Системный" if preset.is_system else "Пользовательский"
-        description = preset.description or "Без описания."
-        self.preset_summary_label.setText(f"{source_label} preset: {description}")
-
-    def _notify_options_changed(self, *_args: object) -> None:
-        if self._suppress_option_signal:
-            return
-        self.options_changed.emit()
-
-    def _refresh_naming_ui(self, *_args: object) -> None:
-        naming_rules = self.build_naming_rules()
-        if not naming_rules.is_enabled:
-            self.naming_summary_label.setText(
-                "PNG-имена останутся как у исходников. Включите правила, если хотите подчистить набор перед экспортом."
-            )
-            return
-
-        example_name = build_output_filename(
-            Path("Wood Floor Albedo.tga"),
-            naming_rules,
-            TextureMapType.BASECOLOR,
-        )
-        self.naming_summary_label.setText(
-            f"Пример: Wood Floor Albedo.tga -> {example_name}"
-        )
-
-    def _refresh_packing_ui(self, *_args: object) -> None:
-        packing_options = self.build_channel_packing_options()
-        self.pack_layout_combo.setEnabled(self.pack_enable_checkbox.isChecked())
-        self.packing_mapping_label.setText(channel_pack_mapping_text(packing_options.layout))
-
-        if not packing_options.enabled:
-            self.packing_queue_label.setText(
-                "Packing выключен. Включите его, если нужно собрать ORM/RMA/MRA или Unity-packed карты прямо из набора текстур."
-            )
-            return
-
-        self.packing_queue_label.setText(self._packing_preflight_text)
-
-    def set_packing_preflight_summary(self, text: str) -> None:
-        self._packing_preflight_text = text
-        self._refresh_packing_ui()
-
-
-class QueueTableWidget(QTableWidget):
-    paths_dropped = pyqtSignal(list)
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if _extract_local_paths(event):
-            event.acceptProposedAction()
-            return
-        super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event) -> None:
-        if _extract_local_paths(event):
-            event.acceptProposedAction()
-            return
-        super().dragMoveEvent(event)
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        paths = _extract_local_paths(event)
-        if paths:
-            self.paths_dropped.emit(paths)
-            event.acceptProposedAction()
-            return
-        super().dropEvent(event)
-
-
-class QueuePanel(QWidget):
-    paths_selected = pyqtSignal(list)
-    paths_dropped = pyqtSignal(list)
-    remove_requested = pyqtSignal()
-    clear_requested = pyqtSignal()
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._interactive_widgets: list[QWidget] = []
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        self.setObjectName("SectionPanel")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
-
-        title_label = QLabel("Очередь конвертации")
-        title_label.setObjectName("PanelTitle")
-        layout.addWidget(title_label)
-
-        subtitle_label = QLabel(
-            "Перетащите сюда отдельные текстуры или целые каталоги. Очередь всегда показывает, что реально уйдет в batch."
-        )
-        subtitle_label.setObjectName("PanelSubtitle")
-        subtitle_label.setWordWrap(True)
-        layout.addWidget(subtitle_label)
-
-        controls_row = QHBoxLayout()
-        self.add_files_button = QPushButton("Добавить файлы")
-        self.add_files_button.clicked.connect(self._pick_files)
-        controls_row.addWidget(self.add_files_button)
-
-        self.add_folder_button = QPushButton("Добавить папку")
-        self.add_folder_button.clicked.connect(self._pick_folder)
-        controls_row.addWidget(self.add_folder_button)
-
-        self.remove_selected_button = QPushButton("Удалить выбранные")
-        self.remove_selected_button.clicked.connect(self.remove_requested.emit)
-        controls_row.addWidget(self.remove_selected_button)
-
-        self.clear_button = QPushButton("Очистить")
-        self.clear_button.setObjectName("DangerButton")
-        self.clear_button.clicked.connect(self.clear_requested.emit)
-        controls_row.addWidget(self.clear_button)
-        controls_row.addStretch(1)
-        layout.addLayout(controls_row)
-
-        self.drop_hint = QLabel(
-            "Перетащите файлы или папки сюда. Можно смешивать отдельные текстуры и каталоги."
-        )
-        self.drop_hint.setObjectName("DropHint")
-        self.drop_hint.setWordWrap(True)
-        layout.addWidget(self.drop_hint)
-
-        self.summary_label = QLabel("Очередь пуста")
-        self.summary_label.setObjectName("SummaryText")
-        layout.addWidget(self.summary_label)
-
-        self.table = QueueTableWidget()
-        self.table.setColumnCount(len(QUEUE_HEADERS))
-        self.table.setHorizontalHeaderLabels(QUEUE_HEADERS)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.setShowGrid(False)
-        self.table.verticalHeader().setVisible(False)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        self.table.paths_dropped.connect(self.paths_dropped.emit)
-        layout.addWidget(self.table, 1)
-
-        self._register_interactive(
-            self.add_files_button,
-            self.add_folder_button,
-            self.remove_selected_button,
-            self.clear_button,
-            self.table,
-        )
-
-    def _register_interactive(self, *widgets: QWidget) -> None:
-        self._interactive_widgets.extend(widgets)
-
-    def _pick_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Выберите изображения", "", FILE_DIALOG_FILTER)
-        if paths:
-            self.paths_selected.emit(paths)
-
-    def _pick_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Выберите папку с текстурами")
-        if path:
-            self.paths_selected.emit([path])
-
-    def set_controls_enabled(self, enabled: bool) -> None:
-        for widget in self._interactive_widgets:
-            widget.setEnabled(enabled)
-
-
-class PreviewCanvas(QFrame):
-    zoom_changed = pyqtSignal(float)
-    stage_rect_changed = pyqtSignal(QRect)
-    detach_requested = pyqtSignal()
-
-    def __init__(self, parent: QWidget | None = None, *, square_stage: bool = True):
-        super().__init__(parent)
-        self._source_pixmap: QPixmap | None = None
-        self._placeholder_text = "Выберите текстуру из очереди, чтобы открыть preview."
-        self._zoom_factor = 1.0
-        self._padding = 14
-        self._min_zoom = 0.5
-        self._max_zoom = 8.0
-        self._pan_offset = QPointF(0.0, 0.0)
-        self._drag_origin: QPoint | None = None
-        self._drag_offset_origin = QPointF(0.0, 0.0)
-        self._detach_on_double_click = False
-        self._square_stage = square_stage
-        self.setMinimumSize(360, 360 if square_stage else 240)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMouseTracking(True)
-
-    def hasHeightForWidth(self) -> bool:
-        return self._square_stage
-
-    def heightForWidth(self, width: int) -> int:
-        if self._square_stage:
-            return width
-        return super().heightForWidth(width)
-
-    def sizeHint(self) -> QSize:
-        return QSize(460, 460) if self._square_stage else QSize(920, 640)
-
-    def set_detach_on_double_click(self, enabled: bool) -> None:
-        self._detach_on_double_click = enabled
-
-    def set_preview_pixmap(self, pixmap: QPixmap, *, preserve_zoom: bool = True) -> None:
-        self._source_pixmap = pixmap
-        if not preserve_zoom:
-            self._zoom_factor = 1.0
-            self._pan_offset = QPointF(0.0, 0.0)
-        self._normalize_pan_offset()
-        self._update_cursor()
-        self._emit_zoom_changed()
-        self.update()
-
-    def clear_preview(self, text: str = "Выберите текстуру из очереди, чтобы открыть preview.") -> None:
-        self._source_pixmap = None
-        self._placeholder_text = text
-        self._zoom_factor = 1.0
-        self._pan_offset = QPointF(0.0, 0.0)
-        self._drag_origin = None
-        self._update_cursor()
-        self._emit_zoom_changed()
-        self.update()
-
-    def reset_zoom(self) -> None:
-        self._zoom_factor = 1.0
-        self._pan_offset = QPointF(0.0, 0.0)
-        self._update_cursor()
-        self._emit_zoom_changed()
-        self.update()
-
-    def change_zoom(self, steps: float) -> None:
-        if self._source_pixmap is None or steps == 0:
-            return
-
-        scale_step = 1.15 ** steps
-        next_zoom = max(self._min_zoom, min(self._max_zoom, self._zoom_factor * scale_step))
-        if abs(next_zoom - self._zoom_factor) < 0.001:
-            return
-
-        self._zoom_factor = next_zoom
-        if self._zoom_factor <= 1.0:
-            self._pan_offset = QPointF(0.0, 0.0)
-        self._normalize_pan_offset()
-        self._update_cursor()
-        self._emit_zoom_changed()
-        self.update()
-
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.change_zoom(event.angleDelta().y() / 120.0)
-            event.accept()
-            return
-        super().wheelEvent(event)
-
-    def mouseDoubleClickEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._source_pixmap is not None:
-            if self._detach_on_double_click:
-                self.detach_requested.emit()
-                event.accept()
-                return
-            self.reset_zoom()
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.MiddleButton and self._can_pan():
-            self._drag_origin = event.position().toPoint()
-            self._drag_offset_origin = QPointF(self._pan_offset)
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event) -> None:
-        if self._drag_origin is not None and self._source_pixmap is not None:
-            delta = event.position().toPoint() - self._drag_origin
-            self._pan_offset = QPointF(
-                self._drag_offset_origin.x() + delta.x(),
-                self._drag_offset_origin.y() + delta.y(),
-            )
-            self._normalize_pan_offset()
-            self.update()
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.MiddleButton and self._drag_origin is not None:
-            self._drag_origin = None
-            self._update_cursor()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._normalize_pan_offset()
-        self._update_cursor()
-        self.stage_rect_changed.emit(self.stage_rect())
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        frame_rect = self.stage_rect()
-        painter.setPen(QColor("#31404D"))
-        painter.setBrush(QColor("#1C232B"))
-        painter.drawRoundedRect(frame_rect, 18, 18)
-
-        viewport_rect = self._viewport_rect()
-        if viewport_rect.width() <= 0 or viewport_rect.height() <= 0:
-            return
-
-        self._draw_checkerboard(painter, viewport_rect)
-
-        if self._source_pixmap is None:
-            painter.setPen(QColor("#8F9CAA"))
-            painter.drawText(
-                viewport_rect.adjusted(20, 20, -20, -20),
-                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
-                self._placeholder_text,
-            )
-            return
-
-        target_width, target_height = self._scaled_target_size(viewport_rect)
-        scaled = self._source_pixmap.scaled(
-            target_width,
-            target_height,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-
-        x = viewport_rect.center().x() - scaled.width() // 2 + round(self._pan_offset.x())
-        y = viewport_rect.center().y() - scaled.height() // 2 + round(self._pan_offset.y())
-        painter.save()
-        painter.setClipRect(viewport_rect)
-        painter.drawPixmap(x, y, scaled)
-        painter.restore()
-
-    def _square_stage_rect(self, frame_rect: QRect) -> QRect:
-        side = max(0, min(frame_rect.width(), frame_rect.height()))
-        x = frame_rect.x() + (frame_rect.width() - side) // 2
-        y = frame_rect.y() + (frame_rect.height() - side) // 2
-        return QRect(x, y, side, side)
-
-    def stage_rect(self) -> QRect:
-        frame_rect = self.rect().adjusted(1, 1, -1, -1)
-        if self._square_stage:
-            return self._square_stage_rect(frame_rect)
-        return frame_rect
-
-    def _viewport_rect(self) -> QRect:
-        return self.stage_rect().adjusted(
-            self._padding,
-            self._padding,
-            -self._padding,
-            -self._padding,
-        )
-
-    def _draw_checkerboard(self, painter: QPainter, rect: QRect) -> None:
-        tile_size = 18
-        light_color = QColor("#34414C")
-        dark_color = QColor("#29333D")
-
-        for top in range(rect.top(), rect.bottom() + 1, tile_size):
-            row_index = (top - rect.top()) // tile_size
-            for left in range(rect.left(), rect.right() + 1, tile_size):
-                column_index = (left - rect.left()) // tile_size
-                color = light_color if (row_index + column_index) % 2 == 0 else dark_color
-                painter.fillRect(left, top, tile_size, tile_size, color)
-
-    def _emit_zoom_changed(self) -> None:
-        self.zoom_changed.emit(self._zoom_factor)
-
-    def _scaled_target_size(self, viewport_rect: QRect) -> tuple[int, int]:
-        if self._source_pixmap is None:
-            return (0, 0)
-
-        base_scale = min(
-            viewport_rect.width() / max(self._source_pixmap.width(), 1),
-            viewport_rect.height() / max(self._source_pixmap.height(), 1),
-        )
-        target_width = max(1, round(self._source_pixmap.width() * base_scale * self._zoom_factor))
-        target_height = max(1, round(self._source_pixmap.height() * base_scale * self._zoom_factor))
-        return (target_width, target_height)
-
-    def _can_pan(self) -> bool:
-        if self._source_pixmap is None or self._zoom_factor <= 1.0:
-            return False
-
-        viewport_rect = self._viewport_rect()
-        target_width, target_height = self._scaled_target_size(viewport_rect)
-        return target_width > viewport_rect.width() or target_height > viewport_rect.height()
-
-    def _normalize_pan_offset(self) -> None:
-        if self._source_pixmap is None:
-            self._pan_offset = QPointF(0.0, 0.0)
-            return
-
-        viewport_rect = self._viewport_rect()
-        if viewport_rect.width() <= 0 or viewport_rect.height() <= 0:
-            self._pan_offset = QPointF(0.0, 0.0)
-            return
-
-        target_width, target_height = self._scaled_target_size(viewport_rect)
-        max_offset_x = max(0.0, (target_width - viewport_rect.width()) / 2)
-        max_offset_y = max(0.0, (target_height - viewport_rect.height()) / 2)
-        self._pan_offset = QPointF(
-            min(max(self._pan_offset.x(), -max_offset_x), max_offset_x),
-            min(max(self._pan_offset.y(), -max_offset_y), max_offset_y),
-        )
-
-    def _update_cursor(self) -> None:
-        if self._drag_origin is not None:
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            return
-        if self._can_pan():
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
-            return
-        self.unsetCursor()
-
-
-class InspectorField(QFrame):
-    def __init__(
-        self,
-        title: str,
-        parent: QWidget | None = None,
-        *,
-        compact: bool = False,
-        wrap_value: bool = True,
-        inline: bool = False,
-    ):
-        super().__init__(parent)
-        self.setObjectName("InspectorCompactRow" if compact else "InspectorRow")
-        if inline:
-            layout = QHBoxLayout(self)
-            if compact:
-                layout.setContentsMargins(0, 0, 0, 0)
-                layout.setSpacing(6)
-            else:
-                layout.setContentsMargins(12, 8, 12, 8)
-                layout.setSpacing(10)
-        else:
-            layout = QVBoxLayout(self)
-            if compact:
-                layout.setContentsMargins(10, 8, 10, 8)
-                layout.setSpacing(2)
-            else:
-                layout.setContentsMargins(12, 10, 12, 10)
-                layout.setSpacing(4)
-
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("InspectorInlineKey" if inline else "InspectorKey")
-        layout.addWidget(self.title_label)
-
-        self.value_label = QLabel("-")
-        self.value_label.setObjectName("InspectorInlineValue" if inline else "InspectorValue")
-        self.value_label.setWordWrap(wrap_value)
-        self.value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        if inline:
-            layout.addWidget(self.value_label, 1)
-        else:
-            layout.addWidget(self.value_label)
-
-    def set_value(self, text: str) -> None:
-        self.value_label.setText(text)
-        self.value_label.setToolTip(text)
-
-
-class MetricTile(QFrame):
-    def __init__(self, title: str, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setObjectName("InspectorMetricTile")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(4)
-
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("MetricKey")
-        layout.addWidget(self.title_label)
-
-        self.value_label = QLabel("-")
-        self.value_label.setObjectName("MetricValue")
-        self.value_label.setWordWrap(False)
-        self.value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.value_label)
-
-    def set_value(self, text: str) -> None:
-        self.value_label.setText(text)
-        self.value_label.setToolTip(text)
-
-
-class PreviewPanel(QWidget):
-    def __init__(self, parent: QWidget | None = None, *, allow_detach: bool = True):
-        super().__init__(parent)
-        self._preview_service = TexturePreviewService()
-        self._current_item: QueueItem | None = None
-        self._selected_channel = PreviewChannel.COMPOSITE
-        self._channel_buttons: dict[PreviewChannel, QToolButton] = {}
-        self._allow_detach = allow_detach
-        self._detached_window: DetachedPreviewWindow | None = None
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        self.setObjectName("SectionPanel")
-        self.setMinimumHeight(220)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 12)
-        layout.setSpacing(8)
-
-        title_label = QLabel("Texture Preview")
-        title_label.setObjectName("PanelTitle")
-        layout.addWidget(title_label)
-
-        self.preview_canvas = PreviewCanvas()
-        self.preview_canvas.zoom_changed.connect(self._update_zoom_label)
-        self.preview_canvas.stage_rect_changed.connect(self._layout_canvas_controls)
-        self.preview_canvas.set_detach_on_double_click(self._allow_detach)
-        if self._allow_detach:
-            self.preview_canvas.detach_requested.connect(self._open_detached_preview)
-            self.preview_canvas.setToolTip(
-                "Double-click: открыть текстуру в отдельном окне.\nCtrl + wheel: zoom, MMB: pan, F: fit."
-            )
-        else:
-            self.preview_canvas.setToolTip("Ctrl + wheel: zoom, MMB: pan, F: fit.")
-        layout.addWidget(self.preview_canvas, 1)
-        self._build_canvas_controls()
-
-        self.asset_label = QLabel("Ничего не выбрано")
-        self.asset_label.setObjectName("PreviewFileName")
-        self.asset_label.setWordWrap(False)
-        layout.addWidget(self.asset_label)
-
-        self.asset_meta_label = QLabel("Выберите строку в очереди, чтобы открыть превью текстуры.")
-        self.asset_meta_label.setObjectName("PreviewMetaText")
-        self.asset_meta_label.setWordWrap(False)
-        layout.addWidget(self.asset_meta_label)
-
-        self.fit_shortcut = QShortcut(QKeySequence("F"), self)
-        self.fit_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self.fit_shortcut.activated.connect(self.preview_reset_requested)
-
-    def _build_canvas_controls(self) -> None:
-        self.fit_overlay_button = QPushButton("F", self.preview_canvas)
-        self.fit_overlay_button.setObjectName("CanvasControlButton")
-        self.fit_overlay_button.setToolTip("Fit: сбросить масштаб до 100%")
-        self.fit_overlay_button.clicked.connect(self.preview_reset_requested)
-
-        self.zoom_label = QLabel("100%", self.preview_canvas)
-        self.zoom_label.setObjectName("CanvasBadge")
-
-        self.channel_host = QWidget(self.preview_canvas)
-        channel_layout = QHBoxLayout(self.channel_host)
-        channel_layout.setContentsMargins(0, 0, 0, 0)
-        channel_layout.setSpacing(4)
-
-        self.channel_group = QButtonGroup(self)
-        self.channel_group.setExclusive(True)
-        channel_specs = (
-            (PreviewChannel.COMPOSITE, "RGB"),
-            (PreviewChannel.RED, "R"),
-            (PreviewChannel.GREEN, "G"),
-            (PreviewChannel.BLUE, "B"),
-            (PreviewChannel.ALPHA, "A"),
-        )
-        for channel, label in channel_specs:
-            button = QToolButton(self.channel_host)
-            button.setObjectName("ChannelChip")
-            button.setText(label)
-            button.setCheckable(True)
-            button.clicked.connect(lambda _checked=False, current=channel: self._set_selected_channel(current))
-            self.channel_group.addButton(button)
-            channel_layout.addWidget(button)
-            self._channel_buttons[channel] = button
-
-        self._sync_channel_buttons([])
-        self._layout_canvas_controls(self.preview_canvas.stage_rect())
-
-    def preview_reset_requested(self) -> None:
-        self.preview_canvas.reset_zoom()
-
-    def set_selected_channel(self, channel: PreviewChannel) -> None:
-        self._set_selected_channel(channel)
-
-    def set_queue_item(self, item: QueueItem | None) -> None:
-        previous_path = self._current_item.path if self._current_item is not None else None
-        next_path = item.path if item is not None else None
-        self._current_item = item
-        self._rebuild_channels(item)
-        if previous_path != next_path:
-            self.preview_canvas.reset_zoom()
-        self._refresh_preview()
-        if self._allow_detach and self._detached_window is not None:
-            self._detached_window.set_queue_item(item)
-
-    def _rebuild_channels(self, item: QueueItem | None) -> None:
-        channels = self._available_channels(item)
-        if self._selected_channel not in channels:
-            self._selected_channel = PreviewChannel.COMPOSITE if PreviewChannel.COMPOSITE in channels else (
-                channels[0] if channels else PreviewChannel.COMPOSITE
-            )
-        self._sync_channel_buttons(channels)
-
-    def _available_channels(self, item: QueueItem | None) -> list[PreviewChannel]:
-        if item is None or item.metadata is None or item.status is QueueStatus.ERROR:
-            return []
-
-        channels = [
-            PreviewChannel.COMPOSITE,
-            PreviewChannel.RED,
-            PreviewChannel.GREEN,
-            PreviewChannel.BLUE,
-        ]
-        if item.metadata.has_alpha:
-            channels.append(PreviewChannel.ALPHA)
-        return channels
-
-    def _refresh_preview(self) -> None:
-        item = self._current_item
+        self.setDragEnabled(True)
+        self.setAcceptDrops(False)
+
+    def startDrag(self, supported_actions: Qt.DropAction) -> None:
+        item = self.currentItem()
         if item is None:
-            self.preview_canvas.clear_preview()
-            self._update_footer(item)
-            self._sync_control_state(False)
             return
-
-        if item.status is QueueStatus.ERROR:
-            self.preview_canvas.clear_preview("Предпросмотр недоступен для поврежденного или неподдерживаемого файла.")
-            self._update_footer(item)
-            self._sync_control_state(False)
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
             return
-
-        if not self._available_channels(item):
-            self.preview_canvas.clear_preview("Нет доступных каналов для предпросмотра.")
-            self._update_footer(item)
-            self._sync_control_state(False)
-            return
-
-        try:
-            preview_image = self._preview_service.render(item.path, self._selected_channel)
-            preview_pixmap = QPixmap.fromImage(_qimage_from_pil(preview_image))
-            self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=True)
-        except Exception as exc:
-            self.preview_canvas.clear_preview(f"Ошибка предпросмотра: {exc}")
-            self._sync_control_state(False)
-            self._update_footer(item)
-            return
-
-        self._sync_control_state(True)
-        self._update_footer(item)
-
-    def _update_footer(self, item: QueueItem | None) -> None:
-        if item is None:
-            self.asset_label.setText("Ничего не выбрано")
-            self.asset_meta_label.setText("Выберите строку в очереди, чтобы открыть превью текстуры.")
-            return
-
-        self.asset_label.setText(item.path.name)
-        self.asset_label.setToolTip(str(item.path))
-        metadata = item.metadata
-        if metadata is None:
-            self.asset_meta_label.setText(item.message or "Метаданные недоступны.")
-            return
-
-        channel_name = _preview_channel_label(self._selected_channel)
-        alpha_state = "alpha" if metadata.has_alpha else "opaque"
-        map_type_name = _map_type_label(item.effective_map_type)
-        colorspace_name = _colorspace_label(
-            recommended_colorspace_for_map_type(item.effective_map_type)
-        )
-        self.asset_meta_label.setText(
-            f"{map_type_name} · {colorspace_name} · {metadata.resolution_text} · {metadata.mode} · канал: {channel_name} · {alpha_state}"
-        )
-        self.asset_meta_label.setToolTip(self.asset_meta_label.text())
-
-    def _update_zoom_label(self, zoom_factor: float) -> None:
-        self.zoom_label.setText(f"{round(zoom_factor * 100)}%")
-        self.zoom_label.adjustSize()
-        self._layout_canvas_controls(self.preview_canvas.stage_rect())
-
-    def _set_selected_channel(self, channel: PreviewChannel) -> None:
-        if channel == self._selected_channel:
-            return
-        self._selected_channel = channel
-        self._sync_channel_buttons(self._available_channels(self._current_item))
-        self._refresh_preview()
-
-    def _sync_channel_buttons(self, channels: list[PreviewChannel]) -> None:
-        for channel, button in self._channel_buttons.items():
-            available = channel in channels
-            button.setVisible(available)
-            button.setEnabled(available)
-            button.blockSignals(True)
-            button.setChecked(available and channel == self._selected_channel)
-            button.blockSignals(False)
-
-        self.channel_host.setVisible(bool(channels))
-        self.fit_overlay_button.setEnabled(bool(channels))
-        self._layout_canvas_controls(self.preview_canvas.stage_rect())
-
-    def _sync_control_state(self, enabled: bool) -> None:
-        self.fit_overlay_button.setEnabled(enabled)
-        if not enabled:
-            self.preview_canvas.reset_zoom()
-
-    def _open_detached_preview(self) -> None:
-        item = self._current_item
-        if item is None or item.status is QueueStatus.ERROR:
-            return
-
-        if self._detached_window is None:
-            self._detached_window = DetachedPreviewWindow()
-
-        self._detached_window.show_for_item(item, self._selected_channel)
-
-    def _layout_canvas_controls(self, stage_rect: QRect) -> None:
-        if stage_rect.width() <= 0 or stage_rect.height() <= 0:
-            return
-
-        margin = 14
-        top = stage_rect.top() + margin
-        left = stage_rect.left() + margin
-
-        self.fit_overlay_button.adjustSize()
-        fit_height = 30
-        fit_width = max(32, self.fit_overlay_button.sizeHint().width())
-        self.fit_overlay_button.resize(fit_width, fit_height)
-        self.fit_overlay_button.move(left, top)
-
-        self.zoom_label.adjustSize()
-        zoom_x = self.fit_overlay_button.x() + self.fit_overlay_button.width() + 8
-        zoom_y = top + max(0, (fit_height - self.zoom_label.height()) // 2)
-        self.zoom_label.move(zoom_x, zoom_y)
-
-        self.channel_host.adjustSize()
-        channel_x = stage_rect.right() - margin - self.channel_host.width()
-        channel_y = top
-        self.channel_host.move(max(left, channel_x), channel_y)
-
-
-class DetachedPreviewWindow(QWidget):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-        self.setWindowFlag(Qt.WindowType.Window, True)
-        self.setWindowTitle("Texture Preview")
-        self.resize(1180, 820)
-        self.setMinimumSize(720, 560)
-        self._current_item: QueueItem | None = None
-        self._selected_channel = PreviewChannel.COMPOSITE
-        self._preview_service = TexturePreviewService()
-        self._channel_buttons: dict[PreviewChannel, QToolButton] = {}
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(18, 18, 18, 18)
-        root_layout.setSpacing(12)
-
-        header_card = QFrame()
-        header_card.setObjectName("ViewerHeaderCard")
-        header_layout = QVBoxLayout(header_card)
-        header_layout.setContentsMargins(18, 16, 18, 16)
-        header_layout.setSpacing(6)
-
-        self.asset_name_label = QLabel("Texture Preview")
-        self.asset_name_label.setObjectName("AssetName")
-        self.asset_name_label.setWordWrap(True)
-        header_layout.addWidget(self.asset_name_label)
-
-        self.asset_meta_label = QLabel(
-            "Двойной клик по строке открывает этот viewer. Дальше он синхронизируется с текущим выбором."
-        )
-        self.asset_meta_label.setObjectName("ViewerMetaText")
-        self.asset_meta_label.setWordWrap(True)
-        header_layout.addWidget(self.asset_meta_label)
-        root_layout.addWidget(header_card)
-
-        canvas_card = QFrame()
-        canvas_card.setObjectName("ViewerCanvasCard")
-        canvas_layout = QVBoxLayout(canvas_card)
-        canvas_layout.setContentsMargins(14, 14, 14, 14)
-        canvas_layout.setSpacing(0)
-
-        self.preview_canvas = PreviewCanvas(square_stage=False)
-        self.preview_canvas.set_detach_on_double_click(False)
-        self.preview_canvas.setMinimumSize(520, 360)
-        self.preview_canvas.zoom_changed.connect(self._update_zoom_label)
-        canvas_layout.addWidget(self.preview_canvas, 1)
-        root_layout.addWidget(canvas_card, 1)
-
-        toolbar_card = QFrame()
-        toolbar_card.setObjectName("ViewerToolbarCard")
-        toolbar_layout = QHBoxLayout(toolbar_card)
-        toolbar_layout.setContentsMargins(14, 12, 14, 12)
-        toolbar_layout.setSpacing(10)
-
-        self.channel_group = QButtonGroup(self)
-        self.channel_group.setExclusive(True)
-        channel_specs = (
-            (PreviewChannel.COMPOSITE, "RGB"),
-            (PreviewChannel.RED, "R"),
-            (PreviewChannel.GREEN, "G"),
-            (PreviewChannel.BLUE, "B"),
-            (PreviewChannel.ALPHA, "A"),
-        )
-        for channel, label in channel_specs:
-            button = QToolButton(toolbar_card)
-            button.setObjectName("ChannelChip")
-            button.setText(label)
-            button.setCheckable(True)
-            button.clicked.connect(lambda _checked=False, current=channel: self._set_selected_channel(current))
-            self.channel_group.addButton(button)
-            toolbar_layout.addWidget(button)
-            self._channel_buttons[channel] = button
-
-        toolbar_layout.addSpacing(8)
-
-        self.fit_button = QPushButton("F")
-        self.fit_button.setObjectName("CanvasControlButton")
-        self.fit_button.setToolTip("Fit: сбросить масштаб до 100%")
-        self.fit_button.clicked.connect(self.preview_canvas.reset_zoom)
-        toolbar_layout.addWidget(self.fit_button)
-
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setObjectName("CanvasBadge")
-        toolbar_layout.addWidget(self.zoom_label)
-
-        toolbar_layout.addStretch(1)
-
-        self.hint_label = QLabel("Ctrl + wheel: zoom  •  MMB: pan  •  F: fit  •  Esc: close")
-        self.hint_label.setObjectName("ViewerHintText")
-        toolbar_layout.addWidget(self.hint_label)
-
-        self.close_button = QPushButton("Закрыть")
-        self.close_button.setObjectName("GhostButton")
-        self.close_button.clicked.connect(self.hide)
-        toolbar_layout.addWidget(self.close_button)
-        root_layout.addWidget(toolbar_card)
-
-        self.fit_shortcut = QShortcut(QKeySequence("F"), self)
-        self.fit_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self.fit_shortcut.activated.connect(self.preview_canvas.reset_zoom)
-
-        self.close_shortcut = QShortcut(QKeySequence("Esc"), self)
-        self.close_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self.close_shortcut.activated.connect(self.hide)
-        self._sync_channel_buttons([])
-
-    def show_for_item(self, item: QueueItem, channel: PreviewChannel | None = None) -> None:
-        if channel is not None:
-            self._selected_channel = channel
-        self.set_queue_item(item)
-        self._ensure_visible_geometry()
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def set_queue_item(self, item: QueueItem | None) -> None:
-        previous_path = self._current_item.path if self._current_item is not None else None
-        next_path = item.path if item is not None else None
-        self._current_item = item
-        self._rebuild_channels(item)
-        if previous_path != next_path:
-            self.preview_canvas.reset_zoom()
-        self._refresh_preview()
-
-    def _rebuild_channels(self, item: QueueItem | None) -> None:
-        channels = self._available_channels(item)
-        if self._selected_channel not in channels:
-            self._selected_channel = PreviewChannel.COMPOSITE if PreviewChannel.COMPOSITE in channels else (
-                channels[0] if channels else PreviewChannel.COMPOSITE
-            )
-        self._sync_channel_buttons(channels)
-
-    def _available_channels(self, item: QueueItem | None) -> list[PreviewChannel]:
-        if item is None or item.metadata is None or item.status is QueueStatus.ERROR:
-            return []
-
-        channels = [
-            PreviewChannel.COMPOSITE,
-            PreviewChannel.RED,
-            PreviewChannel.GREEN,
-            PreviewChannel.BLUE,
-        ]
-        if item.metadata.has_alpha:
-            channels.append(PreviewChannel.ALPHA)
-        return channels
-
-    def _refresh_preview(self) -> None:
-        item = self._current_item
-        if item is None:
-            self.setWindowTitle("Texture Preview")
-            self.asset_name_label.setText("Texture Preview")
-            self.asset_meta_label.setText(
-                "Двойной клик по строке открывает viewer. Выбор в очереди синхронизирует активную текстуру."
-            )
-            self.preview_canvas.clear_preview("Выберите ассет в очереди, чтобы открыть texture viewer.")
-            self._sync_control_state(False)
-            return
-
-        self.setWindowTitle(f"Texture Preview - {item.path.name}")
-        if item.status is QueueStatus.ERROR:
-            self.asset_name_label.setText(item.path.name)
-            self.asset_meta_label.setText(item.message or "Файл поврежден или не читается.")
-            self.preview_canvas.clear_preview("Предпросмотр недоступен для поврежденного или неподдерживаемого файла.")
-            self._sync_control_state(False)
-            return
-
-        try:
-            preview_image = self._preview_service.render(item.path, self._selected_channel, max_size=None)
-            preview_pixmap = QPixmap.fromImage(_qimage_from_pil(preview_image))
-            self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=True)
-        except Exception as exc:
-            self.asset_name_label.setText(item.path.name)
-            self.asset_meta_label.setText(f"Не удалось отрисовать preview: {exc}")
-            self.preview_canvas.clear_preview(f"Ошибка предпросмотра: {exc}")
-            self._sync_control_state(False)
-            return
-
-        metadata = item.metadata
-        if metadata is None:
-            self.asset_name_label.setText(item.path.name)
-            self.asset_meta_label.setText("Метаданные недоступны.")
-            self._sync_control_state(True)
-            return
-
-        map_type_name = _map_type_label(item.effective_map_type)
-        colorspace_name = _colorspace_label(recommended_colorspace_for_map_type(item.effective_map_type))
-        channel_name = _preview_channel_label(self._selected_channel)
-        alpha_state = "alpha" if metadata.has_alpha else "opaque"
-        self.asset_name_label.setText(item.path.name)
-        self.asset_meta_label.setText(
-            f"{map_type_name}  •  {colorspace_name}  •  {metadata.resolution_text}  •  {metadata.mode}  •  канал: {channel_name}  •  {alpha_state}"
-        )
-        self._sync_control_state(True)
-
-    def _sync_channel_buttons(self, channels: list[PreviewChannel]) -> None:
-        for channel, button in self._channel_buttons.items():
-            available = channel in channels
-            button.setVisible(available)
-            button.setEnabled(available)
-            button.blockSignals(True)
-            button.setChecked(available and channel == self._selected_channel)
-            button.blockSignals(False)
-
-    def _sync_control_state(self, enabled: bool) -> None:
-        self.fit_button.setEnabled(enabled)
-        if enabled:
-            self._sync_channel_buttons(self._available_channels(self._current_item))
-        else:
-            for button in self._channel_buttons.values():
-                button.setEnabled(False)
-        if not enabled:
-            self.preview_canvas.reset_zoom()
-
-    def _set_selected_channel(self, channel: PreviewChannel) -> None:
-        if channel == self._selected_channel:
-            return
-        self._selected_channel = channel
-        self._refresh_preview()
-        self._sync_channel_buttons(self._available_channels(self._current_item))
-
-    def _update_zoom_label(self, zoom_factor: float) -> None:
-        self.zoom_label.setText(f"{round(zoom_factor * 100)}%")
-
-    def _ensure_visible_geometry(self) -> None:
-        screen = self.screen() or QGuiApplication.primaryScreen()
-        if screen is None:
-            return
-
-        available = screen.availableGeometry().adjusted(20, 20, -20, -20)
-        width = min(max(self.width(), 860), available.width())
-        height = min(max(self.height(), 620), available.height())
-        self.resize(width, height)
-
-        geometry = self.frameGeometry()
-        if not available.intersects(geometry) or not self.isVisible():
-            x = available.left() + (available.width() - geometry.width()) // 2
-            y = available.top() + (available.height() - geometry.height()) // 2
-        else:
-            x = min(max(geometry.x(), available.left()), max(available.left(), available.right() - geometry.width()))
-            y = min(max(geometry.y(), available.top()), max(available.top(), available.bottom() - geometry.height()))
-        self.move(x, y)
-
-    def closeEvent(self, event: QCloseEvent) -> None:
-        self.hide()
-        event.ignore()
-
-
-class MetadataPanel(QWidget):
-    map_type_override_changed = pyqtSignal(object)
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._current_item: QueueItem | None = None
-        self._conversion_options = ConversionOptions()
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        self.setObjectName("SectionPanel")
-        self.setMinimumHeight(170)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(12)
-
-        header_row = QHBoxLayout()
-        title_label = QLabel("Asset Inspector")
-        title_label.setObjectName("PanelTitle")
-        header_row.addWidget(title_label)
-        header_row.addStretch(1)
-        layout.addLayout(header_row)
-
-        self.inspector_hint_label = QLabel(
-            "Компактная техинспекция активного ассета. Большой preview открывается двойным кликом по строке в очереди."
-        )
-        self.inspector_hint_label.setObjectName("InspectorHintText")
-        self.inspector_hint_label.setWordWrap(True)
-        layout.addWidget(self.inspector_hint_label)
-
-        hero_card = QFrame()
-        hero_card.setObjectName("InspectorCard")
-        hero_layout = QVBoxLayout(hero_card)
-        hero_layout.setContentsMargins(16, 14, 16, 14)
-        hero_layout.setSpacing(10)
-
-        self.asset_name_label = QLabel("Ничего не выбрано")
-        self.asset_name_label.setObjectName("AssetName")
-        self.asset_name_label.setWordWrap(True)
-        hero_layout.addWidget(self.asset_name_label)
-
-        self.asset_meta_label = QLabel("Выберите строку в очереди, чтобы увидеть техническую сводку по текстуре.")
-        self.asset_meta_label.setObjectName("PreviewMetaText")
-        self.asset_meta_label.setWordWrap(True)
-        hero_layout.addWidget(self.asset_meta_label)
-
-        map_type_row = QHBoxLayout()
-        map_type_row.setSpacing(8)
-        map_type_label = QLabel("Map Type")
-        map_type_label.setObjectName("SummaryText")
-        map_type_row.addWidget(map_type_label)
-        self.map_type_combo = QComboBox()
-        self.map_type_combo.currentIndexChanged.connect(self._emit_map_type_override)
-        map_type_row.addWidget(self.map_type_combo, 1)
-        hero_layout.addLayout(map_type_row)
-        layout.addWidget(hero_card)
-
-        fields_grid = QGridLayout()
-        fields_grid.setHorizontalSpacing(10)
-        fields_grid.setVerticalSpacing(10)
-
-        self.source_field = InspectorField("Исходный файл", wrap_value=True)
-        self.output_field = InspectorField("Выходной PNG", wrap_value=True)
-        self.name_preview_field = InspectorField("Имя после rules", wrap_value=True)
-        self.expected_field = InspectorField("После настроек", wrap_value=True)
-
-        fields_grid.addWidget(self.source_field, 0, 0, 1, 2)
-        fields_grid.addWidget(self.output_field, 1, 0, 1, 2)
-        fields_grid.addWidget(self.name_preview_field, 2, 0)
-        fields_grid.addWidget(self.expected_field, 2, 1)
-        fields_grid.setColumnStretch(0, 1)
-        fields_grid.setColumnStretch(1, 1)
-        layout.addLayout(fields_grid)
-
-        metrics_grid = QGridLayout()
-        metrics_grid.setHorizontalSpacing(10)
-        metrics_grid.setVerticalSpacing(10)
-        self.format_field = MetricTile("Формат")
-        self.resolution_field = MetricTile("Разрешение")
-        self.mode_field = MetricTile("Режим")
-        self.colorspace_field = MetricTile("Color Space")
-        self.alpha_field = MetricTile("Alpha")
-        self.frames_field = MetricTile("Кадры")
-        self.size_field = MetricTile("Размер")
-
-        metrics_grid.addWidget(self.format_field, 0, 0)
-        metrics_grid.addWidget(self.resolution_field, 0, 1)
-        metrics_grid.addWidget(self.mode_field, 1, 0)
-        metrics_grid.addWidget(self.colorspace_field, 1, 1)
-        metrics_grid.addWidget(self.alpha_field, 2, 0)
-        metrics_grid.addWidget(self.size_field, 2, 1)
-        metrics_grid.addWidget(self.frames_field, 3, 0, 1, 2)
-        metrics_grid.setColumnStretch(0, 1)
-        metrics_grid.setColumnStretch(1, 1)
-        layout.addLayout(metrics_grid)
-
-        self.warning_label = QLabel("")
-        self.warning_label.setObjectName("WarningBanner")
-        self.warning_label.setWordWrap(True)
-        self.warning_label.hide()
-        layout.addWidget(self.warning_label)
-
-        self.viewer_hint_label = QLabel(
-            "Viewer controls: двойной клик по строке  •  RGB/R/G/B/A  •  Ctrl + wheel  •  MMB pan  •  F fit"
-        )
-        self.viewer_hint_label.setObjectName("InspectorHintText")
-        self.viewer_hint_label.setWordWrap(True)
-        layout.addWidget(self.viewer_hint_label)
-        layout.addStretch(1)
-
-    def set_queue_item(self, item: QueueItem | None) -> None:
-        self._current_item = item
-        self._sync_map_type_combo(item)
-
-        if item is None:
-            self.asset_name_label.setText("Ничего не выбрано")
-            self.asset_meta_label.setText("Выберите строку в очереди, чтобы увидеть техническую сводку по текстуре.")
-            self._set_values(
-                source="-",
-                format_value="-",
-                resolution="-",
-                mode="-",
-                colorspace="-",
-                alpha="-",
-                frames="-",
-                size="-",
-                name_preview="-",
-                output="Будет рассчитан после выбора выходной папки.",
-                expected="-",
-            )
-            self.warning_label.hide()
-            return
-
-        self.asset_name_label.setText(item.path.name)
-        metadata = item.metadata
-
-        if metadata is None:
-            self.asset_meta_label.setText(item.message or "Метаданные недоступны.")
-            self._set_values(
-                source=str(item.path),
-                format_value="-",
-                resolution="-",
-                mode="-",
-                colorspace="-",
-                alpha="-",
-                frames="-",
-                size="-",
-                name_preview="Недоступно без метаданных.",
-                output=str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом.",
-                expected="Недоступно без метаданных.",
-            )
-            self.warning_label.setText(item.message or "Не удалось прочитать метаданные.")
-            self.warning_label.show()
-            return
-
-        output_estimate = build_output_estimate(
-            metadata,
-            self._conversion_options,
-            item.effective_map_type,
-        )
-        self.asset_meta_label.setText(
-            f"{_map_type_label(item.effective_map_type)}  •  {metadata.resolution_text}  •  {metadata.mode}  •  {output_estimate.colorspace_text}"
-        )
-        output_name = build_output_filename(
-            item.path,
-            self._conversion_options.naming,
-            item.effective_map_type,
-        )
-        self._set_values(
-            source=str(item.path),
-            format_value=metadata.format_name,
-            resolution=metadata.resolution_text,
-            mode=metadata.mode,
-            colorspace=output_estimate.colorspace_text,
-            alpha="Да" if metadata.has_alpha else "Нет",
-            frames=str(metadata.frame_count),
-            size=metadata.size_text,
-            name_preview=output_name,
-            output=str(item.output_path) if item.output_path is not None else "Рядом с исходным файлом.",
-            expected=output_estimate.summary,
-        )
-
-        warnings: list[str] = list(item_preflight_warnings(item))
-        if item.status is QueueStatus.ERROR and item.message:
-            warnings.append(item.message)
-
-        if warnings:
-            warning_lines = ["Preflight предупреждения:"] + [f"- {warning}" for warning in warnings]
-            self.warning_label.setText("\n".join(warning_lines))
-            self.warning_label.show()
-            return
-
-        self.warning_label.hide()
-
-    def _set_values(
-        self,
-        *,
-        source: str,
-        format_value: str,
-        resolution: str,
-        mode: str,
-        colorspace: str,
-        alpha: str,
-        frames: str,
-        size: str,
-        name_preview: str,
-        output: str,
-        expected: str,
-    ) -> None:
-        self.source_field.set_value(source)
-        self.name_preview_field.set_value(name_preview)
-        self.format_field.set_value(format_value)
-        self.resolution_field.set_value(resolution)
-        self.mode_field.set_value(mode)
-        self.colorspace_field.set_value(colorspace)
-        self.alpha_field.set_value(alpha)
-        self.frames_field.set_value(frames)
-        self.size_field.set_value(size)
-        self.output_field.set_value(output)
-        self.expected_field.set_value(expected)
-
-    def set_conversion_options(self, options: ConversionOptions) -> None:
-        self._conversion_options = options
-        self.set_queue_item(self._current_item)
-
-    def _sync_map_type_combo(self, item: QueueItem | None) -> None:
-        self.map_type_combo.blockSignals(True)
-        self.map_type_combo.clear()
-
-        if item is None or item.metadata is None:
-            self.map_type_combo.addItem("Авто", AUTO_MAP_TYPE_DATA)
-            self.map_type_combo.setEnabled(False)
-            self.map_type_combo.blockSignals(False)
-            return
-
-        detected_map_type = item.metadata.map_type
-        self.map_type_combo.addItem(f"Авто: {_map_type_label(detected_map_type)}", AUTO_MAP_TYPE_DATA)
-        self.map_type_combo.addItem(_map_type_label(TextureMapType.UNKNOWN), TextureMapType.UNKNOWN)
-        for map_type in TextureMapType:
-            if map_type is TextureMapType.UNKNOWN:
-                continue
-            self.map_type_combo.addItem(_map_type_label(map_type), map_type)
-
-        current_value = item.map_type_override if item.map_type_override is not None else AUTO_MAP_TYPE_DATA
-        for index in range(self.map_type_combo.count()):
-            if self.map_type_combo.itemData(index) == current_value:
-                self.map_type_combo.setCurrentIndex(index)
-                break
-
-        self.map_type_combo.setEnabled(True)
-        self.map_type_combo.blockSignals(False)
-
-    def _emit_map_type_override(self) -> None:
-        if self._current_item is None or self._current_item.metadata is None:
-            return
-
-        selected_data = self.map_type_combo.currentData()
-        if selected_data == AUTO_MAP_TYPE_DATA:
-            self.map_type_override_changed.emit(None)
-            return
-        self.map_type_override_changed.emit(selected_data)
-
-
-class LogPanel(QWidget):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        self.setObjectName("SectionPanel")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
-
-        title_label = QLabel("Журнал пайплайна")
-        title_label.setObjectName("PanelTitle")
-        layout.addWidget(title_label)
-
-        subtitle_label = QLabel("Служебные сообщения, ошибки и итоги batch-конвертации.")
-        subtitle_label.setObjectName("PanelSubtitle")
-        subtitle_label.setWordWrap(True)
-        layout.addWidget(subtitle_label)
-
-        self.log_edit = QPlainTextEdit()
-        self.log_edit.setReadOnly(True)
-        self.log_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.log_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        layout.addWidget(self.log_edit, 1)
-
-    def append_line(self, line: str) -> None:
-        self.log_edit.appendPlainText(line)
-        scrollbar = self.log_edit.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def clear(self) -> None:
-        self.log_edit.clear()
+        mime_data = QMimeData()
+        mime_data.setData("application/x-texture-path", str(path).encode("utf-8"))
+        mime_data.setText(str(path))
+        mime_data.setUrls([QUrl.fromLocalFile(str(path))])
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag.exec(Qt.DropAction.CopyAction)
 
 
 class MainWindow(QMainWindow):
@@ -2045,7 +89,7 @@ class MainWindow(QMainWindow):
         self._queue_items: list[QueueItem] = []
         self._preset_repository: PresetRepository | None = None
         self._presets_by_id: dict[str, ConversionPreset] = {}
-        self.setWindowTitle("Конвертер изображений в PNG")
+        self.setWindowTitle("Texture Pipeline Workbench")
         self.resize(1280, 820)
         self.setMinimumSize(980, 680)
         self.setAcceptDrops(True)
@@ -2053,13 +97,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Готово")
 
     def _build_ui(self) -> None:
-        root = QWidget()
-        root_layout = QHBoxLayout(root)
-        root_layout.setContentsMargins(18, 18, 18, 14)
-        root_layout.setSpacing(16)
+        self.setDockNestingEnabled(True)
+        self.view_menu = self.menuBar().addMenu("Вид")
 
         self.settings_panel = SettingsPanel()
         self.settings_panel.convert_requested.connect(self.convert_requested.emit)
+        self.settings_panel.output_path_changed.connect(self._sync_top_output_path)
         self.settings_panel.output_path_changed.connect(self._update_queue_output_paths)
         self.settings_panel.preset_apply_requested.connect(self._apply_preset)
         self.settings_panel.preset_save_requested.connect(self._save_current_preset)
@@ -2074,12 +117,6 @@ class MainWindow(QMainWindow):
         settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         settings_scroll.setWidget(self.settings_panel)
 
-        sidebar_card = QFrame()
-        sidebar_card.setObjectName("SidebarPanel")
-        sidebar_layout = QVBoxLayout(sidebar_card)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.addWidget(settings_scroll)
-
         self.queue_panel = QueuePanel()
         self.queue_panel.paths_selected.connect(self.queue_paths_received.emit)
         self.queue_panel.paths_dropped.connect(self.queue_paths_received.emit)
@@ -2090,65 +127,224 @@ class MainWindow(QMainWindow):
         self.queue_panel.table.itemDoubleClicked.connect(self._open_selected_preview_window)
 
         self.preview_window = DetachedPreviewWindow()
+        self.preview_panel = PreviewPanel(allow_detach=True)
         self.metadata_panel = MetadataPanel()
         self.metadata_panel.set_conversion_options(self.settings_panel.build_conversion_options())
         self.metadata_panel.map_type_override_changed.connect(self._apply_selected_map_type_override)
+        self.graph_workspace = GraphWorkspace()
+        self.graph_workspace.export_requested.connect(self._export_graph)
+        self.graph_workspace.status_message.connect(self.set_status)
+        self.graph_workspace.status_message.connect(self.append_log)
         self.log_panel = LogPanel()
 
-        self.detail_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.detail_splitter.addWidget(self.queue_panel)
-        self.detail_splitter.addWidget(self.log_panel)
-        self.detail_splitter.setChildrenCollapsible(False)
-        self.detail_splitter.setStretchFactor(0, 3)
-        self.detail_splitter.setStretchFactor(1, 2)
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(10, 10, 10, 8)
+        central_layout.setSpacing(8)
+        central_layout.addWidget(self._build_top_toolbar())
+        central_layout.addWidget(self.graph_workspace, 1)
+        self.setCentralWidget(central)
 
-        self.inspector_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.inspector_splitter.addWidget(self.metadata_panel)
-        self.inspector_splitter.setChildrenCollapsible(False)
-        self.inspector_splitter.setStretchFactor(0, 1)
-
-        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.workspace_splitter.addWidget(self.detail_splitter)
-        self.workspace_splitter.addWidget(self.inspector_splitter)
-        self.workspace_splitter.setChildrenCollapsible(False)
-        self.workspace_splitter.setStretchFactor(0, 5)
-        self.workspace_splitter.setStretchFactor(1, 3)
-
-        workspace_card = QFrame()
-        workspace_card.setObjectName("WorkspaceCard")
-        workspace_layout = QVBoxLayout(workspace_card)
-        workspace_layout.setContentsMargins(18, 18, 18, 18)
-        workspace_layout.setSpacing(14)
-
-        workspace_title = QLabel("Texture Desk")
-        workspace_title.setObjectName("PanelTitle")
-        workspace_layout.addWidget(workspace_title)
-
-        workspace_subtitle = QLabel(
-            "Середина отвечает за intake и лог, правая колонка за техинспекцию. Большой preview открывается двойным кликом по ассету."
+        self.assets_panel = self._build_assets_panel()
+        self.assets_dock = self._create_dock("Assets", self.assets_panel, "AssetsDock")
+        self.node_properties_dock = self._create_dock(
+            "Node Properties",
+            self.graph_workspace.build_properties_widget(),
+            "NodePropertiesDock",
         )
-        workspace_subtitle.setObjectName("PanelSubtitle")
-        workspace_subtitle.setWordWrap(True)
-        workspace_layout.addWidget(workspace_subtitle)
+        self.inspector_dock = self._create_dock("Inspector", self.metadata_panel, "InspectorDock")
+        self.export_dock = self._create_dock("Export Settings", settings_scroll, "ExportDock")
+        self.preview_dock = self._create_dock("Preview", self.preview_panel, "PreviewDock")
+        self.queue_dock = self._create_dock("Queue", self.queue_panel, "QueueDock")
+        self.log_dock = self._create_dock("Log", self.log_panel, "LogDock")
 
-        self.workspace_summary_label = QLabel(
-            "Пока без ассетов. Добавьте папку или набор текстур, затем откройте большой preview двойным кликом по строке."
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.assets_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.node_properties_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.export_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.preview_dock)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.queue_dock)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
+        self.tabifyDockWidget(self.node_properties_dock, self.inspector_dock)
+        self.tabifyDockWidget(self.inspector_dock, self.export_dock)
+        self.tabifyDockWidget(self.export_dock, self.preview_dock)
+        self.tabifyDockWidget(self.queue_dock, self.log_dock)
+        self.node_properties_dock.raise_()
+
+        self._register_view_docks()
+        self.inspector_dock.hide()
+        self.export_dock.hide()
+        self.preview_dock.hide()
+        self.queue_dock.hide()
+        self.log_dock.hide()
+        self.resizeDocks(
+            [self.assets_dock, self.node_properties_dock],
+            [280, 340],
+            Qt.Orientation.Horizontal,
         )
-        self.workspace_summary_label.setObjectName("SummaryText")
-        self.workspace_summary_label.setWordWrap(True)
-        workspace_layout.addWidget(self.workspace_summary_label)
-        workspace_layout.addWidget(self.workspace_splitter, 1)
+        self._sync_active_workspace_label()
 
-        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.main_splitter.addWidget(sidebar_card)
-        self.main_splitter.addWidget(workspace_card)
-        self.main_splitter.setChildrenCollapsible(False)
-        self.main_splitter.setStretchFactor(0, 0)
-        self.main_splitter.setStretchFactor(1, 1)
-        root_layout.addWidget(self.main_splitter, 1)
+    def _create_dock(self, title: str, widget: QWidget, object_name: str) -> QDockWidget:
+        dock = QDockWidget(title, self)
+        dock.setObjectName(object_name)
+        dock.setWidget(widget)
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+            | Qt.DockWidgetArea.BottomDockWidgetArea
+            | Qt.DockWidgetArea.TopDockWidgetArea
+        )
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        return dock
 
-        self.setCentralWidget(root)
-        self._apply_default_splitter_sizes()
+    def _register_view_docks(self) -> None:
+        for dock in (
+            self.assets_dock,
+            self.node_properties_dock,
+            self.inspector_dock,
+            self.export_dock,
+            self.preview_dock,
+            self.queue_dock,
+            self.log_dock,
+        ):
+            self.view_menu.addAction(dock.toggleViewAction())
+        self.view_menu.addSeparator()
+        show_log_action = QAction("Показать лог", self)
+        show_log_action.triggered.connect(lambda: self.log_dock.show())
+        self.view_menu.addAction(show_log_action)
+
+    def _build_top_toolbar(self) -> QFrame:
+        toolbar = QFrame()
+        toolbar.setObjectName("TopToolbar")
+        layout = QHBoxLayout(toolbar)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+
+        title = QLabel("Texture Pipeline Workbench")
+        title.setObjectName("AppTitle")
+        layout.addWidget(title)
+
+        self.active_workspace_label = QLabel("Queue")
+        self.active_workspace_label.setObjectName("StatusPill")
+        layout.addWidget(self.active_workspace_label)
+
+        layout.addStretch(1)
+        layout.addWidget(QLabel("Output"))
+        self.top_output_edit = QLineEdit()
+        self.top_output_edit.setPlaceholderText("Output folder")
+        self.top_output_edit.setMinimumWidth(360)
+        self.top_output_edit.textEdited.connect(self._apply_top_output_path)
+        layout.addWidget(self.top_output_edit)
+
+        self.run_batch_button = QPushButton("Run Batch")
+        self.run_batch_button.setObjectName("PrimaryButton")
+        self.run_batch_button.clicked.connect(self.convert_requested.emit)
+        layout.addWidget(self.run_batch_button)
+
+        self.export_graph_button = QPushButton("Export Graph")
+        self.export_graph_button.clicked.connect(self._export_graph)
+        layout.addWidget(self.export_graph_button)
+
+        self.toolbar_status_label = QLabel("Ready")
+        self.toolbar_status_label.setObjectName("StatusPill")
+        layout.addWidget(self.toolbar_status_label)
+        return toolbar
+
+    def _build_assets_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("SidebarPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("Assets")
+        title.setObjectName("PanelTitle")
+        layout.addWidget(title)
+
+        buttons = QHBoxLayout()
+        add_files = QPushButton("+ Files")
+        add_files.clicked.connect(self.queue_panel._pick_files)
+        buttons.addWidget(add_files)
+        add_folder = QPushButton("+ Folder")
+        add_folder.clicked.connect(self.queue_panel._pick_folder)
+        buttons.addWidget(add_folder)
+        layout.addLayout(buttons)
+
+        self.asset_table = AssetTableWidget()
+        self.asset_table.setColumnCount(3)
+        self.asset_table.setHorizontalHeaderLabels(("Name", "Type", "Res"))
+        self.asset_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.asset_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.asset_table.verticalHeader().setVisible(False)
+        self.asset_table.horizontalHeader().setStretchLastSection(True)
+        self.asset_table.itemDoubleClicked.connect(self._preview_selected_asset)
+        layout.addWidget(self.asset_table, 1)
+
+        hint = QLabel("Drag an asset into Graph. Double-click opens Preview.")
+        hint.setObjectName("SummaryText")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        return panel
+
+    def _apply_top_output_path(self, text: str) -> None:
+        if self.settings_panel.output_edit.text() != text:
+            self.settings_panel.output_edit.setText(text)
+
+    def _sync_top_output_path(self, text: str) -> None:
+        if self.top_output_edit.text() != text:
+            self.top_output_edit.setText(text)
+
+    def _sync_active_workspace_label(self, *_args: object) -> None:
+        if hasattr(self, "active_workspace_label"):
+            self.active_workspace_label.setText("Graph")
+
+    def _render_asset_browser(self) -> None:
+        table = self.asset_table
+        table.setRowCount(len(self._queue_items))
+        for row, item in enumerate(self._queue_items):
+            metadata = item.metadata
+            values = (
+                item.path.name,
+                _map_type_label(item.effective_map_type),
+                metadata.resolution_text if metadata else "-",
+            )
+            for column, value in enumerate(values):
+                table_item = QTableWidgetItem(value)
+                table_item.setToolTip(str(item.path))
+                table_item.setData(Qt.ItemDataRole.UserRole, self._queue_key(item.path))
+                table.setItem(row, column, table_item)
+        self.graph_workspace.set_assets(list(self._queue_items))
+
+    def _add_selected_asset_to_graph(self, *_args: object) -> None:
+        item = self._selected_asset_item()
+        if item is None:
+            return
+        for index in range(self.graph_workspace.asset_combo.count()):
+            if self.graph_workspace.asset_combo.itemData(index) == str(item.path):
+                self.graph_workspace.asset_combo.setCurrentIndex(index)
+                break
+        self.graph_workspace.add_texture_node_from_selected_asset()
+
+    def _preview_selected_asset(self, *_args: object) -> None:
+        item = self._selected_asset_item()
+        if item is None:
+            return
+        self.preview_panel.set_queue_item(item)
+        self.preview_dock.show()
+        self.preview_dock.raise_()
+
+    def _selected_asset_item(self) -> QueueItem | None:
+        selected_rows = self.asset_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return None
+        row = selected_rows[0].row()
+        if row >= len(self._queue_items):
+            return None
+        return self._queue_items[row]
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _extract_local_paths(event):
@@ -2198,6 +394,7 @@ class MainWindow(QMainWindow):
 
         self._queue_items.sort(key=lambda item: str(item.path).lower())
         self._render_queue()
+        self._render_asset_browser()
         self._refresh_packing_preflight()
         self._sync_status_bar_with_selection()
         self._sync_workspace_selection()
@@ -2214,6 +411,7 @@ class MainWindow(QMainWindow):
             self._queue_items.pop(row)
 
         self._render_queue()
+        self._render_asset_browser()
         self._refresh_packing_preflight()
         self._sync_workspace_selection()
         self.set_status(f"Удалено элементов: {len(selected_rows)}")
@@ -2221,6 +419,7 @@ class MainWindow(QMainWindow):
     def clear_queue_items(self) -> None:
         self._queue_items.clear()
         self._render_queue()
+        self._render_asset_browser()
         self._refresh_packing_preflight()
         self.set_status("Очередь очищена")
 
@@ -2263,6 +462,8 @@ class MainWindow(QMainWindow):
         self._is_running = running
         self.settings_panel.set_controls_enabled(not running)
         self.queue_panel.set_controls_enabled(not running)
+        self.run_batch_button.setEnabled(not running)
+        self.export_graph_button.setEnabled(not running)
 
     def append_log(self, line: str) -> None:
         self.log_panel.append_line(line)
@@ -2272,21 +473,18 @@ class MainWindow(QMainWindow):
 
     def set_status(self, text: str) -> None:
         self.statusBar().showMessage(text)
+        if hasattr(self, "toolbar_status_label"):
+            self.toolbar_status_label.setText(text[:60])
 
     def apply_app_settings(self, settings: AppSettings) -> None:
-        self.resize(settings.window_width, settings.window_height)
+        if settings.window_geometry:
+            self.restoreGeometry(QByteArray.fromBase64(settings.window_geometry.encode("ascii")))
+        else:
+            self.resize(settings.window_width, settings.window_height)
         self.settings_panel.apply_app_settings(settings)
-        if len(settings.splitter_sizes) == self.main_splitter.count():
-            self.main_splitter.setSizes(list(settings.splitter_sizes))
-        if len(settings.workspace_splitter_sizes) == self.workspace_splitter.count():
-            workspace_sizes = settings.workspace_splitter_sizes
-            if workspace_sizes == (500, 440):
-                workspace_sizes = (700, 340)
-            self.workspace_splitter.setSizes(list(workspace_sizes))
-        if len(settings.detail_splitter_sizes) == self.detail_splitter.count():
-            self.detail_splitter.setSizes(list(settings.detail_splitter_sizes))
-        if len(settings.inspector_splitter_sizes) == self.inspector_splitter.count():
-            self.inspector_splitter.setSizes(list(settings.inspector_splitter_sizes))
+        self._sync_top_output_path(settings.output_path)
+        if settings.window_state:
+            self.restoreState(QByteArray.fromBase64(settings.window_state.encode("ascii")))
         self._update_queue_output_paths()
         self._sync_preset_selection_with_current_options()
         self._refresh_packing_preflight()
@@ -2303,10 +501,12 @@ class MainWindow(QMainWindow):
             options=request.options,
             window_width=self.width(),
             window_height=self.height(),
-            splitter_sizes=tuple(self.main_splitter.sizes()),
-            workspace_splitter_sizes=tuple(self.workspace_splitter.sizes()),
-            detail_splitter_sizes=tuple(self.detail_splitter.sizes()),
-            inspector_splitter_sizes=tuple(self.inspector_splitter.sizes()),
+            splitter_sizes=(300, 980),
+            workspace_splitter_sizes=(980, 340),
+            detail_splitter_sizes=(640, 180),
+            inspector_splitter_sizes=(1,),
+            window_geometry=bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            window_state=bytes(self.saveState().toBase64()).decode("ascii"),
         )
 
     def confirm_delete_sources(self) -> bool:
@@ -2368,12 +568,10 @@ class MainWindow(QMainWindow):
 
         if not self._queue_items:
             self.queue_panel.summary_label.setText("Очередь пуста")
-            self.workspace_summary_label.setText(
-                "Пока без ассетов. Добавьте папку или набор текстур, затем откройте большой preview двойным кликом по строке."
-            )
             if self.preview_window.isVisible():
                 self.preview_window.set_queue_item(None)
             self.metadata_panel.set_queue_item(None)
+            self.preview_panel.set_queue_item(None)
             self.set_status("Очередь пуста")
             return
 
@@ -2381,9 +579,6 @@ class MainWindow(QMainWindow):
         error_count = sum(1 for item in self._queue_items if item.status is QueueStatus.ERROR)
         summary_text = f"Всего: {len(self._queue_items)} | Предупреждений: {warning_count} | Ошибок: {error_count}"
         self.queue_panel.summary_label.setText(summary_text)
-        self.workspace_summary_label.setText(
-            f"{len(self._queue_items)} ассетов в desk | {warning_count} preflight warnings | {error_count} errors"
-        )
         self._restore_queue_selection(selected_key)
 
     def _apply_row_style(self, row: int, item: QueueItem) -> None:
@@ -2467,6 +662,7 @@ class MainWindow(QMainWindow):
         for item in self._queue_items:
             item.output_path = self._build_output_path(item.batch_source)
         self._render_queue()
+        self._render_asset_browser()
         self._refresh_packing_preflight()
         self._sync_workspace_selection()
 
@@ -2619,6 +815,7 @@ class MainWindow(QMainWindow):
     def _sync_workspace_selection(self) -> None:
         item = self._selected_queue_item()
         self.metadata_panel.set_queue_item(item)
+        self.preview_panel.set_queue_item(item)
         if self.preview_window.isVisible():
             self.preview_window.set_queue_item(item)
 
@@ -2626,7 +823,9 @@ class MainWindow(QMainWindow):
         item = self._selected_queue_item()
         if item is None or item.status is QueueStatus.ERROR:
             return
-        self.preview_window.show_for_item(item)
+        self.preview_panel.set_queue_item(item)
+        self.preview_dock.show()
+        self.preview_dock.raise_()
 
     def _apply_selected_map_type_override(self, map_type_override: object) -> None:
         item = self._selected_queue_item()
@@ -2645,6 +844,28 @@ class MainWindow(QMainWindow):
         self._refresh_packing_preflight()
         self._sync_workspace_selection()
         self._sync_status_bar_with_selection()
+
+    def _export_graph(self) -> None:
+        request = self.settings_panel.build_request()
+        output_root = request.output_root
+        if output_root is None:
+            if self.graph_workspace.project_dir is not None:
+                output_root = self.graph_workspace.project_dir / "exports"
+            else:
+                output_root = Path.cwd() / "graph_exports"
+
+        self.append_log("---- Graph export ----")
+        summary = self.graph_workspace.export_graph(
+            output_root,
+            request.options,
+            self.append_log,
+        )
+        self.append_log(summary.as_text())
+        self.set_status(summary.as_text())
+        if summary.failed:
+            self.show_error("Graph export", summary.as_text())
+        elif summary.succeeded:
+            self.show_info("Graph export", summary.as_text())
 
     def _selected_queue_item(self) -> QueueItem | None:
         selection_model = self.queue_panel.table.selectionModel()
@@ -2680,7 +901,4 @@ class MainWindow(QMainWindow):
         self.queue_panel.table.selectRow(target_row)
 
     def _apply_default_splitter_sizes(self) -> None:
-        self.main_splitter.setSizes([340, 940])
-        self.workspace_splitter.setSizes([700, 340])
-        self.detail_splitter.setSizes([420, 220])
-        self.inspector_splitter.setSizes([1])
+        return

@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from image_converter.domain.node_graph import (
+    GraphConnection,
+    GraphNode,
+    NodeGraph,
+    NodeGraphProject,
+    NodeType,
+)
+
+GRAPH_PROJECT_FILENAME = "graph.texturegraph.json"
+
+
+class NodeGraphProjectRepository:
+    def save(self, project: NodeGraphProject, bundle_dir: Path) -> Path:
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        project_path = bundle_dir / GRAPH_PROJECT_FILENAME
+        payload = self._serialize_project(project, bundle_dir)
+        project_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return project_path
+
+    def load(self, bundle_dir: Path) -> NodeGraphProject:
+        project_path = bundle_dir / GRAPH_PROJECT_FILENAME
+        raw_data = json.loads(project_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_data, dict):
+            raise ValueError("Invalid graph project file.")
+        return self._deserialize_project(raw_data, bundle_dir)
+
+    def _serialize_project(
+        self,
+        project: NodeGraphProject,
+        bundle_dir: Path,
+    ) -> dict[str, Any]:
+        return {
+            "version": project.version,
+            "name": project.name,
+            "graph": {
+                "viewport_center": list(project.graph.viewport_center),
+                "viewport_zoom": project.graph.viewport_zoom,
+                "nodes": [
+                    self._serialize_node(node, bundle_dir) for node in project.graph.nodes
+                ],
+                "connections": [
+                    {
+                        "id": connection.connection_id,
+                        "source_node_id": connection.source_node_id,
+                        "source_socket_id": connection.source_socket_id,
+                        "target_node_id": connection.target_node_id,
+                        "target_socket_id": connection.target_socket_id,
+                    }
+                    for connection in project.graph.connections
+                ],
+            },
+        }
+
+    def _serialize_node(self, node: GraphNode, bundle_dir: Path) -> dict[str, Any]:
+        properties = dict(node.properties)
+        if node.node_type is NodeType.TEXTURE_INPUT and properties.get("path"):
+            properties["path"] = self._serialize_path(Path(str(properties["path"])), bundle_dir)
+
+        return {
+            "id": node.node_id,
+            "type": node.node_type.value,
+            "title": node.title,
+            "position": list(node.position),
+            "properties": properties,
+        }
+
+    def _deserialize_project(
+        self,
+        data: dict[str, Any],
+        bundle_dir: Path,
+    ) -> NodeGraphProject:
+        graph_data = data.get("graph", {})
+        if not isinstance(graph_data, dict):
+            graph_data = {}
+
+        nodes = [
+            self._deserialize_node(raw_node, bundle_dir)
+            for raw_node in graph_data.get("nodes", [])
+            if isinstance(raw_node, dict)
+        ]
+        connections = [
+            GraphConnection(
+                connection_id=str(raw_connection.get("id", "")),
+                source_node_id=str(raw_connection.get("source_node_id", "")),
+                source_socket_id=str(raw_connection.get("source_socket_id", "")),
+                target_node_id=str(raw_connection.get("target_node_id", "")),
+                target_socket_id=str(raw_connection.get("target_socket_id", "")),
+            )
+            for raw_connection in graph_data.get("connections", [])
+            if isinstance(raw_connection, dict)
+        ]
+
+        graph = NodeGraph(
+            nodes=nodes,
+            connections=[
+                connection
+                for connection in connections
+                if connection.connection_id
+                and connection.source_node_id
+                and connection.target_node_id
+            ],
+            viewport_center=self._coerce_pair(graph_data.get("viewport_center"), (0.0, 0.0)),
+            viewport_zoom=self._coerce_float(graph_data.get("viewport_zoom"), 1.0),
+        )
+        return NodeGraphProject(
+            name=str(data.get("name") or bundle_dir.stem),
+            version=self._coerce_int(data.get("version"), 1),
+            graph=graph,
+        )
+
+    def _deserialize_node(self, data: dict[str, Any], bundle_dir: Path) -> GraphNode:
+        try:
+            node_type = NodeType(str(data.get("type", NodeType.TEXTURE_INPUT.value)))
+        except ValueError:
+            node_type = NodeType.TEXTURE_INPUT
+
+        properties = data.get("properties", {})
+        if not isinstance(properties, dict):
+            properties = {}
+        properties = dict(properties)
+        if node_type is NodeType.TEXTURE_INPUT and properties.get("path"):
+            properties["path"] = str(self._deserialize_path(str(properties["path"]), bundle_dir))
+
+        return GraphNode(
+            node_id=str(data.get("id", "")),
+            node_type=node_type,
+            title=str(data.get("title") or node_type.value),
+            position=self._coerce_pair(data.get("position"), (0.0, 0.0)),
+            properties=properties,
+        )
+
+    @staticmethod
+    def _serialize_path(path: Path, bundle_dir: Path) -> str:
+        try:
+            resolved_path = path.resolve()
+            resolved_bundle = bundle_dir.resolve()
+            return str(resolved_path.relative_to(resolved_bundle))
+        except (OSError, ValueError):
+            return str(path)
+
+    @staticmethod
+    def _deserialize_path(value: str, bundle_dir: Path) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        return bundle_dir / path
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _coerce_pair(cls, value: Any, default: tuple[float, float]) -> tuple[float, float]:
+        try:
+            return (
+                cls._coerce_float(value[0], default[0]),
+                cls._coerce_float(value[1], default[1]),
+            )
+        except (TypeError, IndexError):
+            return default
