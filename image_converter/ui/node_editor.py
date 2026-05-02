@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
 from PyQt6.QtCore import QObject, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
+    QFont,
     QKeySequence,
     QPainter,
     QPainterPath,
@@ -96,12 +98,24 @@ from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.packing import PACK_LAYOUTS, PackSourceCandidate
 
 NODE_WIDTH = 190
+TEXTURE_NODE_WIDTH = 260
 TITLE_HEIGHT = 28
 ROW_HEIGHT = 22
 PORT_RADIUS = 6
 FLAG_SIZE = 14
 FLAG_TOP = 7
 FLAG_GAP = 6
+TEXTURE_BODY_HEIGHT = 108
+TEXTURE_THUMBNAIL_SIZE = 72
+TEXTURE_THUMBNAIL_X = 10
+TEXTURE_THUMBNAIL_Y = TITLE_HEIGHT + 14
+TEXTURE_META_X = 94
+TEXTURE_PORT_CENTER_Y = TITLE_HEIGHT + 34
+TEXTURE_PORT_SPACING = 20
+TEXTURE_PORT_LABEL_X_PAD = 34
+GRAPH_LAYOUT_X_SPACING = 300
+GRAPH_LAYOUT_Y_SPACING = 36
+GRAPH_LAYOUT_GRID = 20
 
 OUTPUT_PROFILE_FILENAMES = {
     OutputProfile.GENERIC_RGBA: "packed_rgba.png",
@@ -121,6 +135,13 @@ OUTPUT_PROFILE_PACK_LAYOUTS = {
     OutputProfile.UNITY_URP: ChannelPackLayout.UNITY_URP,
     OutputProfile.UNITY_HDRP: ChannelPackLayout.UNITY_HDRP,
     OutputProfile.UNREAL_ORM: ChannelPackLayout.ORM,
+}
+OUTPUT_PROFILE_LABELS = {
+    OutputProfile.GENERIC_RGBA: "Generic RGBA",
+    OutputProfile.UNITY_URP: "Unity URP",
+    OutputProfile.UNITY_HDRP: "Unity HDRP",
+    OutputProfile.UNREAL_ORM: "Unreal ORM",
+    OutputProfile.METAHUMAN_REPACK: "MetaHuman Repack",
 }
 DEFAULT_PROFILE_FILL = {
     TextureMapType.AO: 255,
@@ -168,6 +189,17 @@ PACKED_SOURCE_CHANNELS = {
         TextureMapType.AO: ("b", False),
     },
 }
+
+
+@dataclass(slots=True)
+class OutputProfilePlan:
+    profile: OutputProfile
+    mode: OutputMode
+    properties: dict
+    utility_nodes: list[GraphNode]
+    utility_connections: list[GraphConnection]
+    output_connections: list[GraphConnection]
+    summary_lines: tuple[str, ...]
 
 
 class GraphPreviewWorker(QObject):
@@ -303,6 +335,7 @@ class GraphNodeItem(QGraphicsRectItem):
     def __init__(self, node: GraphNode):
         super().__init__()
         self.node = node
+        self.node_width = TEXTURE_NODE_WIDTH if node.node_type is NodeType.TEXTURE_INPUT else NODE_WIDTH
         self.port_items: dict[str, PortItem] = {}
         self.display_flag_item: QGraphicsRectItem | None = None
         self.display_flag_label: QGraphicsSimpleTextItem | None = None
@@ -319,8 +352,8 @@ class GraphNodeItem(QGraphicsRectItem):
         row_count = max(input_count, output_count, 2)
         body_height = row_count * ROW_HEIGHT + 16
         if node.node_type is NodeType.TEXTURE_INPUT:
-            body_height += 58
-        self.setRect(0, 0, NODE_WIDTH, TITLE_HEIGHT + body_height)
+            body_height = TEXTURE_BODY_HEIGHT
+        self.setRect(0, 0, self.node_width, TITLE_HEIGHT + body_height)
         self.setPos(*node.position)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -330,31 +363,61 @@ class GraphNodeItem(QGraphicsRectItem):
         self._build_contents()
 
     def _build_contents(self) -> None:
-        title_bg = QGraphicsRectItem(0, 0, NODE_WIDTH, TITLE_HEIGHT, self)
+        title_bg = QGraphicsRectItem(0, 0, self.node_width, TITLE_HEIGHT, self)
         title_bg.setPen(QPen(Qt.PenStyle.NoPen))
         title_bg.setBrush(QColor("#2F3741"))
 
-        title = QGraphicsSimpleTextItem(self.node.title, self)
+        title = QGraphicsSimpleTextItem(self._elide_text(self.node.title, self._title_max_chars()), self)
         title.setBrush(QColor("#E4EAF1"))
         title.setPos(10, 6)
+        title.setToolTip(self.node.title)
 
         self._build_flag_items()
 
-        subtitle = QGraphicsSimpleTextItem(self.node.node_type.value, self)
-        subtitle.setBrush(QColor("#8E9AA8"))
-        subtitle.setPos(10, TITLE_HEIGHT + 6)
-
         y_offset = TITLE_HEIGHT + 30
         if self.node.node_type is NodeType.TEXTURE_INPUT:
+            thumbnail_rect = QRectF(
+                TEXTURE_THUMBNAIL_X,
+                TEXTURE_THUMBNAIL_Y,
+                TEXTURE_THUMBNAIL_SIZE,
+                TEXTURE_THUMBNAIL_SIZE,
+            )
+            thumbnail_bg = QGraphicsRectItem(thumbnail_rect, self)
+            thumbnail_bg.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            thumbnail_bg.setPen(QPen(QColor("#303946"), 1.0))
+            thumbnail_bg.setBrush(QColor("#111820"))
             thumbnail = self._build_thumbnail()
             if thumbnail is not None:
                 thumbnail.setParentItem(self)
-                thumbnail.setPos(10, TITLE_HEIGHT + 26)
+                thumbnail.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                thumbnail.setPos(
+                    thumbnail_rect.x() + (TEXTURE_THUMBNAIL_SIZE - thumbnail.pixmap().width()) / 2,
+                    thumbnail_rect.y() + (TEXTURE_THUMBNAIL_SIZE - thumbnail.pixmap().height()) / 2,
+                )
             path_text = Path(str(self.node.properties.get("path", ""))).name or "no texture"
-            path_label = QGraphicsSimpleTextItem(path_text[:24], self)
-            path_label.setBrush(QColor("#B7C1CC"))
-            path_label.setPos(78, TITLE_HEIGHT + 34)
-            y_offset += 58
+            path_label = QGraphicsSimpleTextItem(self._elide_text(path_text, 16), self)
+            path_label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            path_label.setFont(self._pixel_font(9))
+            path_label.setBrush(QColor("#D6DEE8"))
+            path_label.setPos(TEXTURE_META_X, TITLE_HEIGHT + 15)
+            path_label.setToolTip(str(self.node.properties.get("path", "")) or path_text)
+            metadata_line = QGraphicsSimpleTextItem(self._texture_metadata_line(), self)
+            metadata_line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            metadata_line.setFont(self._pixel_font(8))
+            metadata_line.setBrush(QColor("#8EA0B2"))
+            metadata_line.setPos(TEXTURE_META_X, TITLE_HEIGHT + 35)
+            size_line_text = self._texture_size_line()
+            if size_line_text:
+                size_line = QGraphicsSimpleTextItem(size_line_text, self)
+                size_line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                size_line.setFont(self._pixel_font(8))
+                size_line.setBrush(QColor("#667484"))
+                size_line.setPos(TEXTURE_META_X, TITLE_HEIGHT + 55)
+            y_offset = TEXTURE_PORT_CENTER_Y - 10
+        else:
+            subtitle = QGraphicsSimpleTextItem(self.node.node_type.value, self)
+            subtitle.setBrush(QColor("#8E9AA8"))
+            subtitle.setPos(10, TITLE_HEIGHT + 6)
 
         inputs = [socket for socket in socket_definitions(self.node.node_type) if socket.direction is SocketDirection.INPUT]
         outputs = [socket for socket in socket_definitions(self.node.node_type) if socket.direction is SocketDirection.OUTPUT]
@@ -368,13 +431,20 @@ class GraphNodeItem(QGraphicsRectItem):
             label.setPos(14, y)
 
         for index, socket in enumerate(outputs):
-            y = y_offset + index * ROW_HEIGHT
+            spacing = TEXTURE_PORT_SPACING if self.node.node_type is NodeType.TEXTURE_INPUT else ROW_HEIGHT
+            y = y_offset + index * spacing
             port = PortItem(self, socket.socket_id, socket.name, socket.direction)
-            port.setPos(NODE_WIDTH, y + 10)
+            port.setPos(self.node_width, y + 10)
             self.port_items[socket.socket_id] = port
             label = QGraphicsSimpleTextItem(socket.name, self)
-            label.setBrush(QColor("#C9D2DD"))
-            label.setPos(NODE_WIDTH - 28, y)
+            label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            label.setBrush(self._socket_label_color(socket.socket_id))
+            label_x = (
+                self.node_width - TEXTURE_PORT_LABEL_X_PAD
+                if self.node.node_type is NodeType.TEXTURE_INPUT
+                else self.node_width - 28
+            )
+            label.setPos(label_x, y)
 
     def _build_thumbnail(self) -> QGraphicsPixmapItem | None:
         path = Path(str(self.node.properties.get("path", "")))
@@ -382,7 +452,7 @@ class GraphNodeItem(QGraphicsRectItem):
             return None
         try:
             with Image.open(path) as image:
-                image.thumbnail((54, 54))
+                image.thumbnail((TEXTURE_THUMBNAIL_SIZE, TEXTURE_THUMBNAIL_SIZE))
                 rgba = image.convert("RGBA")
                 data = rgba.tobytes("raw", "RGBA")
         except Exception:
@@ -398,6 +468,72 @@ class GraphNodeItem(QGraphicsRectItem):
         ).copy()
         pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(qimage))
         return pixmap_item
+
+    def _title_max_chars(self) -> int:
+        return 28 if self.node.node_type is NodeType.TEXTURE_INPUT else 22
+
+    def _texture_metadata_line(self) -> str:
+        path = Path(str(self.node.properties.get("path", "")))
+        map_type = detect_texture_map_type(path)
+        map_label = map_type.label if map_type is not TextureMapType.UNKNOWN else "Texture"
+        data_role = str(self.node.properties.get("data_role", TextureDataRole.DATA.value))
+        role_label = {
+            TextureDataRole.COLOR.value: "Color",
+            TextureDataRole.DATA.value: "Data",
+            TextureDataRole.NORMAL.value: "Normal",
+            TextureDataRole.MASK.value: "Mask",
+        }.get(data_role, "Data")
+        return self._elide_text(f"{map_label} · {role_label}", 14)
+
+    def _texture_size_line(self) -> str:
+        path = Path(str(self.node.properties.get("path", "")))
+        if not path.exists():
+            return "missing"
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+        except Exception:
+            return "unreadable"
+        return self._elide_text(f"{width}x{height}", 14)
+
+    def _socket_label_color(self, socket_id: str) -> QColor:
+        if self.node.node_type is not NodeType.TEXTURE_INPUT:
+            return QColor("#C9D2DD")
+        primary_socket = self._primary_texture_socket()
+        if primary_socket is None or socket_id == primary_socket:
+            return QColor("#E2E9F2")
+        return QColor("#7B8794")
+
+    def _primary_texture_socket(self) -> str | None:
+        path = Path(str(self.node.properties.get("path", "")))
+        map_type = detect_texture_map_type(path)
+        if map_type in {
+            TextureMapType.AO,
+            TextureMapType.ROUGHNESS,
+            TextureMapType.SMOOTHNESS,
+            TextureMapType.METALLIC,
+            TextureMapType.OPACITY,
+            TextureMapType.HEIGHT,
+        }:
+            return "r"
+        return None
+
+    @staticmethod
+    def _pixel_font(pixel_size: int) -> QFont:
+        font = QFont()
+        font.setPixelSize(pixel_size)
+        return font
+
+    @staticmethod
+    def _elide_text(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        if max_chars <= 3:
+            return text[:max_chars]
+        keep = max_chars - 3
+        head = max(1, keep // 2)
+        tail = max(1, keep - head)
+        return f"{text[:head]}...{text[-tail:]}"
 
     def _build_flag_items(self) -> None:
         if node_has_resettable_parameters(self.node.node_type):
@@ -502,11 +638,11 @@ class GraphNodeItem(QGraphicsRectItem):
         return self._flag_rect_from_right(1)
 
     def _flag_rect_from_right(self, index: int) -> QRectF:
-        x = NODE_WIDTH - FLAG_SIZE - 8 - index * (FLAG_SIZE + FLAG_GAP)
+        x = self.node_width - FLAG_SIZE - 8 - index * (FLAG_SIZE + FLAG_GAP)
         return QRectF(x, FLAG_TOP, FLAG_SIZE, FLAG_SIZE)
 
     def _render_flag_rect(self) -> QRectF:
-        return QRectF(NODE_WIDTH - FLAG_SIZE - 8, FLAG_TOP, FLAG_SIZE, FLAG_SIZE)
+        return QRectF(self.node_width - FLAG_SIZE - 8, FLAG_TOP, FLAG_SIZE, FLAG_SIZE)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -864,6 +1000,7 @@ class GraphView(QGraphicsView):
     connection_insert_node_requested = pyqtSignal(object, object, object)
     texture_dropped = pyqtSignal(str, object)
     node_add_requested = pyqtSignal(object, object, object)
+    layout_requested = pyqtSignal()
 
     def __init__(self, scene: GraphScene, parent: QWidget | None = None):
         super().__init__(scene, parent)
@@ -880,12 +1017,16 @@ class GraphView(QGraphicsView):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def wheelEvent(self, event) -> None:
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12
-            self.scale(factor, factor)
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        if delta == 0:
             event.accept()
             return
-        super().wheelEvent(event)
+        factor = 1.12 if delta > 0 else 1 / 1.12
+        current_zoom = self.transform().m11()
+        next_zoom = current_zoom * factor
+        if 0.15 <= next_zoom <= 4.0:
+            self.scale(factor, factor)
+        event.accept()
 
     def mousePressEvent(self, event) -> None:
         if self._knife_active and event.button() == Qt.MouseButton.LeftButton:
@@ -1024,6 +1165,8 @@ class GraphView(QGraphicsView):
         menu.addSeparator()
         fit_action = menu.addAction("Fit View")
         fit_action.triggered.connect(self.fit_graph)
+        layout_action = menu.addAction("Auto Layout")
+        layout_action.triggered.connect(self.layout_requested.emit)
         if global_position is None:
             global_position = self.viewport().mapToGlobal(self.mapFromScene(scene_position))
         menu.exec(global_position)
@@ -1107,6 +1250,7 @@ class GraphView(QGraphicsView):
 class NodePropertiesPanel(QWidget):
     node_changed = pyqtSignal(object, object, object, bool)
     output_profile_apply_requested = pyqtSignal(object)
+    output_inputs_clear_requested = pyqtSignal(object)
     node_reset_requested = pyqtSignal(object)
 
     def __init__(self, parent: QWidget | None = None):
@@ -1266,9 +1410,22 @@ class NodePropertiesPanel(QWidget):
         self.output_profile_combo.currentIndexChanged.connect(self._apply_changes)
         self.form.addRow("Profile", self.output_profile_combo)
 
-        self.apply_profile_button = QPushButton("Apply Profile")
+        self.apply_profile_button = QPushButton("Auto Connect Profile")
         self.apply_profile_button.clicked.connect(self._apply_output_profile)
-        self.form.addRow("", self.apply_profile_button)
+        self.clear_output_inputs_button = QPushButton("Clear Inputs")
+        self.clear_output_inputs_button.clicked.connect(self._clear_output_inputs)
+        profile_actions = QHBoxLayout()
+        profile_actions.setContentsMargins(0, 0, 0, 0)
+        profile_actions.addWidget(self.apply_profile_button, 1)
+        profile_actions.addWidget(self.clear_output_inputs_button)
+        self.profile_actions_host = QWidget()
+        self.profile_actions_host.setLayout(profile_actions)
+        self.form.addRow("Auto Connect", self.profile_actions_host)
+
+        self.profile_summary_label = QLabel("")
+        self.profile_summary_label.setObjectName("SummaryText")
+        self.profile_summary_label.setWordWrap(True)
+        self.form.addRow("", self.profile_summary_label)
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("RGB", OutputMode.RGB.value)
@@ -1353,7 +1510,8 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_path_host, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_profile_combo, node_type is NodeType.OUTPUT_RGBA)
-        self._set_row_visible(self.apply_profile_button, node_type is NodeType.OUTPUT_RGBA)
+        self._set_row_visible(self.profile_actions_host, node_type is NodeType.OUTPUT_RGBA)
+        self._set_row_visible(self.profile_summary_label, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.mode_combo, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.enabled_checkbox, node_type is NodeType.OUTPUT_RGBA)
 
@@ -1393,6 +1551,14 @@ class NodePropertiesPanel(QWidget):
         if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
             return
         self.output_profile_apply_requested.emit(self._node)
+
+    def _clear_output_inputs(self) -> None:
+        if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
+            return
+        self.output_inputs_clear_requested.emit(self._node)
+
+    def set_profile_summary(self, text: str) -> None:
+        self.profile_summary_label.setText(text)
 
     def _apply_changes(self, *_args: object) -> None:
         if self._suppress or self._node is None:
@@ -1550,6 +1716,9 @@ class GraphWorkspace(QWidget):
         self.fit_button = QPushButton("Fit")
         self.fit_button.clicked.connect(lambda: self.view.fit_graph())
         toolbar.addWidget(self.fit_button)
+        self.layout_button = QPushButton("Layout")
+        self.layout_button.clicked.connect(self.auto_layout_nodes)
+        toolbar.addWidget(self.layout_button)
         self.preview_quality_combo = QComboBox()
         self.preview_quality_combo.setToolTip("Preview max side")
         for label, value in (("512", 512), ("1024", 1024), ("2048", 2048)):
@@ -1573,11 +1742,13 @@ class GraphWorkspace(QWidget):
         self.view = GraphView(self._scene)
         self.view.connection_delete_requested.connect(self._on_connection_delete_requested)
         self.view.connection_insert_node_requested.connect(self._on_connection_insert_node_requested)
+        self.view.layout_requested.connect(self.auto_layout_nodes)
         self.view.texture_dropped.connect(self.add_texture_node_for_path)
         self.view.node_add_requested.connect(self.add_node_of_type)
         self.properties_panel = NodePropertiesPanel()
         self.properties_panel.node_changed.connect(self._on_node_properties_changed)
         self.properties_panel.output_profile_apply_requested.connect(self._apply_output_profile)
+        self.properties_panel.output_inputs_clear_requested.connect(self._clear_output_inputs)
         self.properties_panel.node_reset_requested.connect(self._on_node_reset_clicked)
         self._install_shortcuts()
 
@@ -1877,6 +2048,125 @@ class GraphWorkspace(QWidget):
     def add_output_node(self) -> None:
         self.add_node_of_type(NodeType.OUTPUT_RGBA)
 
+    def auto_layout_nodes(self) -> None:
+        nodes = list(self.project.graph.nodes)
+        if not nodes:
+            self.status_message.emit("Graph is empty.")
+            return
+        before_positions = {node.node_id: node.position for node in nodes}
+        after_positions = self._auto_layout_positions(nodes)
+        if after_positions == before_positions:
+            self.status_message.emit("Graph layout already looks clean.")
+            return
+        selected_ids = self._scene.selected_node_ids()
+        self._push_graph_command(
+            MoveNodesCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                before_positions,
+                after_positions,
+            ),
+            select_node_ids=selected_ids,
+        )
+        self.view.fit_graph()
+        self.status_message.emit(f"Auto layout: arranged {len(nodes)} node(s).")
+
+    def _auto_layout_positions(self, nodes: list[GraphNode]) -> dict[str, tuple[float, float]]:
+        node_ids = {node.node_id for node in nodes}
+        depth_by_id = self._layout_depth_by_node(nodes)
+        columns: dict[int, list[GraphNode]] = {}
+        for node in nodes:
+            columns.setdefault(depth_by_id.get(node.node_id, 0), []).append(node)
+
+        depths = sorted(columns)
+        center = self.view.mapToScene(self.view.viewport().rect().center())
+        total_width = max(0, (len(depths) - 1) * GRAPH_LAYOUT_X_SPACING)
+        left = center.x() - total_width / 2
+        positions: dict[str, tuple[float, float]] = {}
+
+        for column_index, depth in enumerate(depths):
+            column_nodes = sorted(
+                columns[depth],
+                key=lambda item: (self._layout_type_rank(item.node_type), item.position[1], item.title),
+            )
+            heights = [self._estimated_node_height(node) for node in column_nodes]
+            total_height = sum(heights) + max(0, len(heights) - 1) * GRAPH_LAYOUT_Y_SPACING
+            x = self._snap_to_layout_grid(left + column_index * GRAPH_LAYOUT_X_SPACING)
+            y = self._snap_to_layout_grid(center.y() - total_height / 2)
+            for node, height in zip(column_nodes, heights, strict=True):
+                if node.node_id in node_ids:
+                    positions[node.node_id] = (x, y)
+                y = self._snap_to_layout_grid(y + height + GRAPH_LAYOUT_Y_SPACING)
+        return positions
+
+    def _layout_depth_by_node(self, nodes: list[GraphNode]) -> dict[str, int]:
+        node_by_id = {node.node_id: node for node in nodes}
+        depth_by_id = {
+            node.node_id: self._layout_type_rank(node.node_type)
+            for node in nodes
+        }
+        incoming_count = {node.node_id: 0 for node in nodes}
+        outgoing: dict[str, list[str]] = {node.node_id: [] for node in nodes}
+        for connection in self.project.graph.connections:
+            if connection.source_node_id not in node_by_id or connection.target_node_id not in node_by_id:
+                continue
+            outgoing[connection.source_node_id].append(connection.target_node_id)
+            incoming_count[connection.target_node_id] += 1
+
+        queue = sorted(
+            (node_id for node_id, count in incoming_count.items() if count == 0),
+            key=lambda node_id: (
+                depth_by_id.get(node_id, 0),
+                node_by_id[node_id].position[0],
+                node_by_id[node_id].position[1],
+            ),
+        )
+        while queue:
+            node_id = queue.pop(0)
+            for target_id in outgoing[node_id]:
+                depth_by_id[target_id] = max(depth_by_id[target_id], depth_by_id[node_id] + 1)
+                incoming_count[target_id] -= 1
+                if incoming_count[target_id] == 0:
+                    queue.append(target_id)
+                    queue.sort(
+                        key=lambda item: (
+                            depth_by_id.get(item, 0),
+                            node_by_id[item].position[0],
+                            node_by_id[item].position[1],
+                        )
+                    )
+        return depth_by_id
+
+    @staticmethod
+    def _layout_type_rank(node_type: NodeType) -> int:
+        if node_type in (NodeType.TEXTURE_INPUT, NodeType.CONSTANT_CHANNEL):
+            return 0
+        if node_type in (
+            NodeType.INVERT_CHANNEL,
+            NodeType.LEVELS_CHANNEL,
+            NodeType.CLAMP_CHANNEL,
+            NodeType.THRESHOLD_CHANNEL,
+            NodeType.BLEND_CHANNEL,
+            NodeType.LUMINANCE,
+        ):
+            return 1
+        return 2
+
+    @staticmethod
+    def _estimated_node_height(node: GraphNode) -> float:
+        sockets = socket_definitions(node.node_type)
+        input_count = sum(1 for socket in sockets if socket.direction is SocketDirection.INPUT)
+        output_count = sum(1 for socket in sockets if socket.direction is SocketDirection.OUTPUT)
+        row_count = max(input_count, output_count, 2)
+        body_height = row_count * ROW_HEIGHT + 16
+        if node.node_type is NodeType.TEXTURE_INPUT:
+            body_height = TEXTURE_BODY_HEIGHT
+        return float(TITLE_HEIGHT + body_height)
+
+    @staticmethod
+    def _snap_to_layout_grid(value: float) -> float:
+        return float(round(value / GRAPH_LAYOUT_GRID) * GRAPH_LAYOUT_GRID)
+
     def export_graph(
         self,
         output_root: Path,
@@ -1979,6 +2269,7 @@ class GraphWorkspace(QWidget):
 
         self._refresh_validation()
         self.properties_panel.set_node(self._scene.selected_node())
+        self._refresh_properties_profile_summary()
         self._preview_active_display_node()
         self._update_project_label()
         self._schedule_autosave()
@@ -2146,6 +2437,76 @@ class GraphWorkspace(QWidget):
     def _apply_output_profile(self, node: GraphNode | None) -> None:
         if node is None or node.node_type is not NodeType.OUTPUT_RGBA:
             return
+        plan = self._build_output_profile_plan(node)
+
+        self.undo_stack.beginMacro("Auto connect output profile")
+        try:
+            self.undo_stack.push(
+                SetNodeStateCommand(
+                    self.project.graph,
+                    self._on_graph_command_changed,
+                    node,
+                    title=node.title,
+                    properties=plan.properties,
+                    text="Set output profile",
+                    needs_rebuild=False,
+                )
+            )
+            if plan.utility_nodes:
+                self.undo_stack.push(
+                    AddNodesCommand(
+                        self.project.graph,
+                        self._on_graph_command_changed,
+                        plan.utility_nodes,
+                        plan.utility_connections,
+                        text="Add profile nodes",
+                    )
+                )
+            for connection in plan.output_connections:
+                self.undo_stack.push(
+                    ReplaceInputConnectionCommand(
+                        self.project.graph,
+                        self._on_graph_command_changed,
+                        connection,
+                    )
+                )
+        finally:
+            self.undo_stack.endMacro()
+
+        self._scene.select_node_ids([node.node_id])
+        self._refresh_properties_profile_summary(node)
+        self._schedule_autosave()
+        self.status_message.emit(f"{node.title}: {self._profile_status_text(plan)}")
+
+    def _clear_output_inputs(self, node: GraphNode | None) -> None:
+        if node is None or node.node_type is not NodeType.OUTPUT_RGBA:
+            return
+        input_socket_ids = {
+            socket.socket_id
+            for socket in socket_definitions(NodeType.OUTPUT_RGBA)
+            if socket.direction is SocketDirection.INPUT
+        }
+        connections = [
+            connection
+            for connection in self.project.graph.connections
+            if connection.target_node_id == node.node_id
+            and connection.target_socket_id in input_socket_ids
+        ]
+        if not connections:
+            self.status_message.emit(f"{node.title}: output inputs are already clear.")
+            return
+        self._push_graph_command(
+            RemoveConnectionsCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                connections,
+                text="Clear output inputs",
+            ),
+            select_node_ids=[node.node_id],
+        )
+        self.status_message.emit(f"{node.title}: cleared {len(connections)} input wire(s).")
+
+    def _build_output_profile_plan(self, node: GraphNode) -> OutputProfilePlan:
         profile = self._output_profile(node)
         mode = OUTPUT_PROFILE_MODES.get(profile, OutputMode.RGBA)
         properties = dict(node.properties)
@@ -2228,43 +2589,110 @@ class GraphWorkspace(QWidget):
                     )
                 )
 
-        self.undo_stack.beginMacro("Apply output profile")
-        try:
-            self.undo_stack.push(
-                SetNodeStateCommand(
-                    self.project.graph,
-                    self._on_graph_command_changed,
-                    node,
-                    title=node.title,
-                    properties=properties,
-                    text="Set output profile",
-                    needs_rebuild=False,
-                )
-            )
-            if utility_nodes:
-                self.undo_stack.push(
-                    AddNodesCommand(
-                        self.project.graph,
-                        self._on_graph_command_changed,
-                        utility_nodes,
-                        utility_connections,
-                        text="Add profile nodes",
-                    )
-                )
-            for connection in output_connections:
-                self.undo_stack.push(
-                    ReplaceInputConnectionCommand(
-                        self.project.graph,
-                        self._on_graph_command_changed,
-                        connection,
-                    )
-                )
-        finally:
-            self.undo_stack.endMacro()
+        return OutputProfilePlan(
+            profile=profile,
+            mode=mode,
+            properties=properties,
+            utility_nodes=utility_nodes,
+            utility_connections=utility_connections,
+            output_connections=output_connections,
+            summary_lines=self._profile_plan_summary_lines(
+                utility_nodes,
+                utility_connections,
+                output_connections,
+            ),
+        )
 
-        self._scene.select_node_ids([node.node_id])
-        self._schedule_autosave()
-        self.status_message.emit(f"{node.title}: applied {profile.value} profile.")
+    def _refresh_properties_profile_summary(self, node: GraphNode | None = None) -> None:
+        selected_node = node or self._scene.selected_node()
+        if selected_node is None or selected_node.node_type is not NodeType.OUTPUT_RGBA:
+            self.properties_panel.set_profile_summary("")
+            return
+        self.properties_panel.set_profile_summary(self._profile_summary_text(selected_node))
+
+    def _profile_summary_text(self, node: GraphNode) -> str:
+        plan = self._build_output_profile_plan(node)
+        profile_label = OUTPUT_PROFILE_LABELS.get(plan.profile, plan.profile.value)
+        filename = str(plan.properties.get("filename", "packed_rgba.png"))
+        lines = [f"{profile_label} -> {plan.mode.value.upper()} / {filename}"]
+        if any(connection.target_node_id == node.node_id for connection in self.project.graph.connections):
+            lines.append("Existing input wires will be replaced.")
+        if plan.summary_lines:
+            lines.extend(plan.summary_lines)
+        else:
+            lines.append("No compatible output channel rules.")
+        return "\n".join(lines)
+
+    def _profile_status_text(self, plan: OutputProfilePlan) -> str:
+        profile_label = OUTPUT_PROFILE_LABELS.get(plan.profile, plan.profile.value)
+        mappings = "; ".join(plan.summary_lines)
+        if len(mappings) > 180:
+            mappings = f"{mappings[:177]}..."
+        return f"{profile_label}: {mappings}" if mappings else f"{profile_label}: no channel mappings."
+
+    def _profile_plan_summary_lines(
+        self,
+        utility_nodes: list[GraphNode],
+        utility_connections: list[GraphConnection],
+        output_connections: list[GraphConnection],
+    ) -> tuple[str, ...]:
+        node_by_id = {node.node_id: node for node in self.project.graph.nodes}
+        node_by_id.update({node.node_id: node for node in utility_nodes})
+        utility_input_by_target = {
+            (connection.target_node_id, connection.target_socket_id): connection
+            for connection in utility_connections
+        }
+        channel_order = {"r": 0, "g": 1, "b": 2, "a": 3}
+        lines: list[str] = []
+        for connection in sorted(
+            output_connections,
+            key=lambda item: channel_order.get(item.target_socket_id, 99),
+        ):
+            source_text = self._profile_source_text(
+                connection.source_node_id,
+                connection.source_socket_id,
+                node_by_id,
+                utility_input_by_target,
+            )
+            lines.append(f"{connection.target_socket_id.upper()} <- {source_text}")
+        return tuple(lines)
+
+    def _profile_source_text(
+        self,
+        node_id: str,
+        socket_id: str,
+        node_by_id: dict[str, GraphNode],
+        utility_input_by_target: dict[tuple[str, str], GraphConnection],
+    ) -> str:
+        node = node_by_id.get(node_id)
+        socket_label = socket_id.upper() if socket_id in {"r", "g", "b", "a"} else socket_id
+        if node is None:
+            return f"{node_id}.{socket_label}"
+        if node.node_type is NodeType.CONSTANT_CHANNEL:
+            return f"Constant {self._coerce_channel_value(node.properties.get('value'), 255)}"
+        if node.node_type is NodeType.INVERT_CHANNEL:
+            input_connection = utility_input_by_target.get((node.node_id, "in"))
+            if input_connection is None:
+                return "Invert"
+            inner_text = self._profile_source_text(
+                input_connection.source_node_id,
+                input_connection.source_socket_id,
+                node_by_id,
+                utility_input_by_target,
+            )
+            return f"Invert({inner_text})"
+        if node.node_type is NodeType.TEXTURE_INPUT:
+            path_name = Path(str(node.properties.get("path", ""))).name
+            source_name = path_name or node.title
+            return f"{source_name}.{socket_label}"
+        return f"{node.title}.{socket_label}"
+
+    @staticmethod
+    def _coerce_channel_value(value: object, default: int) -> int:
+        try:
+            return max(0, min(255, int(value)))
+        except (TypeError, ValueError):
+            return default
 
     def _profile_rules(
         self,
@@ -2609,6 +3037,7 @@ class GraphWorkspace(QWidget):
 
     def _on_node_selected(self, node: GraphNode | None) -> None:
         self.properties_panel.set_node(node)
+        self._refresh_properties_profile_summary(node)
         if self._active_display_node() is None:
             self._preview_view_node(node)
 

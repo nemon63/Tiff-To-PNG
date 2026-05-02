@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from PIL import Image
 from PyQt6.QtCore import QEventLoop, QTimer
 from PyQt6.QtWidgets import QApplication
 
@@ -26,7 +27,7 @@ from image_converter.services.node_graph_executor import NodeGraphExecutor
 from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
 from image_converter.services.settings import AppSettingsRepository
 from image_converter.ui.graph_commands import AddNodesCommand, ReplaceInputConnectionCommand
-from image_converter.ui.node_editor import GraphWorkspace
+from image_converter.ui.node_editor import GraphNodeItem, GraphWorkspace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -105,6 +106,60 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.workspace._paste_clipboard()
         self.assertEqual(4, len(self.workspace.project.graph.nodes))
         self.assertEqual(2, len(self.workspace.project.graph.connections))
+
+    def test_auto_layout_arranges_nodes_by_flow_and_is_undoable(self) -> None:
+        texture = create_graph_node(NodeType.TEXTURE_INPUT, position=(0, 0))
+        levels = create_graph_node(NodeType.LEVELS_CHANNEL, position=(0, 0))
+        output = create_graph_node(NodeType.OUTPUT_RGBA, position=(0, 0))
+        connections = [
+            GraphConnection(make_connection_id(), texture.node_id, "r", levels.node_id, "in"),
+            GraphConnection(make_connection_id(), levels.node_id, "out", output.node_id, "r"),
+        ]
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [texture, levels, output],
+                connections,
+            ),
+        )
+
+        self.workspace.auto_layout_nodes()
+
+        self.assertLess(texture.position[0], levels.position[0])
+        self.assertLess(levels.position[0], output.position[0])
+        self.workspace.undo_stack.undo()
+        self.assertEqual((0, 0), texture.position)
+        self.assertEqual((0, 0), levels.position)
+        self.assertEqual((0, 0), output.position)
+
+    def test_texture_node_visual_stays_compact_with_larger_thumbnail(self) -> None:
+        texture = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            title="mushket_maskmap",
+            properties={"path": "mushket_maskmap.png"},
+        )
+        item = GraphNodeItem(texture)
+
+        self.assertEqual(260, item.rect().width())
+        self.assertLessEqual(item.rect().height(), 150)
+
+    def test_texture_display_flag_renders_composite_color_preview(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "basecolor.png"
+            Image.new("RGBA", (2, 1), (20, 80, 160, 255)).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                title="basecolor",
+                properties={"path": str(texture_path)},
+            )
+
+            image, meta = NodeGraphExecutor().render_display_node(NodeGraph(nodes=[texture]), texture)
+
+        self.assertEqual("RGBA", image.mode)
+        self.assertEqual((20, 80, 160, 255), image.getpixel((0, 0)))
+        self.assertIn("Display flag · Texture", meta)
+        self.assertNotIn("· R ·", meta)
 
     def test_validation_reports_missing_output_inputs(self) -> None:
         output = create_graph_node(NodeType.OUTPUT_RGBA)
@@ -220,6 +275,58 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertEqual("b", by_target["b"].source_socket_id)
         self.assertEqual(basecolor.node_id, by_target["a"].source_node_id)
         self.assertEqual("a", by_target["a"].source_socket_id)
+
+    def test_output_profile_summary_describes_autoconnect_plan(self) -> None:
+        basecolor = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_diff.png"})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.GENERIC_RGBA.value},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [basecolor, output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+
+        summary = self.workspace._profile_summary_text(output)
+
+        self.assertIn("Generic RGBA -> RGBA / packed_rgba.png", summary)
+        self.assertIn("R <- anglerfish_diff.png.R", summary)
+        self.assertIn("G <- anglerfish_diff.png.G", summary)
+        self.assertIn("B <- anglerfish_diff.png.B", summary)
+        self.assertIn("A <- anglerfish_diff.png.A", summary)
+        self.assertEqual("Auto Connect Profile", self.workspace.properties_panel.apply_profile_button.text())
+
+    def test_clear_output_inputs_is_undoable(self) -> None:
+        constant = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        connection = GraphConnection(
+            make_connection_id(),
+            constant.node_id,
+            "out",
+            output.node_id,
+            "r",
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [constant, output],
+                [connection],
+            ),
+            select_node_ids=[output.node_id],
+        )
+
+        self.workspace._clear_output_inputs(output)
+
+        self.assertEqual(0, len(self.workspace.project.graph.connections))
+        self.workspace.undo_stack.undo()
+        self.assertEqual(1, len(self.workspace.project.graph.connections))
+        self.workspace.undo_stack.redo()
+        self.assertEqual(0, len(self.workspace.project.graph.connections))
 
     def test_output_profile_uses_detected_hdrp_maskmap_channels(self) -> None:
         maskmap = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "mushket_maskmap.png"})

@@ -130,6 +130,13 @@ class NodeGraphExecutor:
                 fallback_size=resolved_fallback,
             )
             return image, f"View preview · {image.width}x{image.height} · channel"
+        if node.node_type is NodeType.TEXTURE_INPUT:
+            image = self._load_texture_preview_image(node)
+            target_size = self._fit_preview_size(image.size, cache.max_side)
+            if image.size != target_size:
+                image = image.resize(target_size, RESAMPLING_LANCZOS)
+            image = image.convert("RGBA")
+            return image, f"Display flag · Texture · {image.width}x{image.height} · {image.mode}"
 
         output_socket = self._first_channel_output_socket(node)
         if output_socket is None:
@@ -958,6 +965,15 @@ class NodeGraphExecutor:
                     return working_image.getchannel("A").copy()
                 return Image.new("L", working_image.size, 255)
         raise GraphExecutionError(f"Unsupported texture channel: {socket_id}")
+
+    @staticmethod
+    def _load_texture_preview_image(node: GraphNode) -> Image.Image:
+        path = Path(str(node.properties.get("path", "")))
+        if not path.exists():
+            raise GraphExecutionError(f"{node.title}: texture not found: {path}")
+
+        with Image.open(path) as image:
+            return _extract_first_frame(image).convert("RGBA")
 
     @staticmethod
     def _constant_value(node: GraphNode) -> int:
