@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from copy import deepcopy
 from pathlib import Path
 
 from PIL import Image
-from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QKeySequence,
@@ -40,11 +41,18 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from image_converter.domain.models import ConversionOptions, ConversionStatus, QueueItem
+from image_converter.domain.models import (
+    ChannelPackLayout,
+    ConversionOptions,
+    ConversionStatus,
+    QueueItem,
+    TextureMapType,
+)
 from image_converter.domain.node_graph import (
     GraphConnection,
     GraphNode,
@@ -84,6 +92,8 @@ from image_converter.services.node_graph_executor import (
     NodeGraphPreviewCache,
 )
 from image_converter.services.node_graph_project import NodeGraphProjectRepository
+from image_converter.services.map_types import detect_texture_map_type
+from image_converter.services.packing import PACK_LAYOUTS, PackSourceCandidate
 
 NODE_WIDTH = 190
 TITLE_HEIGHT = 28
@@ -92,6 +102,82 @@ PORT_RADIUS = 6
 FLAG_SIZE = 14
 FLAG_TOP = 7
 FLAG_GAP = 6
+
+OUTPUT_PROFILE_FILENAMES = {
+    OutputProfile.GENERIC_RGBA: "packed_rgba.png",
+    OutputProfile.UNITY_URP: "unity_urp_mask.png",
+    OutputProfile.UNITY_HDRP: "unity_hdrp_mask.png",
+    OutputProfile.UNREAL_ORM: "unreal_orm.png",
+    OutputProfile.METAHUMAN_REPACK: "metahuman_repack.png",
+}
+OUTPUT_PROFILE_MODES = {
+    OutputProfile.GENERIC_RGBA: OutputMode.RGBA,
+    OutputProfile.UNITY_URP: OutputMode.RGBA,
+    OutputProfile.UNITY_HDRP: OutputMode.RGBA,
+    OutputProfile.UNREAL_ORM: OutputMode.RGB,
+    OutputProfile.METAHUMAN_REPACK: OutputMode.RGBA,
+}
+OUTPUT_PROFILE_PACK_LAYOUTS = {
+    OutputProfile.UNITY_URP: ChannelPackLayout.UNITY_URP,
+    OutputProfile.UNITY_HDRP: ChannelPackLayout.UNITY_HDRP,
+    OutputProfile.UNREAL_ORM: ChannelPackLayout.ORM,
+}
+DEFAULT_PROFILE_FILL = {
+    TextureMapType.AO: 255,
+    TextureMapType.ROUGHNESS: 255,
+    TextureMapType.SMOOTHNESS: 0,
+    TextureMapType.METALLIC: 0,
+    TextureMapType.OPACITY: 255,
+}
+METAHUMAN_REPACK_RULES = (
+    ("r", (PackSourceCandidate(TextureMapType.AO),), 255),
+    ("g", (PackSourceCandidate(TextureMapType.ROUGHNESS),), 255),
+    ("b", (PackSourceCandidate(TextureMapType.METALLIC),), 0),
+    ("a", (PackSourceCandidate(TextureMapType.OPACITY),), 255),
+)
+
+
+class GraphPreviewWorker(QObject):
+    finished = pyqtSignal(int, object, str, str)
+    failed = pyqtSignal(int, str, str)
+    completed = pyqtSignal()
+
+    def __init__(
+        self,
+        generation: int,
+        graph_project: NodeGraphProject,
+        node: GraphNode,
+        *,
+        mode_label: str = "",
+        max_side: int = 1024,
+    ):
+        super().__init__()
+        self._generation = generation
+        self._project = graph_project
+        self._node = node
+        self._mode_label = mode_label
+        self._max_side = max_side
+
+    def run(self) -> None:
+        try:
+            executor = NodeGraphExecutor()
+            preview_cache = NodeGraphPreviewCache(max_side=self._max_side)
+            image, meta = executor.render_display_node(
+                self._project.graph,
+                self._node,
+                preview_cache=preview_cache,
+            )
+            if self._mode_label:
+                filename = str(self._node.properties.get("filename", "")).strip()
+                if self._node.properties.get("output_path"):
+                    filename = Path(str(self._node.properties.get("output_path"))).name
+                suffix = f" · {filename}" if filename else ""
+                meta = f"Output preview · {image.width}x{image.height} · {self._mode_label}{suffix}"
+            self.finished.emit(self._generation, image, self._node.title, meta)
+        except (GraphExecutionError, OSError, ValueError) as exc:
+            self.failed.emit(self._generation, self._node.title, str(exc))
+        finally:
+            self.completed.emit()
 
 
 class ConnectionItem(QGraphicsPathItem):
@@ -987,6 +1073,7 @@ class GraphView(QGraphicsView):
 
 class NodePropertiesPanel(QWidget):
     node_changed = pyqtSignal(object, object, object, bool)
+    output_profile_apply_requested = pyqtSignal(object)
     node_reset_requested = pyqtSignal(object)
 
     def __init__(self, parent: QWidget | None = None):
@@ -1146,6 +1233,10 @@ class NodePropertiesPanel(QWidget):
         self.output_profile_combo.currentIndexChanged.connect(self._apply_changes)
         self.form.addRow("Profile", self.output_profile_combo)
 
+        self.apply_profile_button = QPushButton("Apply Profile")
+        self.apply_profile_button.clicked.connect(self._apply_output_profile)
+        self.form.addRow("", self.apply_profile_button)
+
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("RGB", OutputMode.RGB.value)
         self.mode_combo.addItem("RGBA", OutputMode.RGBA.value)
@@ -1229,6 +1320,7 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_path_host, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_profile_combo, node_type is NodeType.OUTPUT_RGBA)
+        self._set_row_visible(self.apply_profile_button, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.mode_combo, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.enabled_checkbox, node_type is NodeType.OUTPUT_RGBA)
 
@@ -1263,6 +1355,11 @@ class NodePropertiesPanel(QWidget):
         if self._node is None or not node_has_resettable_parameters(self._node.node_type):
             return
         self.node_reset_requested.emit(self._node)
+
+    def _apply_output_profile(self) -> None:
+        if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
+            return
+        self.output_profile_apply_requested.emit(self._node)
 
     def _apply_changes(self, *_args: object) -> None:
         if self._suppress or self._node is None:
@@ -1350,10 +1447,18 @@ class GraphWorkspace(QWidget):
         self._assets: list[QueueItem] = []
         self._clipboard_nodes: list[GraphNode] = []
         self._clipboard_connections: list[GraphConnection] = []
+        self._preview_generation = 0
+        self._preview_threads: list[QThread] = []
+        self._preview_workers: list[GraphPreviewWorker] = []
+        self._recent_project_dirs: list[Path] = []
         self._shortcuts = []
         self._repository = NodeGraphProjectRepository()
         self._executor = NodeGraphExecutor()
         self._preview_cache = NodeGraphPreviewCache(max_side=1024)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(30000)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.timeout.connect(self.autosave_project)
         self.undo_stack = QUndoStack(self)
         self.undo_stack.cleanChanged.connect(lambda _clean: self._update_project_label())
         self.undo_stack.indexChanged.connect(lambda _index: self._update_project_label())
@@ -1412,6 +1517,20 @@ class GraphWorkspace(QWidget):
         self.fit_button = QPushButton("Fit")
         self.fit_button.clicked.connect(lambda: self.view.fit_graph())
         toolbar.addWidget(self.fit_button)
+        self.preview_quality_combo = QComboBox()
+        self.preview_quality_combo.setToolTip("Preview max side")
+        for label, value in (("512", 512), ("1024", 1024), ("2048", 2048)):
+            self.preview_quality_combo.addItem(label, value)
+        self.preview_quality_combo.setCurrentIndex(1)
+        self.preview_quality_combo.currentIndexChanged.connect(self._set_preview_quality)
+        toolbar.addWidget(self.preview_quality_combo)
+        self.recent_button = QToolButton()
+        self.recent_button.setText("Recent")
+        self.recent_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        toolbar.addWidget(self.recent_button)
+        self.remap_button = QPushButton("Remap Missing")
+        self.remap_button.clicked.connect(self.remap_missing_texture_paths)
+        toolbar.addWidget(self.remap_button)
         self.export_button = QPushButton("Export Graph")
         self.export_button.setObjectName("PrimaryButton")
         self.export_button.clicked.connect(self.export_requested.emit)
@@ -1425,6 +1544,7 @@ class GraphWorkspace(QWidget):
         self.view.node_add_requested.connect(self.add_node_of_type)
         self.properties_panel = NodePropertiesPanel()
         self.properties_panel.node_changed.connect(self._on_node_properties_changed)
+        self.properties_panel.output_profile_apply_requested.connect(self._apply_output_profile)
         self.properties_panel.node_reset_requested.connect(self._on_node_reset_clicked)
         self._install_shortcuts()
 
@@ -1451,6 +1571,7 @@ class GraphWorkspace(QWidget):
         self.validation_table.itemSelectionChanged.connect(self._select_validation_issue_node)
 
         root_layout.addWidget(self.view, 1)
+        self._rebuild_recent_menu()
 
     def build_properties_widget(self) -> QWidget:
         panel = QFrame()
@@ -1483,9 +1604,21 @@ class GraphWorkspace(QWidget):
     def set_assets(self, items: list[QueueItem]) -> None:
         self._assets = [item for item in items if item.metadata is not None]
 
+    def apply_recent_projects(self, paths: Iterable[str]) -> None:
+        self._recent_project_dirs = []
+        for raw_path in paths:
+            path = Path(raw_path)
+            if path.exists() and path not in self._recent_project_dirs:
+                self._recent_project_dirs.append(path)
+        self._rebuild_recent_menu()
+
+    def recent_project_paths(self) -> tuple[str, ...]:
+        return tuple(str(path) for path in self._recent_project_dirs[:8])
+
     def new_project(self) -> None:
         self.project = NodeGraphProject()
         self.project_dir = None
+        self._preview_generation += 1
         self._preview_cache.clear()
         self.undo_stack.clear()
         self._scene.project = self.project
@@ -1500,20 +1633,7 @@ class GraphWorkspace(QWidget):
         path = QFileDialog.getExistingDirectory(self, "Load .texturegraph project")
         if not path:
             return
-        try:
-            self.project = self._repository.load(Path(path))
-        except Exception as exc:
-            self.status_message.emit(f"Graph load failed: {exc}")
-            return
-        self.project_dir = Path(path)
-        self._preview_cache.clear()
-        self.undo_stack.clear()
-        self._scene.project = self.project
-        self._scene.rebuild()
-        self.undo_stack.setClean()
-        self._update_project_label()
-        self._refresh_validation()
-        self.status_message.emit(f"Loaded graph: {self.project.name}")
+        self.load_project(Path(path))
 
     def save_project_dialog(self) -> None:
         path = str(self.project_dir or "")
@@ -1531,9 +1651,120 @@ class GraphWorkspace(QWidget):
             return
         self.project_dir = bundle_dir
         self.project.name = bundle_dir.stem
+        self._remember_recent_project(bundle_dir)
         self.undo_stack.setClean()
         self._update_project_label()
         self.status_message.emit(f"Saved graph: {bundle_dir}")
+
+    def autosave_project(self) -> None:
+        if not self.has_unsaved_changes() or self.project_dir is None:
+            return
+        autosave_dir = self.project_dir / ".autosave.texturegraph"
+        try:
+            self._repository.save(self.project, autosave_dir)
+        except Exception as exc:
+            self.status_message.emit(f"Graph autosave failed: {exc}")
+            return
+        self.status_message.emit(f"Autosaved graph: {autosave_dir}")
+
+    def load_project(self, bundle_dir: Path) -> None:
+        try:
+            self.project = self._repository.load(bundle_dir)
+        except Exception as exc:
+            self.status_message.emit(f"Graph load failed: {exc}")
+            return
+        self.project_dir = bundle_dir
+        self._remember_recent_project(bundle_dir)
+        self._preview_generation += 1
+        self._preview_cache.clear()
+        self.undo_stack.clear()
+        self._scene.project = self.project
+        self._scene.rebuild()
+        self.undo_stack.setClean()
+        self._update_project_label()
+        self._refresh_validation()
+        self.status_message.emit(f"Loaded graph: {self.project.name}")
+
+    def remap_missing_texture_paths(self) -> None:
+        missing_nodes = [
+            node
+            for node in self.project.graph.nodes
+            if node.node_type is NodeType.TEXTURE_INPUT
+            and (
+                not str(node.properties.get("path", "")).strip()
+                or not Path(str(node.properties.get("path", ""))).exists()
+            )
+        ]
+        if not missing_nodes:
+            self.status_message.emit("No missing texture paths.")
+            return
+        root = QFileDialog.getExistingDirectory(self, "Select folder to remap missing textures")
+        if not root:
+            return
+        root_path = Path(root)
+        indexed_paths: dict[str, Path] = {}
+        for candidate in root_path.rglob("*"):
+            if candidate.is_file():
+                indexed_paths.setdefault(candidate.name.casefold(), candidate)
+
+        updated = 0
+        for node in missing_nodes:
+            old_path = Path(str(node.properties.get("path", "")))
+            replacement = indexed_paths.get(old_path.name.casefold())
+            if replacement is None:
+                continue
+            properties = dict(node.properties)
+            properties["path"] = str(replacement)
+            self._push_graph_command(
+                SetNodeStateCommand(
+                    self.project.graph,
+                    self._on_graph_command_changed,
+                    node,
+                    title=node.title,
+                    properties=properties,
+                    text="Remap texture path",
+                    needs_rebuild=True,
+                )
+            )
+            updated += 1
+        self.status_message.emit(f"Remapped missing textures: {updated}/{len(missing_nodes)}")
+
+    def _set_preview_quality(self) -> None:
+        max_side = int(self.preview_quality_combo.currentData() or 1024)
+        self._preview_cache.max_side = max_side
+        self._preview_cache.clear()
+        self._preview_active_display_node()
+
+    def _schedule_autosave(self) -> None:
+        if self.project_dir is not None and self.has_unsaved_changes():
+            self._autosave_timer.start()
+
+    def _remember_recent_project(self, bundle_dir: Path) -> None:
+        try:
+            resolved = bundle_dir.resolve()
+        except OSError:
+            resolved = bundle_dir
+        self._recent_project_dirs = [
+            path for path in self._recent_project_dirs if path != resolved
+        ]
+        self._recent_project_dirs.insert(0, resolved)
+        self._recent_project_dirs = self._recent_project_dirs[:8]
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self) -> None:
+        if not hasattr(self, "recent_button"):
+            return
+        menu = QMenu(self.recent_button)
+        if not self._recent_project_dirs:
+            empty_action = menu.addAction("No recent projects")
+            empty_action.setEnabled(False)
+        for bundle_dir in self._recent_project_dirs:
+            action = menu.addAction(bundle_dir.name)
+            action.setToolTip(str(bundle_dir))
+            action.triggered.connect(
+                lambda _checked=False, path=bundle_dir: self.load_project(path)
+            )
+        self.recent_button.setMenu(menu)
 
     def add_texture_node_from_selected_asset(self) -> None:
         if not self._assets:
@@ -1717,6 +1948,7 @@ class GraphWorkspace(QWidget):
         self.properties_panel.set_node(self._scene.selected_node())
         self._preview_active_display_node()
         self._update_project_label()
+        self._schedule_autosave()
 
     def _delete_selection(self) -> None:
         self._scene.delete_selected()
@@ -1877,6 +2109,169 @@ class GraphWorkspace(QWidget):
             ),
             select_node_ids=[node.node_id],
         )
+
+    def _apply_output_profile(self, node: GraphNode | None) -> None:
+        if node is None or node.node_type is not NodeType.OUTPUT_RGBA:
+            return
+        profile = self._output_profile(node)
+        mode = OUTPUT_PROFILE_MODES.get(profile, OutputMode.RGBA)
+        properties = dict(node.properties)
+        properties["profile"] = profile.value
+        properties["mode"] = mode.value
+        properties["filename"] = OUTPUT_PROFILE_FILENAMES.get(profile, "packed_rgba.png")
+
+        utility_nodes: list[GraphNode] = []
+        utility_connections: list[GraphConnection] = []
+        output_connections: list[GraphConnection] = []
+        texture_nodes_by_map_type = self._texture_nodes_by_map_type()
+        output_x, output_y = node.position
+
+        for index, (socket_id, candidates, fill_value) in enumerate(self._profile_rules(profile)):
+            if mode is OutputMode.RGB and socket_id == "a":
+                continue
+            source_node, source_socket_id, invert, resolved_fill = self._resolve_profile_source(
+                candidates,
+                texture_nodes_by_map_type,
+                fill_value,
+            )
+            if source_node is not None:
+                if invert:
+                    invert_node = create_graph_node(
+                        NodeType.INVERT_CHANNEL,
+                        title=f"Invert {socket_id.upper()}",
+                        position=(output_x - 240.0, output_y + 58.0 * index),
+                    )
+                    utility_nodes.append(invert_node)
+                    utility_connections.append(
+                        GraphConnection(
+                            connection_id=make_connection_id(),
+                            source_node_id=source_node.node_id,
+                            source_socket_id=source_socket_id,
+                            target_node_id=invert_node.node_id,
+                            target_socket_id="in",
+                        )
+                    )
+                    source_node = invert_node
+                    source_socket_id = "out"
+            else:
+                constant_node = create_graph_node(
+                    NodeType.CONSTANT_CHANNEL,
+                    title=f"{socket_id.upper()} {resolved_fill}",
+                    position=(output_x - 240.0, output_y + 58.0 * index),
+                    properties={"value": resolved_fill},
+                )
+                utility_nodes.append(constant_node)
+                source_node = constant_node
+                source_socket_id = "out"
+
+            output_connections.append(
+                GraphConnection(
+                    connection_id=make_connection_id(),
+                    source_node_id=source_node.node_id,
+                    source_socket_id=source_socket_id,
+                    target_node_id=node.node_id,
+                    target_socket_id=socket_id,
+                )
+            )
+
+        self.undo_stack.beginMacro("Apply output profile")
+        try:
+            self.undo_stack.push(
+                SetNodeStateCommand(
+                    self.project.graph,
+                    self._on_graph_command_changed,
+                    node,
+                    title=node.title,
+                    properties=properties,
+                    text="Set output profile",
+                    needs_rebuild=False,
+                )
+            )
+            if utility_nodes:
+                self.undo_stack.push(
+                    AddNodesCommand(
+                        self.project.graph,
+                        self._on_graph_command_changed,
+                        utility_nodes,
+                        utility_connections,
+                        text="Add profile nodes",
+                    )
+                )
+            for connection in output_connections:
+                self.undo_stack.push(
+                    ReplaceInputConnectionCommand(
+                        self.project.graph,
+                        self._on_graph_command_changed,
+                        connection,
+                    )
+                )
+        finally:
+            self.undo_stack.endMacro()
+
+        self._scene.select_node_ids([node.node_id])
+        self._schedule_autosave()
+        self.status_message.emit(f"{node.title}: applied {profile.value} profile.")
+
+    def _profile_rules(
+        self,
+        profile: OutputProfile,
+    ) -> tuple[tuple[str, tuple[PackSourceCandidate, ...], int | None], ...]:
+        if profile is OutputProfile.GENERIC_RGBA:
+            return ()
+        if profile is OutputProfile.METAHUMAN_REPACK:
+            return METAHUMAN_REPACK_RULES
+        layout = OUTPUT_PROFILE_PACK_LAYOUTS.get(profile)
+        if layout is None:
+            return ()
+        return tuple(
+            (
+                rule.channel.lower(),
+                rule.candidates,
+                rule.fill_value,
+            )
+            for rule in PACK_LAYOUTS[layout]
+        )
+
+    def _resolve_profile_source(
+        self,
+        candidates: tuple[PackSourceCandidate, ...],
+        texture_nodes_by_map_type: dict[TextureMapType, GraphNode],
+        fill_value: int | None,
+    ) -> tuple[GraphNode | None, str, bool, int]:
+        for candidate in candidates:
+            source_node = texture_nodes_by_map_type.get(candidate.map_type)
+            if source_node is not None:
+                return source_node, "r", candidate.invert, 255
+        if fill_value is not None:
+            return None, "", False, fill_value
+        if candidates:
+            return None, "", False, DEFAULT_PROFILE_FILL.get(candidates[0].map_type, 255)
+        return None, "", False, 255
+
+    def _texture_nodes_by_map_type(self) -> dict[TextureMapType, GraphNode]:
+        asset_map_types = {
+            self._path_key(item.path): item.effective_map_type
+            for item in self._assets
+        }
+        nodes_by_map_type: dict[TextureMapType, GraphNode] = {}
+        for node in self.project.graph.nodes:
+            if node.node_type is not NodeType.TEXTURE_INPUT:
+                continue
+            path = Path(str(node.properties.get("path", "")))
+            map_type = asset_map_types.get(self._path_key(path))
+            if map_type is None:
+                map_type = detect_texture_map_type(path)
+            if map_type is TextureMapType.UNKNOWN:
+                continue
+            nodes_by_map_type.setdefault(map_type, node)
+        return nodes_by_map_type
+
+    @staticmethod
+    def _path_key(path: Path) -> str:
+        try:
+            return str(path.resolve()).lower()
+        except OSError:
+            return str(path).lower()
 
     def _connections_for_new_node_context(
         self,
@@ -2109,16 +2504,7 @@ class GraphWorkspace(QWidget):
             self._preview_display_node(display_node)
 
     def _preview_display_node(self, node: GraphNode) -> None:
-        try:
-            preview_image, meta = self._executor.render_display_node(
-                self.project.graph,
-                node,
-                preview_cache=self._preview_cache,
-            )
-        except (GraphExecutionError, OSError, ValueError) as exc:
-            self.status_message.emit(f"{node.title}: display failed: {exc}")
-            return
-        self.preview_image_requested.emit(preview_image, node.title, meta)
+        self._request_preview_node(node)
 
     def _preview_view_node(self, node: GraphNode | None) -> None:
         if node is None or node.node_type is not NodeType.VIEW:
@@ -2129,36 +2515,71 @@ class GraphWorkspace(QWidget):
             target_socket_id="in",
         ) is None:
             return
-        try:
-            preview_image = self._executor.render_view_node(
-                self.project.graph,
-                node,
-                preview_cache=self._preview_cache,
-            )
-        except (GraphExecutionError, OSError, ValueError) as exc:
-            self.status_message.emit(f"{node.title}: {exc}")
-            return
-        meta = f"Graph channel preview · {preview_image.width}x{preview_image.height} · {preview_image.mode}"
-        self.preview_image_requested.emit(preview_image, node.title, meta)
+        self._request_preview_node(node)
 
     def _preview_output_node(self, node: GraphNode) -> None:
-        try:
-            preview_image, _meta = self._executor.render_display_node(
-                self.project.graph,
-                node,
-                preview_cache=self._preview_cache,
-            )
-        except (GraphExecutionError, OSError, ValueError) as exc:
-            self.status_message.emit(f"{node.title}: preview failed: {exc}")
-            return
-
         mode = self._output_mode_label(node)
-        filename = str(node.properties.get("filename", "")).strip()
-        if node.properties.get("output_path"):
-            filename = Path(str(node.properties.get("output_path"))).name
-        suffix = f" · {filename}" if filename else ""
-        meta = f"Output preview · {preview_image.width}x{preview_image.height} · {mode}{suffix}"
-        self.preview_image_requested.emit(preview_image, node.title, meta)
+        self._request_preview_node(node, mode_label=mode)
+
+    def _request_preview_node(self, node: GraphNode, *, mode_label: str = "") -> None:
+        self._preview_generation += 1
+        generation = self._preview_generation
+        snapshot = deepcopy(self.project)
+        node_snapshot = next(
+            (
+                graph_node
+                for graph_node in snapshot.graph.nodes
+                if graph_node.node_id == node.node_id
+            ),
+            None,
+        )
+        if node_snapshot is None:
+            return
+        thread = QThread(self)
+        worker = GraphPreviewWorker(
+            generation,
+            snapshot,
+            node_snapshot,
+            mode_label=mode_label,
+            max_side=self._preview_cache.max_side,
+        )
+        worker.moveToThread(thread)
+        self._preview_threads.append(thread)
+        self._preview_workers.append(worker)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_preview_worker_finished)
+        worker.failed.connect(self._on_preview_worker_failed)
+        worker.completed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda current=thread: self._forget_preview_thread(current))
+        thread.finished.connect(lambda current=worker: self._forget_preview_worker(current))
+        thread.start()
+        self.status_message.emit(f"{node.title}: rendering preview...")
+
+    def _on_preview_worker_finished(
+        self,
+        generation: int,
+        image: object,
+        title: str,
+        meta: str,
+    ) -> None:
+        if generation != self._preview_generation:
+            return
+        self.preview_image_requested.emit(image, title, meta)
+
+    def _on_preview_worker_failed(self, generation: int, title: str, message: str) -> None:
+        if generation != self._preview_generation:
+            return
+        self.status_message.emit(f"{title}: preview failed: {message}")
+
+    def _forget_preview_thread(self, thread: QThread) -> None:
+        if thread in self._preview_threads:
+            self._preview_threads.remove(thread)
+
+    def _forget_preview_worker(self, worker: GraphPreviewWorker) -> None:
+        if worker in self._preview_workers:
+            self._preview_workers.remove(worker)
 
     @staticmethod
     def _output_mode_label(node: GraphNode) -> str:
@@ -2166,6 +2587,13 @@ class GraphWorkspace(QWidget):
             return OutputMode(str(node.properties.get("mode", OutputMode.RGBA.value))).value.upper()
         except ValueError:
             return OutputMode.RGBA.value.upper()
+
+    @staticmethod
+    def _output_profile(node: GraphNode) -> OutputProfile:
+        try:
+            return OutputProfile(str(node.properties.get("profile", OutputProfile.GENERIC_RGBA.value)))
+        except ValueError:
+            return OutputProfile.GENERIC_RGBA
 
     @staticmethod
     def _status_text(status: ConversionStatus) -> str:
@@ -2180,3 +2608,10 @@ class GraphWorkspace(QWidget):
 
     def sizeHint(self) -> QSize:
         return QSize(980, 620)
+
+    def closeEvent(self, event) -> None:
+        self._preview_generation += 1
+        for thread in list(self._preview_threads):
+            thread.quit()
+            thread.wait(10000)
+        super().closeEvent(event)

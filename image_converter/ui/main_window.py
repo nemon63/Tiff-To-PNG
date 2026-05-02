@@ -529,6 +529,7 @@ class MainWindow(QMainWindow):
         else:
             self.resize(settings.window_width, settings.window_height)
         self.settings_panel.apply_app_settings(settings)
+        self.graph_workspace.apply_recent_projects(settings.recent_graph_projects)
         self._sync_top_output_path(settings.output_path)
         if settings.window_state:
             self.restoreState(QByteArray.fromBase64(settings.window_state.encode("ascii")))
@@ -545,6 +546,7 @@ class MainWindow(QMainWindow):
         return AppSettings(
             input_path=str(request.input_path or ""),
             output_path=str(request.output_root or ""),
+            recent_graph_projects=self.graph_workspace.recent_project_paths(),
             options=request.options,
             window_width=self.width(),
             window_height=self.height(),

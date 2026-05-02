@@ -42,6 +42,7 @@ class AppSettingsRepository:
         return {
             "input_path": settings.input_path,
             "output_path": settings.output_path,
+            "recent_graph_projects": list(settings.recent_graph_projects),
             "options": serialize_conversion_options(settings.options),
             "window": {
                 "layout_version": LAYOUT_VERSION,
@@ -64,6 +65,7 @@ class AppSettingsRepository:
         return AppSettings(
             input_path=str(data.get("input_path", "")),
             output_path=str(data.get("output_path", "")),
+            recent_graph_projects=self._coerce_strings(data.get("recent_graph_projects", [])),
             options=deserialize_conversion_options(options_data if isinstance(options_data, dict) else {}),
             window_width=self._coerce_int(window_data.get("width"), 1280),
             window_height=self._coerce_int(window_data.get("height"), 820),
@@ -93,6 +95,12 @@ class AppSettingsRepository:
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _coerce_strings(value: Any) -> tuple[str, ...]:
+        if not isinstance(value, list):
+            return ()
+        return tuple(str(item) for item in value if str(item))
 
     @classmethod
     def _coerce_pair(cls, value: Any, default: tuple[int, int]) -> tuple[int, int]:
