@@ -135,6 +135,39 @@ METAHUMAN_REPACK_RULES = (
     ("b", (PackSourceCandidate(TextureMapType.METALLIC),), 0),
     ("a", (PackSourceCandidate(TextureMapType.OPACITY),), 255),
 )
+PACKED_DETAIL_MASK = "detail_mask"
+PACKED_SOURCE_CHANNELS = {
+    "unity_hdrp_mask": {
+        TextureMapType.METALLIC: ("r", False),
+        TextureMapType.AO: ("g", False),
+        PACKED_DETAIL_MASK: ("b", False),
+        TextureMapType.SMOOTHNESS: ("a", False),
+        TextureMapType.ROUGHNESS: ("a", True),
+    },
+    "unity_urp_mask": {
+        TextureMapType.METALLIC: ("r", False),
+        TextureMapType.SMOOTHNESS: ("a", False),
+        TextureMapType.ROUGHNESS: ("a", True),
+    },
+    "unreal_orm": {
+        TextureMapType.AO: ("r", False),
+        TextureMapType.ROUGHNESS: ("g", False),
+        TextureMapType.SMOOTHNESS: ("g", True),
+        TextureMapType.METALLIC: ("b", False),
+    },
+    "unreal_mra": {
+        TextureMapType.METALLIC: ("r", False),
+        TextureMapType.ROUGHNESS: ("g", False),
+        TextureMapType.SMOOTHNESS: ("g", True),
+        TextureMapType.AO: ("b", False),
+    },
+    "unreal_rma": {
+        TextureMapType.ROUGHNESS: ("r", False),
+        TextureMapType.SMOOTHNESS: ("r", True),
+        TextureMapType.METALLIC: ("g", False),
+        TextureMapType.AO: ("b", False),
+    },
+}
 
 
 class GraphPreviewWorker(QObject):
@@ -1460,8 +1493,8 @@ class GraphWorkspace(QWidget):
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self.autosave_project)
         self.undo_stack = QUndoStack(self)
-        self.undo_stack.cleanChanged.connect(lambda _clean: self._update_project_label())
-        self.undo_stack.indexChanged.connect(lambda _index: self._update_project_label())
+        self.undo_stack.cleanChanged.connect(self._on_undo_stack_changed)
+        self.undo_stack.indexChanged.connect(self._on_undo_stack_changed)
         self._scene = GraphScene(self.project, self)
         self._scene.connection_delete_requested.connect(self._on_connection_delete_requested)
         self._scene.connection_insert_node_requested.connect(self._on_connection_insert_node_requested)
@@ -2124,55 +2157,76 @@ class GraphWorkspace(QWidget):
         utility_connections: list[GraphConnection] = []
         output_connections: list[GraphConnection] = []
         texture_nodes_by_map_type = self._texture_nodes_by_map_type()
+        packed_texture_nodes = self._packed_texture_nodes()
         output_x, output_y = node.position
 
-        for index, (socket_id, candidates, fill_value) in enumerate(self._profile_rules(profile)):
-            if mode is OutputMode.RGB and socket_id == "a":
-                continue
-            source_node, source_socket_id, invert, resolved_fill = self._resolve_profile_source(
-                candidates,
+        if profile is OutputProfile.GENERIC_RGBA:
+            generic_connections, generic_utility_nodes = self._generic_rgba_profile_connections(
+                node,
                 texture_nodes_by_map_type,
-                fill_value,
             )
-            if source_node is not None:
-                if invert:
-                    invert_node = create_graph_node(
-                        NodeType.INVERT_CHANNEL,
-                        title=f"Invert {socket_id.upper()}",
-                        position=(output_x - 240.0, output_y + 58.0 * index),
+            output_connections.extend(generic_connections)
+            utility_nodes.extend(generic_utility_nodes)
+        else:
+            for index, (socket_id, candidates, fill_value) in enumerate(self._profile_rules(profile)):
+                if mode is OutputMode.RGB and socket_id == "a":
+                    continue
+                source_node, source_socket_id, invert = self._resolve_separate_profile_source(
+                    candidates,
+                    texture_nodes_by_map_type,
+                )
+                if source_node is None:
+                    source_node, source_socket_id, invert = self._resolve_packed_profile_source(
+                        profile,
+                        socket_id,
+                        candidates,
+                        packed_texture_nodes,
                     )
-                    utility_nodes.append(invert_node)
-                    utility_connections.append(
-                        GraphConnection(
-                            connection_id=make_connection_id(),
-                            source_node_id=source_node.node_id,
-                            source_socket_id=source_socket_id,
-                            target_node_id=invert_node.node_id,
-                            target_socket_id="in",
+                resolved_fill = self._profile_fill_value(
+                    profile,
+                    socket_id,
+                    candidates,
+                    fill_value,
+                )
+                if source_node is not None:
+                    if invert:
+                        invert_node = create_graph_node(
+                            NodeType.INVERT_CHANNEL,
+                            title=f"Invert {socket_id.upper()}",
+                            position=(output_x - 240.0, output_y + 58.0 * index),
                         )
+                        utility_nodes.append(invert_node)
+                        utility_connections.append(
+                            GraphConnection(
+                                connection_id=make_connection_id(),
+                                source_node_id=source_node.node_id,
+                                source_socket_id=source_socket_id,
+                                target_node_id=invert_node.node_id,
+                                target_socket_id="in",
+                            )
+                        )
+                        source_node = invert_node
+                        source_socket_id = "out"
+                else:
+                    constant_node = create_graph_node(
+                        NodeType.CONSTANT_CHANNEL,
+                        title=f"{socket_id.upper()} {resolved_fill}",
+                        position=(output_x - 240.0, output_y + 58.0 * index),
+                        properties={"value": resolved_fill},
                     )
-                    source_node = invert_node
+                    utility_nodes.append(constant_node)
+                    source_node = constant_node
                     source_socket_id = "out"
-            else:
-                constant_node = create_graph_node(
-                    NodeType.CONSTANT_CHANNEL,
-                    title=f"{socket_id.upper()} {resolved_fill}",
-                    position=(output_x - 240.0, output_y + 58.0 * index),
-                    properties={"value": resolved_fill},
-                )
-                utility_nodes.append(constant_node)
-                source_node = constant_node
-                source_socket_id = "out"
 
-            output_connections.append(
-                GraphConnection(
-                    connection_id=make_connection_id(),
-                    source_node_id=source_node.node_id,
-                    source_socket_id=source_socket_id,
-                    target_node_id=node.node_id,
-                    target_socket_id=socket_id,
+                output_connections.append(
+                    GraphConnection(
+                        connection_id=make_connection_id(),
+                        source_node_id=source_node.node_id,
+                        source_socket_id=source_socket_id,
+                        target_node_id=node.node_id,
+                        target_socket_id=socket_id,
+                    )
                 )
-            )
 
         self.undo_stack.beginMacro("Apply output profile")
         try:
@@ -2232,21 +2286,141 @@ class GraphWorkspace(QWidget):
             for rule in PACK_LAYOUTS[layout]
         )
 
-    def _resolve_profile_source(
+    def _generic_rgba_profile_connections(
+        self,
+        output_node: GraphNode,
+        texture_nodes_by_map_type: dict[TextureMapType, GraphNode],
+    ) -> tuple[list[GraphConnection], list[GraphNode]]:
+        color_node = (
+            texture_nodes_by_map_type.get(TextureMapType.BASECOLOR)
+            or texture_nodes_by_map_type.get(TextureMapType.EMISSIVE)
+            or self._first_generic_texture_node()
+        )
+        opacity_node = texture_nodes_by_map_type.get(TextureMapType.OPACITY)
+        utility_nodes: list[GraphNode] = []
+
+        if color_node is None:
+            output_x, output_y = output_node.position
+            constants = [
+                create_graph_node(
+                    NodeType.CONSTANT_CHANNEL,
+                    title=f"{socket.upper()} {value}",
+                    position=(output_x - 240.0, output_y + 58.0 * index),
+                    properties={"value": value},
+                )
+                for index, (socket, value) in enumerate((("r", 0), ("g", 0), ("b", 0), ("a", 255)))
+            ]
+            utility_nodes.extend(constants)
+            return (
+                [
+                    GraphConnection(
+                        connection_id=make_connection_id(),
+                        source_node_id=constant.node_id,
+                        source_socket_id="out",
+                        target_node_id=output_node.node_id,
+                        target_socket_id=socket_id,
+                    )
+                    for constant, socket_id in zip(constants, ("r", "g", "b", "a"), strict=True)
+                ],
+                utility_nodes,
+            )
+
+        alpha_source_node = opacity_node or color_node
+        alpha_socket_id = "r" if opacity_node is not None else "a"
+        source_specs = (
+            ("r", color_node, "r"),
+            ("g", color_node, "g"),
+            ("b", color_node, "b"),
+            ("a", alpha_source_node, alpha_socket_id),
+        )
+        return (
+            [
+                GraphConnection(
+                    connection_id=make_connection_id(),
+                    source_node_id=source_node.node_id,
+                    source_socket_id=source_socket_id,
+                    target_node_id=output_node.node_id,
+                    target_socket_id=target_socket_id,
+                )
+                for target_socket_id, source_node, source_socket_id in source_specs
+            ],
+            utility_nodes,
+        )
+
+    def _first_generic_texture_node(self) -> GraphNode | None:
+        for node in self.project.graph.nodes:
+            if node.node_type is not NodeType.TEXTURE_INPUT:
+                continue
+            path = Path(str(node.properties.get("path", "")))
+            map_type = detect_texture_map_type(path)
+            if map_type in (TextureMapType.NORMAL, TextureMapType.HEIGHT):
+                continue
+            return node
+        return next(
+            (
+                node
+                for node in self.project.graph.nodes
+                if node.node_type is NodeType.TEXTURE_INPUT
+            ),
+            None,
+        )
+
+    def _resolve_separate_profile_source(
         self,
         candidates: tuple[PackSourceCandidate, ...],
         texture_nodes_by_map_type: dict[TextureMapType, GraphNode],
-        fill_value: int | None,
-    ) -> tuple[GraphNode | None, str, bool, int]:
+    ) -> tuple[GraphNode | None, str, bool]:
         for candidate in candidates:
             source_node = texture_nodes_by_map_type.get(candidate.map_type)
             if source_node is not None:
-                return source_node, "r", candidate.invert, 255
+                return source_node, "r", candidate.invert
+        return None, "", False
+
+    def _resolve_packed_profile_source(
+        self,
+        profile: OutputProfile,
+        socket_id: str,
+        candidates: tuple[PackSourceCandidate, ...],
+        packed_texture_nodes: list[tuple[str, GraphNode]],
+    ) -> tuple[GraphNode | None, str, bool]:
+        semantic = self._profile_socket_semantic(profile, socket_id, candidates)
+        if semantic is None:
+            return None, "", False
+        for pack_kind, texture_node in packed_texture_nodes:
+            mapping = PACKED_SOURCE_CHANNELS.get(pack_kind, {})
+            source = mapping.get(semantic)
+            if source is None:
+                continue
+            source_socket_id, invert = source
+            return texture_node, source_socket_id, invert
+        return None, "", False
+
+    def _profile_fill_value(
+        self,
+        profile: OutputProfile,
+        socket_id: str,
+        candidates: tuple[PackSourceCandidate, ...],
+        fill_value: int | None,
+    ) -> int:
         if fill_value is not None:
-            return None, "", False, fill_value
+            return fill_value
         if candidates:
-            return None, "", False, DEFAULT_PROFILE_FILL.get(candidates[0].map_type, 255)
-        return None, "", False, 255
+            return DEFAULT_PROFILE_FILL.get(candidates[0].map_type, 255)
+        if profile is OutputProfile.UNITY_URP and socket_id in {"g", "b"}:
+            return 0
+        return 255
+
+    @staticmethod
+    def _profile_socket_semantic(
+        profile: OutputProfile,
+        socket_id: str,
+        candidates: tuple[PackSourceCandidate, ...],
+    ) -> TextureMapType | str | None:
+        if candidates:
+            return candidates[0].map_type
+        if profile is OutputProfile.UNITY_HDRP and socket_id == "b":
+            return PACKED_DETAIL_MASK
+        return None
 
     def _texture_nodes_by_map_type(self) -> dict[TextureMapType, GraphNode]:
         asset_map_types = {
@@ -2265,6 +2439,34 @@ class GraphWorkspace(QWidget):
                 continue
             nodes_by_map_type.setdefault(map_type, node)
         return nodes_by_map_type
+
+    def _packed_texture_nodes(self) -> list[tuple[str, GraphNode]]:
+        packed_nodes: list[tuple[str, GraphNode]] = []
+        for node in self.project.graph.nodes:
+            if node.node_type is not NodeType.TEXTURE_INPUT:
+                continue
+            pack_kind = self._detect_packed_texture_kind(
+                Path(str(node.properties.get("path", ""))).stem
+            )
+            if pack_kind:
+                packed_nodes.append((pack_kind, node))
+        return packed_nodes
+
+    @staticmethod
+    def _detect_packed_texture_kind(stem: str) -> str:
+        normalized = stem.lower().replace("-", "_").replace(" ", "_")
+        collapsed = normalized.replace("_", "")
+        if "maskmap" in collapsed or "hdrpmask" in collapsed:
+            return "unity_hdrp_mask"
+        if "orm" in collapsed or "occlusionroughnessmetallic" in collapsed:
+            return "unreal_orm"
+        if "mra" in collapsed or "metallicroughnessao" in collapsed:
+            return "unreal_mra"
+        if "rma" in collapsed or "roughnessmetallicao" in collapsed:
+            return "unreal_rma"
+        if "metallicsmoothness" in collapsed or "urpmask" in collapsed:
+            return "unity_urp_mask"
+        return ""
 
     @staticmethod
     def _path_key(path: Path) -> str:
@@ -2365,11 +2567,20 @@ class GraphWorkspace(QWidget):
         self._paste_clipboard()
 
     def has_unsaved_changes(self) -> bool:
-        return not self.undo_stack.isClean()
+        try:
+            return not self.undo_stack.isClean()
+        except RuntimeError:
+            return False
+
+    def _on_undo_stack_changed(self, *_args: object) -> None:
+        self._update_project_label()
 
     def _update_project_label(self) -> None:
-        suffix = "*" if self.has_unsaved_changes() else ""
-        self.project_label.setText(f"{self.project.name}{suffix}")
+        try:
+            suffix = "*" if self.has_unsaved_changes() else ""
+            self.project_label.setText(f"{self.project.name}{suffix}")
+        except RuntimeError:
+            return
 
     @staticmethod
     def _first_channel_input_socket_id(node_type: NodeType) -> str | None:

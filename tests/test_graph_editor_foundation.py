@@ -191,6 +191,105 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertEqual(roughness.node_id, by_target["g"].source_node_id)
         self.assertEqual(metallic.node_id, by_target["b"].source_node_id)
 
+    def test_generic_rgba_profile_connects_basecolor_channels(self) -> None:
+        basecolor = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_diff.png"})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.GENERIC_RGBA.value},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [basecolor, output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+        self.workspace._apply_output_profile(output)
+
+        by_target = {
+            connection.target_socket_id: connection
+            for connection in self.workspace.project.graph.connections
+            if connection.target_node_id == output.node_id
+        }
+        self.assertEqual(basecolor.node_id, by_target["r"].source_node_id)
+        self.assertEqual("r", by_target["r"].source_socket_id)
+        self.assertEqual(basecolor.node_id, by_target["g"].source_node_id)
+        self.assertEqual("g", by_target["g"].source_socket_id)
+        self.assertEqual(basecolor.node_id, by_target["b"].source_node_id)
+        self.assertEqual("b", by_target["b"].source_socket_id)
+        self.assertEqual(basecolor.node_id, by_target["a"].source_node_id)
+        self.assertEqual("a", by_target["a"].source_socket_id)
+
+    def test_output_profile_uses_detected_hdrp_maskmap_channels(self) -> None:
+        maskmap = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "mushket_maskmap.png"})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.UNITY_HDRP.value},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [maskmap, output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+        self.workspace._apply_output_profile(output)
+
+        by_target = {
+            connection.target_socket_id: connection
+            for connection in self.workspace.project.graph.connections
+            if connection.target_node_id == output.node_id
+        }
+        self.assertEqual(maskmap.node_id, by_target["r"].source_node_id)
+        self.assertEqual("r", by_target["r"].source_socket_id)
+        self.assertEqual(maskmap.node_id, by_target["g"].source_node_id)
+        self.assertEqual("g", by_target["g"].source_socket_id)
+        self.assertEqual(maskmap.node_id, by_target["b"].source_node_id)
+        self.assertEqual("b", by_target["b"].source_socket_id)
+        self.assertEqual(maskmap.node_id, by_target["a"].source_node_id)
+        self.assertEqual("a", by_target["a"].source_socket_id)
+
+    def test_unreal_profile_remaps_hdrp_maskmap_with_invert(self) -> None:
+        maskmap = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "mushket_maskmap.png"})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.UNREAL_ORM.value},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [maskmap, output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+        self.workspace._apply_output_profile(output)
+
+        by_target = {
+            connection.target_socket_id: connection
+            for connection in self.workspace.project.graph.connections
+            if connection.target_node_id == output.node_id
+        }
+        self.assertEqual(maskmap.node_id, by_target["r"].source_node_id)
+        self.assertEqual("g", by_target["r"].source_socket_id)
+        self.assertEqual(maskmap.node_id, by_target["b"].source_node_id)
+        self.assertEqual("r", by_target["b"].source_socket_id)
+        invert_node = next(
+            node
+            for node in self.workspace.project.graph.nodes
+            if node.node_type is NodeType.INVERT_CHANNEL
+        )
+        self.assertEqual(invert_node.node_id, by_target["g"].source_node_id)
+        invert_input = next(
+            connection
+            for connection in self.workspace.project.graph.connections
+            if connection.target_node_id == invert_node.node_id
+        )
+        self.assertEqual(maskmap.node_id, invert_input.source_node_id)
+        self.assertEqual("a", invert_input.source_socket_id)
+
     def test_background_preview_emits_latest_result(self) -> None:
         constant = create_graph_node(NodeType.CONSTANT_CHANNEL, properties={"value": 123})
         self.workspace._push_graph_command(
@@ -211,6 +310,12 @@ class GraphEditorFoundationTests(unittest.TestCase):
         loop.exec()
         self.assertTrue(received)
         self.assertEqual(constant.title, received[-1][1])
+
+    def test_deleted_undo_stack_does_not_break_dirty_state_label(self) -> None:
+        self.workspace.undo_stack.deleteLater()
+        self.app.processEvents()
+        self.assertFalse(self.workspace.has_unsaved_changes())
+        self.workspace._update_project_label()
 
 
 if __name__ == "__main__":
