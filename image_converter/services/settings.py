@@ -42,6 +42,7 @@ class AppSettingsRepository:
         return {
             "input_path": settings.input_path,
             "output_path": settings.output_path,
+            "workspace_mode": settings.workspace_mode,
             "recent_graph_projects": list(settings.recent_graph_projects),
             "options": serialize_conversion_options(settings.options),
             "window": {
@@ -65,6 +66,7 @@ class AppSettingsRepository:
         return AppSettings(
             input_path=str(data.get("input_path", "")),
             output_path=str(data.get("output_path", "")),
+            workspace_mode=str(data.get("workspace_mode", "graph")),
             recent_graph_projects=self._coerce_strings(data.get("recent_graph_projects", [])),
             options=deserialize_conversion_options(options_data if isinstance(options_data, dict) else {}),
             window_width=self._coerce_int(window_data.get("width"), 1280),

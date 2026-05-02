@@ -153,6 +153,20 @@ QPushButton#PrimaryButton:hover {
     background: #367FCF;
 }
 
+QPushButton#ModeButton {
+    background: #1C2229;
+    color: #AEB9C6;
+    border: 1px solid #303A45;
+    padding: 6px 12px;
+}
+
+QPushButton#ModeButton:checked {
+    background: #2A3D55;
+    color: #F0F6FF;
+    border: 1px solid #4D7FBA;
+    font-weight: 700;
+}
+
 QPushButton#DangerButton {
     background: #372124;
     color: #F2A4A4;

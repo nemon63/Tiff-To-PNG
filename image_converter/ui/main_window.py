@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import QByteArray, QMimeData, QSize, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QCloseEvent, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPixmap
+from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDockWidget,
@@ -16,11 +16,16 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+WORKSPACE_BATCH = "batch"
+WORKSPACE_GRAPH = "graph"
 
 from image_converter.domain.models import (
     AppSettings,
@@ -90,6 +95,7 @@ class MainWindow(QMainWindow):
         self._asset_rows: list[QueueItem] = []
         self._preset_repository: PresetRepository | None = None
         self._presets_by_id: dict[str, ConversionPreset] = {}
+        self._workspace_mode = WORKSPACE_GRAPH
         self.setWindowTitle("Texture Pipeline Workbench")
         self.resize(1280, 820)
         self.setMinimumSize(720, 480)
@@ -99,6 +105,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setDockNestingEnabled(True)
+        self.mode_menu = self.menuBar().addMenu("Режим")
         self.view_menu = self.menuBar().addMenu("Вид")
 
         self.settings_panel = SettingsPanel()
@@ -112,11 +119,11 @@ class MainWindow(QMainWindow):
         self.settings_panel.options_changed.connect(self._update_queue_output_paths)
         self.settings_panel.options_changed.connect(self._sync_metadata_conversion_options)
 
-        settings_scroll = QScrollArea()
-        settings_scroll.setWidgetResizable(True)
-        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        settings_scroll.setWidget(self.settings_panel)
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.settings_scroll.setWidget(self.settings_panel)
 
         self.queue_panel = QueuePanel()
         self.queue_panel.paths_selected.connect(self.queue_paths_received.emit)
@@ -144,7 +151,11 @@ class MainWindow(QMainWindow):
         central_layout.setContentsMargins(10, 10, 10, 8)
         central_layout.setSpacing(8)
         central_layout.addWidget(self._build_top_toolbar())
-        central_layout.addWidget(self.graph_workspace, 1)
+        self.workspace_stack = QStackedWidget()
+        self.batch_workspace = self._build_batch_workspace()
+        self.workspace_stack.addWidget(self.graph_workspace)
+        self.workspace_stack.addWidget(self.batch_workspace)
+        central_layout.addWidget(self.workspace_stack, 1)
         self.setCentralWidget(central)
 
         self.assets_panel = self._build_assets_panel()
@@ -155,36 +166,29 @@ class MainWindow(QMainWindow):
             "NodePropertiesDock",
         )
         self.inspector_dock = self._create_dock("Inspector", self.metadata_panel, "InspectorDock")
-        self.export_dock = self._create_dock("Export Settings", settings_scroll, "ExportDock")
         self.preview_dock = self._create_dock("Preview", self.preview_panel, "PreviewDock")
-        self.queue_dock = self._create_dock("Queue", self.queue_panel, "QueueDock")
         self.log_dock = self._create_dock("Log", self.log_panel, "LogDock")
 
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.assets_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.node_properties_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.export_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.preview_dock)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.queue_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
         self.tabifyDockWidget(self.node_properties_dock, self.inspector_dock)
-        self.tabifyDockWidget(self.inspector_dock, self.export_dock)
-        self.tabifyDockWidget(self.export_dock, self.preview_dock)
-        self.tabifyDockWidget(self.queue_dock, self.log_dock)
+        self.tabifyDockWidget(self.inspector_dock, self.preview_dock)
         self.node_properties_dock.raise_()
 
+        self._register_mode_actions()
         self._register_view_docks()
         self.inspector_dock.hide()
-        self.export_dock.hide()
         self.preview_dock.hide()
-        self.queue_dock.hide()
         self.log_dock.hide()
         self.resizeDocks(
             [self.assets_dock, self.node_properties_dock],
             [280, 340],
             Qt.Orientation.Horizontal,
         )
-        self._sync_active_workspace_label()
+        self._set_workspace_mode(WORKSPACE_GRAPH)
 
     def _create_dock(self, title: str, widget: QWidget, object_name: str) -> QDockWidget:
         dock = QDockWidget(title, self)
@@ -203,14 +207,40 @@ class MainWindow(QMainWindow):
         )
         return dock
 
+    def _build_batch_workspace(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("WorkspaceCard")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        title = QLabel("Batch Converter")
+        title.setObjectName("PanelTitle")
+        header.addWidget(title)
+        subtitle = QLabel("Потоковая конвертация TIFF/texture assets в PNG.")
+        subtitle.setObjectName("SummaryText")
+        header.addWidget(subtitle)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.settings_scroll.setMinimumWidth(340)
+        self.settings_scroll.setMaximumWidth(460)
+        splitter.addWidget(self.settings_scroll)
+        splitter.addWidget(self.queue_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([380, 820])
+        layout.addWidget(splitter, 1)
+        return panel
+
     def _register_view_docks(self) -> None:
         for dock in (
             self.assets_dock,
             self.node_properties_dock,
             self.inspector_dock,
-            self.export_dock,
             self.preview_dock,
-            self.queue_dock,
             self.log_dock,
         ):
             self.view_menu.addAction(dock.toggleViewAction())
@@ -218,6 +248,20 @@ class MainWindow(QMainWindow):
         show_log_action = QAction("Показать лог", self)
         show_log_action.triggered.connect(lambda: self.log_dock.show())
         self.view_menu.addAction(show_log_action)
+
+    def _register_mode_actions(self) -> None:
+        self.mode_action_group = QActionGroup(self)
+        self.mode_action_group.setExclusive(True)
+        self.batch_mode_action = QAction("Batch Converter", self)
+        self.batch_mode_action.setCheckable(True)
+        self.graph_mode_action = QAction("Graph Workbench", self)
+        self.graph_mode_action.setCheckable(True)
+        self.batch_mode_action.triggered.connect(lambda: self._set_workspace_mode(WORKSPACE_BATCH))
+        self.graph_mode_action.triggered.connect(lambda: self._set_workspace_mode(WORKSPACE_GRAPH))
+        self.mode_action_group.addAction(self.batch_mode_action)
+        self.mode_action_group.addAction(self.graph_mode_action)
+        self.mode_menu.addAction(self.batch_mode_action)
+        self.mode_menu.addAction(self.graph_mode_action)
 
     def _build_top_toolbar(self) -> QFrame:
         toolbar = QFrame()
@@ -229,6 +273,18 @@ class MainWindow(QMainWindow):
         title = QLabel("Texture Pipeline Workbench")
         title.setObjectName("AppTitle")
         layout.addWidget(title)
+
+        self.batch_mode_button = QPushButton("Batch Converter")
+        self.batch_mode_button.setObjectName("ModeButton")
+        self.batch_mode_button.setCheckable(True)
+        self.batch_mode_button.clicked.connect(lambda: self._set_workspace_mode(WORKSPACE_BATCH))
+        layout.addWidget(self.batch_mode_button)
+
+        self.graph_mode_button = QPushButton("Graph Workbench")
+        self.graph_mode_button.setObjectName("ModeButton")
+        self.graph_mode_button.setCheckable(True)
+        self.graph_mode_button.clicked.connect(lambda: self._set_workspace_mode(WORKSPACE_GRAPH))
+        layout.addWidget(self.graph_mode_button)
 
         self.active_workspace_label = QLabel("Queue")
         self.active_workspace_label.setObjectName("StatusPill")
@@ -309,9 +365,40 @@ class MainWindow(QMainWindow):
         if self.top_output_edit.text() != text:
             self.top_output_edit.setText(text)
 
-    def _sync_active_workspace_label(self, *_args: object) -> None:
+    def _set_workspace_mode(self, mode: str) -> None:
+        if mode not in {WORKSPACE_BATCH, WORKSPACE_GRAPH}:
+            mode = WORKSPACE_GRAPH
+        self._workspace_mode = mode
+        is_batch = mode == WORKSPACE_BATCH
+
+        if hasattr(self, "workspace_stack"):
+            self.workspace_stack.setCurrentWidget(self.batch_workspace if is_batch else self.graph_workspace)
+        if hasattr(self, "batch_mode_button"):
+            self.batch_mode_button.setChecked(is_batch)
+            self.graph_mode_button.setChecked(not is_batch)
+        if hasattr(self, "batch_mode_action"):
+            self.batch_mode_action.setChecked(is_batch)
+            self.graph_mode_action.setChecked(not is_batch)
         if hasattr(self, "active_workspace_label"):
-            self.active_workspace_label.setText("Graph")
+            self.active_workspace_label.setText("Batch" if is_batch else "Graph")
+
+        if hasattr(self, "run_batch_button"):
+            self.run_batch_button.setVisible(is_batch)
+            self.export_graph_button.setVisible(not is_batch)
+        if hasattr(self, "assets_dock"):
+            if is_batch:
+                self.assets_dock.hide()
+                self.node_properties_dock.hide()
+                self.inspector_dock.hide()
+            else:
+                self.assets_dock.show()
+                self.node_properties_dock.show()
+                self.node_properties_dock.raise_()
+
+        self.set_status("Batch Converter mode" if is_batch else "Graph Workbench mode")
+
+    def _sync_active_workspace_label(self, *_args: object) -> None:
+        self._set_workspace_mode(self._workspace_mode)
 
     def _render_asset_browser(self) -> None:
         table = self.asset_table
@@ -533,6 +620,7 @@ class MainWindow(QMainWindow):
         self._sync_top_output_path(settings.output_path)
         if settings.window_state:
             self.restoreState(QByteArray.fromBase64(settings.window_state.encode("ascii")))
+        self._set_workspace_mode(settings.workspace_mode)
         self._update_queue_output_paths()
         self._sync_preset_selection_with_current_options()
         self._refresh_packing_preflight()
@@ -546,6 +634,7 @@ class MainWindow(QMainWindow):
         return AppSettings(
             input_path=str(request.input_path or ""),
             output_path=str(request.output_root or ""),
+            workspace_mode=self._workspace_mode,
             recent_graph_projects=self.graph_workspace.recent_project_paths(),
             options=request.options,
             window_width=self.width(),

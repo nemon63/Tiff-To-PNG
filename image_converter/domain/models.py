@@ -289,6 +289,7 @@ class BatchSummary:
 class AppSettings:
     input_path: str = ""
     output_path: str = ""
+    workspace_mode: str = "graph"
     recent_graph_projects: tuple[str, ...] = ()
     options: ConversionOptions = field(default_factory=ConversionOptions)
     window_width: int = 1280

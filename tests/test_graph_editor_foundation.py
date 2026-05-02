@@ -27,6 +27,7 @@ from image_converter.services.node_graph_executor import NodeGraphExecutor
 from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
 from image_converter.services.settings import AppSettingsRepository
 from image_converter.ui.graph_commands import AddNodesCommand, ReplaceInputConnectionCommand
+from image_converter.ui.main_window import MainWindow
 from image_converter.ui.node_editor import GraphNodeItem, GraphWorkspace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -211,11 +212,32 @@ class GraphEditorFoundationTests(unittest.TestCase):
             repository = AppSettingsRepository(settings_path)
             repository.save(
                 AppSettings(
+                    workspace_mode="batch",
                     recent_graph_projects=("A.texturegraph", "B.texturegraph"),
                 )
             )
             loaded = repository.load()
+        self.assertEqual("batch", loaded.workspace_mode)
         self.assertEqual(("A.texturegraph", "B.texturegraph"), loaded.recent_graph_projects)
+
+    def test_main_window_switches_between_batch_and_graph_modes(self) -> None:
+        window = MainWindow()
+        try:
+            window._set_workspace_mode("batch")
+            self.assertEqual("batch", window._workspace_mode)
+            self.assertIs(window.workspace_stack.currentWidget(), window.batch_workspace)
+            self.assertFalse(window.run_batch_button.isHidden())
+            self.assertTrue(window.export_graph_button.isHidden())
+
+            window._set_workspace_mode("graph")
+            self.assertEqual("graph", window._workspace_mode)
+            self.assertIs(window.workspace_stack.currentWidget(), window.graph_workspace)
+            self.assertTrue(window.run_batch_button.isHidden())
+            self.assertFalse(window.export_graph_button.isHidden())
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
 
     def test_output_profile_connects_detected_texture_nodes(self) -> None:
         ao = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "mat_ao.png"})
