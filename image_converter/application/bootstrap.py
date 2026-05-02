@@ -14,14 +14,27 @@ from image_converter.ui.main_window import MainWindow
 from image_converter.ui.theme import APP_STYLESHEET
 
 
+def _runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+def _resource_root() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parents[2]
+
+
 def run_gui() -> int:
     app = QApplication(sys.argv)
     app.setStyleSheet(APP_STYLESHEET)
 
-    project_root = Path(__file__).resolve().parents[2]
-    icon_path = project_root / "ico" / "favicon.ico"
-    settings_repository = AppSettingsRepository(project_root / "app_settings.json")
-    preset_repository = PresetRepository(project_root / "conversion_presets.json")
+    runtime_root = _runtime_root()
+    resource_root = _resource_root()
+    icon_path = resource_root / "ico" / "favicon.ico"
+    settings_repository = AppSettingsRepository(runtime_root / "app_settings.json")
+    preset_repository = PresetRepository(runtime_root / "conversion_presets.json")
     if icon_path.exists():
         icon = QIcon(str(icon_path))
         app.setWindowIcon(icon)
