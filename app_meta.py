@@ -1,0 +1,8 @@
+APP_PRODUCT = "TexturePipelineWorkbench"
+APP_NAME = "Texture Pipeline Workbench"
+APP_VERSION = "0.1.0"
+APP_PUBLISHER = "Texture Pipeline Workbench"
+APP_INSTALLER_GUID = "E57EC96A-654B-4E89-A28B-9B11E1A2A25E"
+
+APP_TITLE = f"{APP_NAME} {APP_VERSION}"
+APP_ID = f"{APP_PRODUCT}_{APP_VERSION}"
