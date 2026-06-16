@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,7 +13,7 @@ from PIL import Image
 from PyQt6.QtCore import QEventLoop, QTimer
 from PyQt6.QtWidgets import QApplication
 
-from image_converter.domain.models import AppSettings
+from image_converter.domain.models import AppSettings, ConversionOptions
 from image_converter.domain.node_graph import (
     GraphConnection,
     NodeGraph,
@@ -23,6 +24,9 @@ from image_converter.domain.node_graph import (
     create_graph_node,
     make_connection_id,
 )
+from image_converter.services.asset_queue import AssetScanner
+from image_converter.services.conversion import ImageConverter
+from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.node_graph_executor import NodeGraphExecutor
 from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
 from image_converter.services.settings import AppSettingsRepository
@@ -35,6 +39,78 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 def _app() -> QApplication:
     return QApplication.instance() or QApplication(sys.argv)
+
+
+def _write_rgb_tiff_with_unspecified_alpha(path: Path) -> None:
+    width, height = 2, 1
+    pixel_data = bytes((10, 20, 30, 40, 50, 60, 70, 200))
+    entries = []
+    extra_data = bytearray()
+    data_offset = 8 + 2 + 10 * 12 + 4
+
+    def add_entry(tag: int, field_type: int, count: int, value: int) -> None:
+        entries.append((tag, field_type, count, value))
+
+    bits_offset = data_offset + len(extra_data)
+    extra_data.extend(struct.pack("<4H", 8, 8, 8, 8))
+    pixel_offset = data_offset + len(extra_data)
+    extra_data.extend(pixel_data)
+
+    add_entry(256, 4, 1, width)
+    add_entry(257, 4, 1, height)
+    add_entry(258, 3, 4, bits_offset)
+    add_entry(259, 3, 1, 1)
+    add_entry(262, 3, 1, 2)
+    add_entry(273, 4, 1, pixel_offset)
+    add_entry(277, 3, 1, 4)
+    add_entry(278, 4, 1, height)
+    add_entry(279, 4, 1, len(pixel_data))
+    add_entry(338, 3, 1, 0)
+
+    payload = bytearray(b"II" + struct.pack("<H", 42) + struct.pack("<I", 8))
+    payload.extend(struct.pack("<H", len(entries)))
+    for tag, field_type, count, value in sorted(entries):
+        payload.extend(struct.pack("<HHI", tag, field_type, count))
+        if field_type == 3 and count == 1:
+            payload.extend(struct.pack("<H", value) + b"\x00\x00")
+        else:
+            payload.extend(struct.pack("<I", value))
+    payload.extend(struct.pack("<I", 0))
+    payload.extend(extra_data)
+    path.write_bytes(payload)
+
+
+class ImageLoadingTests(unittest.TestCase):
+    def test_tiff_unspecified_extra_sample_is_treated_as_alpha(self) -> None:
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "photoshop_alpha.tif"
+            destination = Path(tmp) / "photoshop_alpha.png"
+            _write_rgb_tiff_with_unspecified_alpha(source)
+
+            with Image.open(source) as raw_image:
+                self.assertEqual("RGB", raw_image.mode)
+                self.assertEqual((0,), raw_image.tag_v2.get(338))
+                loaded = copy_first_frame_preserving_alpha(raw_image)
+            try:
+                self.assertEqual("RGBA", loaded.mode)
+                self.assertEqual((40, 200), loaded.getchannel("A").getextrema())
+            finally:
+                loaded.close()
+
+            item = AssetScanner().scan_paths([source], recursive=False).items[0]
+            self.assertIsNotNone(item.metadata)
+            self.assertTrue(item.metadata.has_alpha)
+            self.assertEqual("RGBA", item.metadata.mode)
+
+            result = ImageConverter().convert(
+                source,
+                destination,
+                ConversionOptions(overwrite=True),
+            )
+            self.assertTrue(result.is_success)
+            with Image.open(destination) as converted:
+                self.assertEqual("RGBA", converted.mode)
+                self.assertEqual((40, 200), converted.getchannel("A").getextrema())
 
 
 class GraphEditorFoundationTests(unittest.TestCase):
@@ -207,6 +283,7 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertIn("display", output.properties)
 
     def test_recent_graph_projects_round_trip_in_app_settings(self) -> None:
+        self.assertEqual("batch", AppSettings().workspace_mode)
         with TemporaryDirectory() as tmp:
             settings_path = Path(tmp) / "settings.json"
             repository = AppSettingsRepository(settings_path)
@@ -228,12 +305,20 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertIs(window.workspace_stack.currentWidget(), window.batch_workspace)
             self.assertFalse(window.run_batch_button.isHidden())
             self.assertTrue(window.export_graph_button.isHidden())
+            self.assertTrue(window.top_output_edit.isHidden())
+            self.assertTrue(window.assets_dock.isHidden())
+            self.assertTrue(window.node_properties_dock.isHidden())
+            self.assertFalse(window.inspector_dock.isHidden())
 
             window._set_workspace_mode("graph")
             self.assertEqual("graph", window._workspace_mode)
             self.assertIs(window.workspace_stack.currentWidget(), window.graph_workspace)
             self.assertTrue(window.run_batch_button.isHidden())
             self.assertFalse(window.export_graph_button.isHidden())
+            self.assertFalse(window.top_output_edit.isHidden())
+            self.assertFalse(window.assets_dock.isHidden())
+            self.assertFalse(window.node_properties_dock.isHidden())
+            self.assertTrue(window.inspector_dock.isHidden())
         finally:
             window.setParent(None)
             window.deleteLater()

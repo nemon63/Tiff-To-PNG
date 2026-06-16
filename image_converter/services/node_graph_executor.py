@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageOps, ImageSequence
+from PIL import Image, ImageChops, ImageOps
 
 from image_converter.domain.models import ConversionOptions, ConversionStatus
 from image_converter.domain.node_graph import (
@@ -22,6 +22,7 @@ from image_converter.domain.node_graph import (
     incoming_connection,
     socket_definitions,
 )
+from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.pipeline import RESAMPLING_LANCZOS
 
 Logger = Callable[[str], None]
@@ -1060,6 +1061,4 @@ class NodeGraphExecutor:
 
 
 def _extract_first_frame(image: Image.Image) -> Image.Image:
-    if getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) > 1:
-        return next(ImageSequence.Iterator(image)).copy()
-    return image.copy()
+    return copy_first_frame_preserving_alpha(image)

@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageOps, ImageSequence
+from PIL import Image, ImageOps
 
 from image_converter.domain.models import (
     BatchSource,
@@ -13,6 +13,7 @@ from image_converter.domain.models import (
     ConversionStatus,
     TextureMapType,
 )
+from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.map_types import known_map_aliases
 from image_converter.services.naming import apply_naming_rules
 from image_converter.services.pipeline import RESAMPLING_LANCZOS, ResizeProcessor
@@ -448,6 +449,4 @@ def _relative_dir(path: Path, root: Path) -> Path:
 
 
 def _extract_first_frame(image: Image.Image) -> Image.Image:
-    if getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) > 1:
-        return next(ImageSequence.Iterator(image)).copy()
-    return image.copy()
+    return copy_first_frame_preserving_alpha(image)

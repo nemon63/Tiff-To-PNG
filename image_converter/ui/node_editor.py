@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -94,6 +95,7 @@ from image_converter.services.node_graph_executor import (
     NodeGraphPreviewCache,
 )
 from image_converter.services.node_graph_project import NodeGraphProjectRepository
+from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.packing import PACK_LAYOUTS, PackSourceCandidate
 
@@ -452,8 +454,9 @@ class GraphNodeItem(QGraphicsRectItem):
             return None
         try:
             with Image.open(path) as image:
-                image.thumbnail((TEXTURE_THUMBNAIL_SIZE, TEXTURE_THUMBNAIL_SIZE))
-                rgba = image.convert("RGBA")
+                thumbnail_image = copy_first_frame_preserving_alpha(image)
+                thumbnail_image.thumbnail((TEXTURE_THUMBNAIL_SIZE, TEXTURE_THUMBNAIL_SIZE))
+                rgba = thumbnail_image.convert("RGBA")
                 data = rgba.tobytes("raw", "RGBA")
         except Exception:
             return None
@@ -1689,54 +1692,63 @@ class GraphWorkspace(QWidget):
         root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(8)
 
-        toolbar = QHBoxLayout()
+        toolbar = QVBoxLayout()
         toolbar.setSpacing(6)
+        project_row = QHBoxLayout()
+        project_row.setSpacing(6)
         self.project_label = QLabel("Untitled Graph")
         self.project_label.setObjectName("PanelTitle")
-        toolbar.addWidget(self.project_label)
+        project_row.addWidget(self.project_label)
 
         menu_hint = QLabel("Right-click graph to add nodes")
         menu_hint.setObjectName("SummaryText")
-        toolbar.addWidget(menu_hint)
+        project_row.addWidget(menu_hint)
+        project_row.addStretch(1)
 
+        self.new_button = QPushButton("New")
+        self.new_button.clicked.connect(self.new_project)
+        project_row.addWidget(self.new_button)
+        self.load_button = QPushButton("Load")
+        self.load_button.clicked.connect(self.load_project_dialog)
+        project_row.addWidget(self.load_button)
+        self.save_button = QPushButton("Save")
+        self.save_button.clicked.connect(self.save_project_dialog)
+        project_row.addWidget(self.save_button)
+        self.recent_button = QToolButton()
+        self.recent_button.setText("Recent")
+        self.recent_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        project_row.addWidget(self.recent_button)
+        self.export_button = QPushButton("Export Graph")
+        self.export_button.setObjectName("PrimaryButton")
+        self.export_button.clicked.connect(self.export_requested.emit)
+        project_row.addWidget(self.export_button)
+        toolbar.addLayout(project_row)
+
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(6)
         self.delete_button = QPushButton("Delete")
         self.delete_button.setObjectName("DangerButton")
         self.delete_button.clicked.connect(self._delete_selection)
-        toolbar.addWidget(self.delete_button)
-        toolbar.addStretch(1)
-        self.new_button = QPushButton("New")
-        self.new_button.clicked.connect(self.new_project)
-        toolbar.addWidget(self.new_button)
-        self.load_button = QPushButton("Load")
-        self.load_button.clicked.connect(self.load_project_dialog)
-        toolbar.addWidget(self.load_button)
-        self.save_button = QPushButton("Save")
-        self.save_button.clicked.connect(self.save_project_dialog)
-        toolbar.addWidget(self.save_button)
+        tools_row.addWidget(self.delete_button)
         self.fit_button = QPushButton("Fit")
         self.fit_button.clicked.connect(lambda: self.view.fit_graph())
-        toolbar.addWidget(self.fit_button)
+        tools_row.addWidget(self.fit_button)
         self.layout_button = QPushButton("Layout")
         self.layout_button.clicked.connect(self.auto_layout_nodes)
-        toolbar.addWidget(self.layout_button)
+        tools_row.addWidget(self.layout_button)
+        tools_row.addWidget(QLabel("Preview"))
         self.preview_quality_combo = QComboBox()
         self.preview_quality_combo.setToolTip("Preview max side")
         for label, value in (("512", 512), ("1024", 1024), ("2048", 2048)):
             self.preview_quality_combo.addItem(label, value)
         self.preview_quality_combo.setCurrentIndex(1)
         self.preview_quality_combo.currentIndexChanged.connect(self._set_preview_quality)
-        toolbar.addWidget(self.preview_quality_combo)
-        self.recent_button = QToolButton()
-        self.recent_button.setText("Recent")
-        self.recent_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        toolbar.addWidget(self.recent_button)
+        tools_row.addWidget(self.preview_quality_combo)
         self.remap_button = QPushButton("Remap Missing")
         self.remap_button.clicked.connect(self.remap_missing_texture_paths)
-        toolbar.addWidget(self.remap_button)
-        self.export_button = QPushButton("Export Graph")
-        self.export_button.setObjectName("PrimaryButton")
-        self.export_button.clicked.connect(self.export_requested.emit)
-        toolbar.addWidget(self.export_button)
+        tools_row.addWidget(self.remap_button)
+        tools_row.addStretch(1)
+        toolbar.addLayout(tools_row)
         root_layout.addLayout(toolbar)
 
         self.view = GraphView(self._scene)
@@ -1760,7 +1772,7 @@ class GraphWorkspace(QWidget):
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.result_table.horizontalHeader().setStretchLastSection(True)
-        self.result_table.setMaximumHeight(150)
+        self.result_table.setMinimumHeight(120)
         self.result_table.setMinimumWidth(0)
 
         self.validation_table = QTableWidget()
@@ -1771,7 +1783,7 @@ class GraphWorkspace(QWidget):
         self.validation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.validation_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.validation_table.horizontalHeader().setStretchLastSection(True)
-        self.validation_table.setMaximumHeight(160)
+        self.validation_table.setMinimumHeight(120)
         self.validation_table.itemSelectionChanged.connect(self._select_validation_issue_node)
 
         root_layout.addWidget(self.view, 1)
@@ -1783,11 +1795,27 @@ class GraphWorkspace(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
-        layout.addWidget(self.properties_panel, 1)
-        layout.addWidget(QLabel("Graph Validation"))
-        layout.addWidget(self.validation_table)
-        layout.addWidget(QLabel("Graph Export Queue"))
-        layout.addWidget(self.result_table)
+
+        tabs = QTabWidget()
+        tabs.addTab(self.properties_panel, "Properties")
+
+        validation_tab = QWidget()
+        validation_layout = QVBoxLayout(validation_tab)
+        validation_layout.setContentsMargins(8, 8, 8, 8)
+        validation_layout.setSpacing(8)
+        validation_layout.addWidget(QLabel("Graph Validation"))
+        validation_layout.addWidget(self.validation_table, 1)
+        tabs.addTab(validation_tab, "Validation")
+
+        export_tab = QWidget()
+        export_layout = QVBoxLayout(export_tab)
+        export_layout.setContentsMargins(8, 8, 8, 8)
+        export_layout.setSpacing(8)
+        export_layout.addWidget(QLabel("Graph Export Queue"))
+        export_layout.addWidget(self.result_table, 1)
+        tabs.addTab(export_tab, "Export")
+
+        layout.addWidget(tabs, 1)
         return panel
 
     def _install_shortcuts(self) -> None:

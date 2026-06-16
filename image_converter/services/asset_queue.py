@@ -8,6 +8,7 @@ from PIL import Image
 
 from image_converter.domain.constants import SUPPORTED_SOURCE_EXTENSIONS
 from image_converter.domain.models import AssetKind, AssetMetadata, BatchSource, QueueItem, QueueStatus
+from image_converter.services.image_loading import copy_first_frame_preserving_alpha, image_has_alpha
 from image_converter.services.map_types import detect_texture_map_type
 
 
@@ -92,16 +93,15 @@ class AssetScanner:
         file_size = path.stat().st_size
         map_type = detect_texture_map_type(path)
         with Image.open(path) as image:
-            width, height = image.size
-            mode = image.mode
+            working_image = copy_first_frame_preserving_alpha(image)
+            width, height = working_image.size
+            mode = working_image.mode
             frame_count = getattr(image, "n_frames", 1)
-            has_alpha = "A" in image.getbands() or (
-                image.mode == "P" and "transparency" in image.info
-            )
+            has_alpha = image_has_alpha(working_image)
             format_name = (image.format or path.suffix.removeprefix(".")).upper()
             alpha_fully_opaque = False
-            if has_alpha and "A" in image.getbands():
-                alpha_min, alpha_max = image.getchannel("A").getextrema()
+            if has_alpha and "A" in working_image.getbands():
+                alpha_min, alpha_max = working_image.getchannel("A").getextrema()
                 alpha_fully_opaque = alpha_min == 255 and alpha_max == 255
 
         warnings: list[str] = []

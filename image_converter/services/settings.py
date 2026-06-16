@@ -10,7 +10,7 @@ from image_converter.services.options_codec import (
     serialize_conversion_options,
 )
 
-LAYOUT_VERSION = 5
+LAYOUT_VERSION = 6
 
 
 class AppSettingsRepository:
@@ -63,10 +63,14 @@ class AppSettingsRepository:
         window_data = data.get("window", {})
         use_saved_layout = self._coerce_int(window_data.get("layout_version"), 0) == LAYOUT_VERSION
 
+        workspace_mode = str(data.get("workspace_mode", "batch"))
+        if not use_saved_layout:
+            workspace_mode = "batch"
+
         return AppSettings(
             input_path=str(data.get("input_path", "")),
             output_path=str(data.get("output_path", "")),
-            workspace_mode=str(data.get("workspace_mode", "graph")),
+            workspace_mode=workspace_mode,
             recent_graph_projects=self._coerce_strings(data.get("recent_graph_projects", [])),
             options=deserialize_conversion_options(options_data if isinstance(options_data, dict) else {}),
             window_width=self._coerce_int(window_data.get("width"), 1280),

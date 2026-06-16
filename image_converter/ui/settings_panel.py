@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -73,14 +74,30 @@ class SettingsPanel(QWidget):
         subtitle_label.setWordWrap(True)
         root_layout.addWidget(subtitle_label)
 
-        root_layout.addWidget(self._build_presets_group())
-        root_layout.addWidget(self._build_paths_group())
-        root_layout.addWidget(self._build_naming_group())
-        root_layout.addWidget(self._build_packing_group())
-        root_layout.addWidget(self._build_basic_group())
-        root_layout.addWidget(self._build_png_group())
-        root_layout.addWidget(self._build_resize_group())
-        root_layout.addStretch(1)
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.addTab(
+            self._build_tab(
+                self._build_presets_group(),
+                self._build_paths_group(),
+            ),
+            "Source",
+        )
+        self.settings_tabs.addTab(
+            self._build_tab(
+                self._build_naming_group(),
+                self._build_packing_group(),
+            ),
+            "Output",
+        )
+        self.settings_tabs.addTab(
+            self._build_tab(
+                self._build_basic_group(),
+                self._build_png_group(),
+                self._build_resize_group(),
+            ),
+            "PNG",
+        )
+        root_layout.addWidget(self.settings_tabs, 1)
 
         controls_row = QHBoxLayout()
         self.convert_button = QPushButton("Конвертировать")
@@ -93,6 +110,16 @@ class SettingsPanel(QWidget):
         controls_row.addWidget(self.convert_button)
         root_layout.addLayout(controls_row)
         self._register_interactive(self.convert_button)
+
+    def _build_tab(self, *groups: QGroupBox) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
+        for group in groups:
+            layout.addWidget(group)
+        layout.addStretch(1)
+        return tab
 
     def _build_presets_group(self) -> QGroupBox:
         group = QGroupBox("Workflow Presets")

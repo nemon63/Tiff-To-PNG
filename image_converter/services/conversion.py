@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from PIL import Image, ImageSequence
+from PIL import Image
 
 from image_converter.domain.constants import SUPPORTED_SOURCE_EXTENSIONS
 from image_converter.domain.models import (
@@ -17,6 +17,7 @@ from image_converter.domain.models import (
 )
 from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.naming import build_output_filename
+from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.packing import (
     build_channel_pack_jobs,
     execute_channel_pack_job,
@@ -38,10 +39,10 @@ class ImageConverter:
                 destination=destination,
                 status=ConversionStatus.SKIPPED,
                 message=f"пропуск (уже есть): {destination.name}",
-            )
+        )
 
         with Image.open(source) as image:
-            working_image = self._extract_first_frame(image)
+            working_image = copy_first_frame_preserving_alpha(image)
             processed = self._pipeline.process(working_image, options)
             destination.parent.mkdir(parents=True, exist_ok=True)
             processed.save(
@@ -57,13 +58,6 @@ class ImageConverter:
             status=ConversionStatus.SUCCESS,
             message=f"успех: {destination.name}",
         )
-
-    @staticmethod
-    def _extract_first_frame(image: Image.Image) -> Image.Image:
-        if getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) > 1:
-            return next(ImageSequence.Iterator(image)).copy()
-        return image.copy()
-
 
 class BatchConversionService:
     def __init__(self, converter: ImageConverter | None = None):

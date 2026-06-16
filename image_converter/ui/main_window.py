@@ -168,6 +168,10 @@ class MainWindow(QMainWindow):
         self.inspector_dock = self._create_dock("Inspector", self.metadata_panel, "InspectorDock")
         self.preview_dock = self._create_dock("Preview", self.preview_panel, "PreviewDock")
         self.log_dock = self._create_dock("Log", self.log_panel, "LogDock")
+        self.assets_dock.setMinimumWidth(260)
+        self.node_properties_dock.setMinimumWidth(320)
+        self.inspector_dock.setMinimumWidth(320)
+        self.preview_dock.setMinimumWidth(320)
 
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.assets_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.node_properties_dock)
@@ -248,6 +252,34 @@ class MainWindow(QMainWindow):
         show_log_action = QAction("Показать лог", self)
         show_log_action.triggered.connect(lambda: self.log_dock.show())
         self.view_menu.addAction(show_log_action)
+        reset_layout_action = QAction("Reset Layout", self)
+        reset_layout_action.triggered.connect(self._reset_window_layout)
+        self.view_menu.addAction(reset_layout_action)
+
+    def _reset_window_layout(self) -> None:
+        for dock in (
+            self.assets_dock,
+            self.node_properties_dock,
+            self.inspector_dock,
+            self.preview_dock,
+            self.log_dock,
+        ):
+            dock.setFloating(False)
+
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.assets_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.node_properties_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.preview_dock)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
+        self.tabifyDockWidget(self.node_properties_dock, self.inspector_dock)
+        self.tabifyDockWidget(self.inspector_dock, self.preview_dock)
+        self.log_dock.hide()
+        self.resizeDocks(
+            [self.assets_dock, self.node_properties_dock],
+            [280, 340],
+            Qt.Orientation.Horizontal,
+        )
+        self._set_workspace_mode(self._workspace_mode)
 
     def _register_mode_actions(self) -> None:
         self.mode_action_group = QActionGroup(self)
@@ -291,10 +323,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.active_workspace_label)
 
         layout.addStretch(1)
-        layout.addWidget(QLabel("Output"))
+        self.top_output_label = QLabel("Export Root")
+        layout.addWidget(self.top_output_label)
         self.top_output_edit = QLineEdit()
-        self.top_output_edit.setPlaceholderText("Output folder")
-        self.top_output_edit.setMinimumWidth(360)
+        self.top_output_edit.setPlaceholderText("Graph export folder")
+        self.top_output_edit.setMinimumWidth(240)
+        self.top_output_edit.setMaximumWidth(420)
         self.top_output_edit.textEdited.connect(self._apply_top_output_path)
         layout.addWidget(self.top_output_edit)
 
@@ -385,14 +419,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, "run_batch_button"):
             self.run_batch_button.setVisible(is_batch)
             self.export_graph_button.setVisible(not is_batch)
+            self.top_output_label.setVisible(not is_batch)
+            self.top_output_edit.setVisible(not is_batch)
         if hasattr(self, "assets_dock"):
             if is_batch:
                 self.assets_dock.hide()
                 self.node_properties_dock.hide()
-                self.inspector_dock.hide()
+                self.inspector_dock.show()
+                self.inspector_dock.raise_()
             else:
                 self.assets_dock.show()
                 self.node_properties_dock.show()
+                self.inspector_dock.hide()
                 self.node_properties_dock.raise_()
 
         self.set_status("Batch Converter mode" if is_batch else "Graph Workbench mode")
@@ -696,6 +734,7 @@ class MainWindow(QMainWindow):
     def _render_queue(self) -> None:
         table = self.queue_panel.table
         selected_key = self._selected_queue_key()
+        self.queue_panel.drop_hint.setVisible(not self._queue_items)
         table.setRowCount(len(self._queue_items))
 
         for row, item in enumerate(self._queue_items):
