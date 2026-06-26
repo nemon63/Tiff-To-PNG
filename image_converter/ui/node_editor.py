@@ -1280,17 +1280,36 @@ class NodePropertiesPanel(QWidget):
         spin.valueChanged.connect(self._apply_changes)
         return spin
 
-    def _make_byte_slider_pair(self, initial: int = 0) -> tuple[QSlider, QSpinBox]:
+    def _make_int_spin(self, minimum: int, maximum: int, *, suffix: str = "") -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setKeyboardTracking(False)
+        if suffix:
+            spin.setSuffix(suffix)
+        spin.valueChanged.connect(self._apply_changes)
+        return spin
+
+    def _make_slider_spin_pair(
+        self,
+        minimum: int,
+        maximum: int,
+        *,
+        initial: int = 0,
+        suffix: str = "",
+    ) -> tuple[QSlider, QSpinBox]:
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(0, 255)
+        slider.setRange(minimum, maximum)
         slider.setValue(initial)
         slider.valueChanged.connect(self._apply_changes)
 
-        spin = self._make_byte_spin()
+        spin = self._make_int_spin(minimum, maximum, suffix=suffix)
         spin.setValue(initial)
         slider.valueChanged.connect(spin.setValue)
         spin.valueChanged.connect(slider.setValue)
         return slider, spin
+
+    def _make_byte_slider_pair(self, initial: int = 0) -> tuple[QSlider, QSpinBox]:
+        return self._make_slider_spin_pair(0, 255, initial=initial)
 
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
@@ -1357,11 +1376,9 @@ class NodePropertiesPanel(QWidget):
         self.texture_data_role_combo.currentIndexChanged.connect(self._apply_changes)
         self.form.addRow("Data Role", self.texture_data_role_combo)
 
-        self.value_spin = QSpinBox()
-        self.value_spin.setRange(0, 255)
-        self.value_spin.setKeyboardTracking(False)
-        self.value_spin.valueChanged.connect(self._apply_changes)
-        self.form.addRow("Value", self.value_spin)
+        self.value_slider, self.value_spin = self._make_byte_slider_pair(initial=255)
+        self.value_host = self._byte_row_widget(self.value_slider, self.value_spin)
+        self.form.addRow("Value", self.value_host)
 
         self.level_black_slider, self.level_black_spin = self._make_byte_slider_pair()
         self.level_black_host = self._byte_row_widget(self.level_black_slider, self.level_black_spin)
@@ -1406,12 +1423,14 @@ class NodePropertiesPanel(QWidget):
             self.blend_mode_combo.addItem(label, value)
         self.blend_mode_combo.currentIndexChanged.connect(self._apply_changes)
         self.form.addRow("Blend Mode", self.blend_mode_combo)
-        self.blend_opacity_spin = QSpinBox()
-        self.blend_opacity_spin.setRange(0, 100)
-        self.blend_opacity_spin.setKeyboardTracking(False)
-        self.blend_opacity_spin.setSuffix("%")
-        self.blend_opacity_spin.valueChanged.connect(self._apply_changes)
-        self.form.addRow("Opacity", self.blend_opacity_spin)
+        self.blend_opacity_slider, self.blend_opacity_spin = self._make_slider_spin_pair(
+            0,
+            100,
+            initial=100,
+            suffix="%",
+        )
+        self.blend_opacity_host = self._byte_row_widget(self.blend_opacity_slider, self.blend_opacity_spin)
+        self.form.addRow("Opacity", self.blend_opacity_host)
 
         self.filename_edit = QLineEdit()
         self.filename_edit.setPlaceholderText("packed_rgba.png")
@@ -1519,6 +1538,7 @@ class NodePropertiesPanel(QWidget):
             self.blend_opacity_spin.setValue(self._coerce_int(node.properties.get("opacity"), 100))
             self.filename_edit.setText(str(node.properties.get("filename", "packed.png")))
             self.output_path_edit.setText(str(node.properties.get("output_path", "")))
+            self._update_output_format_hint()
             self._set_combo_value(
                 self.output_profile_combo,
                 str(node.properties.get("profile", OutputProfile.GENERIC_RGBA.value)),
@@ -1535,7 +1555,7 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.path_host, node_type is NodeType.TEXTURE_INPUT)
         self._set_row_visible(self.texture_color_space_combo, node_type is NodeType.TEXTURE_INPUT)
         self._set_row_visible(self.texture_data_role_combo, node_type is NodeType.TEXTURE_INPUT)
-        self._set_row_visible(self.value_spin, node_type is NodeType.CONSTANT_CHANNEL)
+        self._set_row_visible(self.value_host, node_type is NodeType.CONSTANT_CHANNEL)
         self._set_row_visible(self.level_black_host, node_type is NodeType.LEVELS_CHANNEL)
         self._set_row_visible(self.level_white_host, node_type is NodeType.LEVELS_CHANNEL)
         self._set_row_visible(self.level_gamma_spin, node_type is NodeType.LEVELS_CHANNEL)
@@ -1545,7 +1565,7 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.clamp_max_host, node_type is NodeType.CLAMP_CHANNEL)
         self._set_row_visible(self.threshold_host, node_type is NodeType.THRESHOLD_CHANNEL)
         self._set_row_visible(self.blend_mode_combo, node_type is NodeType.BLEND_CHANNEL)
-        self._set_row_visible(self.blend_opacity_spin, node_type is NodeType.BLEND_CHANNEL)
+        self._set_row_visible(self.blend_opacity_host, node_type is NodeType.BLEND_CHANNEL)
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_path_host, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_profile_combo, node_type is NodeType.OUTPUT_RGBA)
@@ -1608,6 +1628,7 @@ class NodePropertiesPanel(QWidget):
         raw_path = self.output_path_edit.text().strip()
         if raw_path:
             self._sync_output_name_from_output_path(Path(raw_path))
+        self._update_output_format_hint()
         self._apply_changes()
 
     def _sync_output_name_from_output_path(self, path: Path) -> None:
@@ -1616,6 +1637,7 @@ class NodePropertiesPanel(QWidget):
         filename = path.name.strip()
         if filename and self.filename_edit.text().strip() != filename:
             self.filename_edit.setText(filename)
+        self._update_output_format_hint()
 
     def _sync_output_path_from_output_name(self, filename: str) -> None:
         if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
@@ -1624,12 +1646,37 @@ class NodePropertiesPanel(QWidget):
         current_output = self.output_path_edit.text().strip()
         if not current_output:
             self.output_path_edit.setText(filename)
+            self._update_output_format_hint()
             return
 
         output_path = Path(current_output)
         updated_path = output_path.with_name(filename)
         if str(updated_path) != current_output:
             self.output_path_edit.setText(str(updated_path))
+        self._update_output_format_hint()
+
+    def _update_output_format_hint(self) -> None:
+        if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
+            self.filename_edit.setPlaceholderText("packed_rgba.png")
+            self.filename_edit.setToolTip("Output filename inside Export Folder. Add an extension to choose format.")
+            self.output_path_edit.setToolTip(
+                "Optional override output file path. Relative paths resolve inside Export Folder."
+            )
+            return
+
+        filename = self.filename_edit.text().strip()
+        output_path = self.output_path_edit.text().strip()
+        suffix = Path(filename).suffix or Path(output_path).suffix or ".png"
+        format_hint = suffix.lower()
+        self.filename_edit.setPlaceholderText(f"packed_rgba{format_hint}")
+        self.filename_edit.setToolTip(
+            f"Output filename inside Export Folder. Current format: {format_hint}. "
+            "Change the extension to choose another format."
+        )
+        self.output_path_edit.setToolTip(
+            f"Optional override output file path. Relative paths resolve inside Export Folder. "
+            f"Current format: {format_hint}."
+        )
 
     def _reset_parameters(self) -> None:
         if self._node is None or not node_has_resettable_parameters(self._node.node_type):

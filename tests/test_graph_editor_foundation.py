@@ -541,6 +541,68 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertEqual("graph_output_1.tga", output.properties["filename"])
         self.assertEqual(Path("exports") / "graph_output_1.tga", Path(output.properties["output_path"]))
 
+    def test_constant_value_uses_slider_and_spinbox_pair(self) -> None:
+        constant = create_graph_node(
+            NodeType.CONSTANT_CHANNEL,
+            properties={"value": 96},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [constant],
+            ),
+            select_node_ids=[constant.node_id],
+        )
+        self.workspace.properties_panel.set_node(constant)
+
+        self.workspace.properties_panel.value_slider.setValue(144)
+
+        self.assertEqual(144, self.workspace.properties_panel.value_spin.value())
+        self.assertEqual(144, constant.properties["value"])
+
+    def test_blend_opacity_uses_slider_and_spinbox_pair(self) -> None:
+        blend = create_graph_node(
+            NodeType.BLEND_CHANNEL,
+            properties={"opacity": 65},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [blend],
+            ),
+            select_node_ids=[blend.node_id],
+        )
+        self.workspace.properties_panel.set_node(blend)
+
+        self.workspace.properties_panel.blend_opacity_slider.setValue(42)
+
+        self.assertEqual(42, self.workspace.properties_panel.blend_opacity_spin.value())
+        self.assertEqual(42, blend.properties["opacity"])
+
+    def test_output_fields_show_current_format_hint(self) -> None:
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={
+                "filename": "graph_output_1.tga",
+                "output_path": "exports/graph_output_1.tga",
+            },
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+        self.workspace.properties_panel.set_node(output)
+
+        self.assertIn(".tga", self.workspace.properties_panel.filename_edit.toolTip())
+        self.assertIn(".tga", self.workspace.properties_panel.output_path_edit.toolTip())
+        self.assertEqual("packed_rgba.tga", self.workspace.properties_panel.filename_edit.placeholderText())
+
     def test_clear_output_inputs_is_undoable(self) -> None:
         constant = create_graph_node(NodeType.CONSTANT_CHANNEL)
         output = create_graph_node(NodeType.OUTPUT_RGBA)
