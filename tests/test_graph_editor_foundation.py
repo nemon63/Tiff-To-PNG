@@ -13,7 +13,15 @@ from PIL import Image
 from PyQt6.QtCore import QEventLoop, QTimer
 from PyQt6.QtWidgets import QApplication
 
-from image_converter.domain.models import AppSettings, ConversionOptions
+from image_converter.domain.models import (
+    AppSettings,
+    AssetKind,
+    AssetMetadata,
+    BatchSource,
+    ConversionOptions,
+    QueueItem,
+    TextureMapType,
+)
 from image_converter.domain.node_graph import (
     GraphConnection,
     NodeGraph,
@@ -314,15 +322,92 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertEqual("graph", window._workspace_mode)
             self.assertIs(window.workspace_stack.currentWidget(), window.graph_workspace)
             self.assertTrue(window.run_batch_button.isHidden())
-            self.assertFalse(window.export_graph_button.isHidden())
+            self.assertTrue(window.export_graph_button.isHidden())
             self.assertFalse(window.top_output_edit.isHidden())
             self.assertFalse(window.assets_dock.isHidden())
-            self.assertFalse(window.node_properties_dock.isHidden())
+            self.assertTrue(window.node_properties_dock.isHidden())
             self.assertTrue(window.inspector_dock.isHidden())
+            self.assertFalse(window.graph_workspace.export_button.isHidden())
         finally:
             window.setParent(None)
             window.deleteLater()
             self.app.processEvents()
+
+    def test_graph_asset_browser_can_remove_selected_assets(self) -> None:
+        window = MainWindow()
+        try:
+            metadata = AssetMetadata(
+                format_name="PNG",
+                width=4,
+                height=4,
+                mode="RGBA",
+                has_alpha=True,
+                file_size_bytes=64,
+                map_type=TextureMapType.BASECOLOR,
+            )
+            items = [
+                QueueItem(BatchSource(Path("albedo.png")), AssetKind.IMAGE, metadata),
+                QueueItem(BatchSource(Path("normal.png")), AssetKind.IMAGE, metadata),
+            ]
+            window.add_queue_items(items)
+
+            window.asset_table.selectRow(0)
+            window._remove_selected_assets()
+
+            self.assertEqual(1, len(window._queue_items))
+            self.assertEqual("normal.png", window._queue_items[0].path.name)
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_graph_output_path_keeps_explicit_non_png_suffix(self) -> None:
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"output_path": "exports/maskmap.tif"},
+        )
+
+        destinations = NodeGraphExecutor().resolve_output_paths(
+            NodeGraph(nodes=[output]),
+            Path("C:/graph_exports"),
+        )
+
+        self.assertEqual(1, len(destinations))
+        self.assertEqual(Path("C:/graph_exports/exports/maskmap.tif"), destinations[0])
+
+    def test_graph_export_can_write_jpeg(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "source.png"
+            Image.new("RGBA", (4, 4), (24, 96, 180, 255)).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path)},
+            )
+            output = create_graph_node(
+                NodeType.OUTPUT_RGBA,
+                properties={"filename": "packed_mask.jpg"},
+            )
+            graph = NodeGraph(
+                nodes=[texture, output],
+                connections=[
+                    GraphConnection(make_connection_id(), texture.node_id, "r", output.node_id, "r"),
+                    GraphConnection(make_connection_id(), texture.node_id, "g", output.node_id, "g"),
+                    GraphConnection(make_connection_id(), texture.node_id, "b", output.node_id, "b"),
+                    GraphConnection(make_connection_id(), texture.node_id, "a", output.node_id, "a"),
+                ],
+            )
+            summary = NodeGraphExecutor().export_enabled_outputs(
+                NodeGraphProject(graph=graph),
+                Path(tmp),
+                ConversionOptions(overwrite=True),
+            )
+
+            self.assertEqual(1, summary.succeeded)
+            destination = Path(tmp) / "packed_mask.jpg"
+            self.assertTrue(destination.exists())
+            with Image.open(destination) as exported:
+                self.assertEqual("JPEG", exported.format)
+                self.assertEqual("RGB", exported.mode)
 
     def test_output_profile_connects_detected_texture_nodes(self) -> None:
         ao = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "mat_ao.png"})

@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QMimeData, QSize, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPixmap
+from PyQt6.QtCore import QByteArray, QItemSelectionModel, QMimeData, QSize, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QDrag,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QKeySequence,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDockWidget,
@@ -62,6 +74,7 @@ from image_converter.ui.settings_panel import SettingsPanel
 
 class AssetTableWidget(QTableWidget):
     asset_dropped = pyqtSignal(str)
+    remove_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -83,6 +96,13 @@ class AssetTableWidget(QTableWidget):
         drag.setMimeData(mime_data)
         drag.exec(Qt.DropAction.CopyAction)
 
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Delete:
+            self.remove_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
 
 class MainWindow(QMainWindow):
     convert_requested = pyqtSignal()
@@ -96,6 +116,7 @@ class MainWindow(QMainWindow):
         self._preset_repository: PresetRepository | None = None
         self._presets_by_id: dict[str, ConversionPreset] = {}
         self._workspace_mode = WORKSPACE_GRAPH
+        self._graph_node_properties_visible = False
         self.setWindowTitle("Texture Pipeline Workbench")
         self.resize(1280, 820)
         self.setMinimumSize(720, 480)
@@ -180,10 +201,14 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
         self.tabifyDockWidget(self.node_properties_dock, self.inspector_dock)
         self.tabifyDockWidget(self.inspector_dock, self.preview_dock)
-        self.node_properties_dock.raise_()
+        self.node_properties_dock.visibilityChanged.connect(self._on_node_properties_visibility_changed)
+        self.node_properties_shortcut = QShortcut(QKeySequence("P"), self)
+        self.node_properties_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.node_properties_shortcut.activated.connect(self._show_node_properties_dock)
 
         self._register_mode_actions()
         self._register_view_docks()
+        self.node_properties_dock.hide()
         self.inspector_dock.hide()
         self.preview_dock.hide()
         self.log_dock.hide()
@@ -323,12 +348,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.active_workspace_label)
 
         layout.addStretch(1)
-        self.top_output_label = QLabel("Export Root")
+        self.top_output_label = QLabel("Export Folder")
+        self.top_output_label.setToolTip(
+            "Base folder for graph export. Relative Output File values resolve inside this folder."
+        )
         layout.addWidget(self.top_output_label)
         self.top_output_edit = QLineEdit()
-        self.top_output_edit.setPlaceholderText("Graph export folder")
+        self.top_output_edit.setPlaceholderText("Base folder for graph exports")
         self.top_output_edit.setMinimumWidth(240)
         self.top_output_edit.setMaximumWidth(420)
+        self.top_output_edit.setToolTip(
+            "Base folder for graph export. Relative Output File values resolve inside this folder."
+        )
         self.top_output_edit.textEdited.connect(self._apply_top_output_path)
         layout.addWidget(self.top_output_edit)
 
@@ -339,6 +370,7 @@ class MainWindow(QMainWindow):
 
         self.export_graph_button = QPushButton("Export Graph")
         self.export_graph_button.clicked.connect(self._export_graph)
+        self.export_graph_button.hide()
         layout.addWidget(self.export_graph_button)
 
         self.toolbar_status_label = QLabel("Ready")
@@ -367,6 +399,10 @@ class MainWindow(QMainWindow):
         reload_asset = QPushButton("Reload")
         reload_asset.clicked.connect(self._reload_selected_asset)
         buttons.addWidget(reload_asset)
+        self.remove_asset_button = QPushButton("Remove")
+        self.remove_asset_button.setObjectName("DangerButton")
+        self.remove_asset_button.clicked.connect(self._remove_selected_assets)
+        buttons.addWidget(self.remove_asset_button)
         layout.addLayout(buttons)
 
         self.asset_filter_edit = QLineEdit()
@@ -378,11 +414,13 @@ class MainWindow(QMainWindow):
         self.asset_table.setColumnCount(4)
         self.asset_table.setHorizontalHeaderLabels(("", "Name", "Type", "Res"))
         self.asset_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.asset_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.asset_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.asset_table.verticalHeader().setVisible(False)
         self.asset_table.horizontalHeader().setStretchLastSection(True)
         self.asset_table.setIconSize(QSize(42, 42))
         self.asset_table.itemDoubleClicked.connect(self._preview_selected_asset)
+        self.asset_table.remove_requested.connect(self._remove_selected_assets)
         layout.addWidget(self.asset_table, 1)
 
         hint = QLabel("Drag an asset into Graph. Double-click opens Preview.")
@@ -418,20 +456,24 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "run_batch_button"):
             self.run_batch_button.setVisible(is_batch)
-            self.export_graph_button.setVisible(not is_batch)
+            self.export_graph_button.setVisible(False)
             self.top_output_label.setVisible(not is_batch)
             self.top_output_edit.setVisible(not is_batch)
         if hasattr(self, "assets_dock"):
             if is_batch:
                 self.assets_dock.hide()
+                self._graph_node_properties_visible = not self.node_properties_dock.isHidden()
                 self.node_properties_dock.hide()
                 self.inspector_dock.show()
                 self.inspector_dock.raise_()
             else:
                 self.assets_dock.show()
-                self.node_properties_dock.show()
                 self.inspector_dock.hide()
-                self.node_properties_dock.raise_()
+                if self._graph_node_properties_visible:
+                    self.node_properties_dock.show()
+                    self.node_properties_dock.raise_()
+                else:
+                    self.node_properties_dock.hide()
 
         self.set_status("Batch Converter mode" if is_batch else "Graph Workbench mode")
 
@@ -440,6 +482,7 @@ class MainWindow(QMainWindow):
 
     def _render_asset_browser(self) -> None:
         table = self.asset_table
+        selected_keys = set(self._selected_asset_keys())
         filter_text = self.asset_filter_edit.text().strip().casefold() if hasattr(self, "asset_filter_edit") else ""
         self._asset_rows = [
             item
@@ -467,6 +510,7 @@ class MainWindow(QMainWindow):
                     if icon is not None:
                         table_item.setIcon(icon)
                 table.setItem(row, column, table_item)
+        self._restore_asset_selection(selected_keys)
         self.graph_workspace.set_assets(list(self._queue_items))
 
     def _add_selected_asset_to_graph(self, *_args: object) -> None:
@@ -484,10 +528,32 @@ class MainWindow(QMainWindow):
         self.preview_dock.raise_()
 
     def _reload_selected_asset(self) -> None:
-        item = self._selected_asset_item()
-        if item is None:
+        items = self._selected_asset_items()
+        if not items:
             return
-        self.queue_paths_received.emit([str(item.path)])
+        paths = [item.path for item in items]
+        preview_item = self.preview_panel.current_queue_item()
+        preview_key = self._queue_key(preview_item.path) if preview_item is not None else None
+        reloaded_keys = {self._queue_key(path) for path in paths}
+        self.queue_paths_received.emit([str(path) for path in paths])
+        self.graph_workspace.refresh_asset_paths(paths)
+        if preview_key in reloaded_keys:
+            refreshed_item = next(
+                (
+                    queue_item
+                    for queue_item in self._queue_items
+                    if self._queue_key(queue_item.path) == preview_key
+                ),
+                None,
+            )
+            if refreshed_item is not None:
+                self.preview_panel.set_queue_item(refreshed_item)
+        self.set_status(f"Reloaded assets: {len(paths)}")
+
+    def _remove_selected_assets(self) -> None:
+        removed_count = self._remove_queue_items_by_keys(set(self._selected_asset_keys()))
+        if removed_count:
+            self.set_status(f"Удалено ассетов: {removed_count}")
 
     def _asset_thumbnail_icon(self, item: QueueItem) -> QIcon | None:
         if not item.path.exists():
@@ -509,14 +575,56 @@ class MainWindow(QMainWindow):
         self.preview_dock.show()
         self.preview_dock.raise_()
 
+    def _show_node_properties_dock(self) -> None:
+        if self._workspace_mode != WORKSPACE_GRAPH:
+            return
+        self._graph_node_properties_visible = True
+        self.node_properties_dock.show()
+        self.node_properties_dock.raise_()
+
+    def _on_node_properties_visibility_changed(self, visible: bool) -> None:
+        if self._workspace_mode == WORKSPACE_GRAPH:
+            self._graph_node_properties_visible = visible
+
+    def _selected_asset_items(self) -> list[QueueItem]:
+        selection_model = self.asset_table.selectionModel()
+        if selection_model is None:
+            return []
+        selected_rows = sorted({index.row() for index in selection_model.selectedRows()})
+        return [
+            self._asset_rows[row]
+            for row in selected_rows
+            if row < len(self._asset_rows)
+        ]
+
     def _selected_asset_item(self) -> QueueItem | None:
-        selected_rows = self.asset_table.selectionModel().selectedRows()
-        if not selected_rows:
-            return None
-        row = selected_rows[0].row()
-        if row >= len(self._asset_rows):
-            return None
-        return self._asset_rows[row]
+        items = self._selected_asset_items()
+        return items[0] if items else None
+
+    def _selected_asset_keys(self) -> list[str]:
+        return [self._queue_key(item.path) for item in self._selected_asset_items()]
+
+    def _restore_asset_selection(self, keys: set[str]) -> None:
+        if not keys:
+            return
+        selection_model = self.asset_table.selectionModel()
+        if selection_model is None:
+            return
+        first_row = None
+        selection_model.clearSelection()
+        for row, item in enumerate(self._asset_rows):
+            if self._queue_key(item.path) not in keys:
+                continue
+            model_index = self.asset_table.model().index(row, 0)
+            selection_model.select(
+                model_index,
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+            if first_row is None:
+                first_row = row
+        if first_row is not None:
+            self.asset_table.setCurrentCell(first_row, 0)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _extract_local_paths(event):
@@ -572,21 +680,18 @@ class MainWindow(QMainWindow):
         self._sync_workspace_selection()
 
     def remove_selected_queue_items(self) -> None:
-        selected_rows = sorted(
-            {index.row() for index in self.queue_panel.table.selectionModel().selectedRows()},
-            reverse=True,
-        )
-        if not selected_rows:
+        selection_model = self.queue_panel.table.selectionModel()
+        if selection_model is None:
             return
-
-        for row in selected_rows:
-            self._queue_items.pop(row)
-
-        self._render_queue()
-        self._render_asset_browser()
-        self._refresh_packing_preflight()
-        self._sync_workspace_selection()
-        self.set_status(f"Удалено элементов: {len(selected_rows)}")
+        selected_rows = {index.row() for index in selection_model.selectedRows()}
+        selected_keys = {
+            self._queue_key(self._queue_items[row].path)
+            for row in selected_rows
+            if row < len(self._queue_items)
+        }
+        removed_count = self._remove_queue_items_by_keys(selected_keys)
+        if removed_count:
+            self.set_status(f"Удалено элементов: {removed_count}")
 
     def clear_queue_items(self) -> None:
         self._queue_items.clear()
@@ -636,6 +741,9 @@ class MainWindow(QMainWindow):
         self.queue_panel.set_controls_enabled(not running)
         self.run_batch_button.setEnabled(not running)
         self.export_graph_button.setEnabled(not running)
+        self.graph_workspace.export_button.setEnabled(not running)
+        self.asset_table.setEnabled(not running)
+        self.remove_asset_button.setEnabled(not running)
 
     def append_log(self, line: str) -> None:
         self.log_panel.append_line(line)
@@ -1048,11 +1156,36 @@ class MainWindow(QMainWindow):
                 output_root = self.graph_workspace.project_dir / "exports"
             else:
                 output_root = Path.cwd() / "graph_exports"
+        export_options = request.options
+        existing_paths = [
+            path
+            for path in self.graph_workspace.export_destinations(output_root)
+            if path.exists()
+        ]
+        if existing_paths and not request.options.overwrite:
+            preview_lines = "\n".join(f"- {path.name}" for path in existing_paths[:5])
+            if len(existing_paths) > 5:
+                preview_lines += f"\n... и еще {len(existing_paths) - 5}"
+            button = QMessageBox.question(
+                self,
+                "Перезаписать export-файлы",
+                (
+                    f"Найдено существующих файлов: {len(existing_paths)}.\n"
+                    f"{preview_lines}\n\n"
+                    "Перезаписать их и продолжить export?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if button is not QMessageBox.StandardButton.Yes:
+                self.set_status("Graph export canceled.")
+                return
+            export_options = replace(request.options, overwrite=True)
 
         self.append_log("---- Graph export ----")
         summary = self.graph_workspace.export_graph(
             output_root,
-            request.options,
+            export_options,
             self.append_log,
         )
         self.append_log(summary.as_text())
@@ -1075,6 +1208,24 @@ class MainWindow(QMainWindow):
         if row >= len(self._queue_items):
             return None
         return self._queue_items[row]
+
+    def _remove_queue_items_by_keys(self, keys: set[str]) -> int:
+        if not keys:
+            return 0
+        before_count = len(self._queue_items)
+        self._queue_items = [
+            item
+            for item in self._queue_items
+            if self._queue_key(item.path) not in keys
+        ]
+        removed_count = before_count - len(self._queue_items)
+        if not removed_count:
+            return 0
+        self._render_queue()
+        self._render_asset_browser()
+        self._refresh_packing_preflight()
+        self._sync_workspace_selection()
+        return removed_count
 
     def _selected_queue_key(self) -> str | None:
         item = self._selected_queue_item()

@@ -191,6 +191,15 @@ PACKED_SOURCE_CHANNELS = {
         TextureMapType.AO: ("b", False),
     },
 }
+GRAPH_EXPORT_FILE_FILTER = (
+    "PNG (*.png);;"
+    "JPEG (*.jpg *.jpeg);;"
+    "WebP (*.webp);;"
+    "TIFF (*.tif *.tiff);;"
+    "BMP (*.bmp);;"
+    "TGA (*.tga);;"
+    "All files (*)"
+)
 
 
 @dataclass(slots=True)
@@ -1385,11 +1394,18 @@ class NodePropertiesPanel(QWidget):
         self.form.addRow("Opacity", self.blend_opacity_spin)
 
         self.filename_edit = QLineEdit()
+        self.filename_edit.setPlaceholderText("packed_rgba.png")
+        self.filename_edit.setToolTip("Output filename inside Export Folder. Add an extension to choose format.")
         self.filename_edit.editingFinished.connect(self._apply_changes)
-        self.form.addRow("Filename", self.filename_edit)
+        self.form.addRow("Output Name", self.filename_edit)
 
         self.output_path_edit = QLineEdit()
-        self.output_path_edit.setPlaceholderText("Optional full output PNG path")
+        self.output_path_edit.setPlaceholderText(
+            "Optional override file path. Relative paths resolve inside Export Folder."
+        )
+        self.output_path_edit.setToolTip(
+            "Optional override output file path. Relative paths resolve inside Export Folder."
+        )
         self.output_path_edit.editingFinished.connect(self._apply_changes)
         self.output_path_button = QPushButton("...")
         self.output_path_button.clicked.connect(self._browse_output_path)
@@ -1399,7 +1415,7 @@ class NodePropertiesPanel(QWidget):
         output_path_row.addWidget(self.output_path_button)
         self.output_path_host = QWidget()
         self.output_path_host.setLayout(output_path_row)
-        self.form.addRow("Output Path", self.output_path_host)
+        self.form.addRow("Output File", self.output_path_host)
 
         self.output_profile_combo = QComboBox()
         for label, value in (
@@ -1537,9 +1553,9 @@ class NodePropertiesPanel(QWidget):
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Select output PNG",
+            "Select output file",
             self.output_path_edit.text().strip() or self.filename_edit.text().strip(),
-            "PNG (*.png)",
+            GRAPH_EXPORT_FILE_FILTER,
         )
         if path:
             self.output_path_edit.setText(path)
@@ -1649,6 +1665,8 @@ class GraphWorkspace(QWidget):
         self._assets: list[QueueItem] = []
         self._clipboard_nodes: list[GraphNode] = []
         self._clipboard_connections: list[GraphConnection] = []
+        self._last_preview_node_id: str | None = None
+        self._last_preview_mode_label = ""
         self._preview_generation = 0
         self._preview_threads: list[QThread] = []
         self._preview_workers: list[GraphPreviewWorker] = []
@@ -1836,6 +1854,33 @@ class GraphWorkspace(QWidget):
     def set_assets(self, items: list[QueueItem]) -> None:
         self._assets = [item for item in items if item.metadata is not None]
 
+    def refresh_asset_paths(self, paths: Iterable[Path]) -> None:
+        changed_keys = {
+            self._path_key(path)
+            for path in paths
+            if str(path).strip()
+        }
+        if not changed_keys:
+            return
+
+        selected_ids = self._scene.selected_node_ids()
+        if not selected_ids and self.properties_panel._node is not None:
+            selected_ids = [self.properties_panel._node.node_id]
+
+        self._preview_generation += 1
+        self._preview_cache.clear()
+        self._scene.rebuild()
+        if selected_ids:
+            self._scene.select_node_ids(selected_ids)
+        self._refresh_validation()
+        self.properties_panel.set_node(self._scene.selected_node())
+        self._refresh_properties_profile_summary()
+        if not self._refresh_last_preview_request():
+            self._preview_active_display_node()
+
+    def export_destinations(self, output_root: Path) -> list[Path]:
+        return self._executor.resolve_output_paths(self.project.graph, output_root)
+
     def apply_recent_projects(self, paths: Iterable[str]) -> None:
         self._recent_project_dirs = []
         for raw_path in paths:
@@ -1850,6 +1895,8 @@ class GraphWorkspace(QWidget):
     def new_project(self) -> None:
         self.project = NodeGraphProject()
         self.project_dir = None
+        self._last_preview_node_id = None
+        self._last_preview_mode_label = ""
         self._preview_generation += 1
         self._preview_cache.clear()
         self.undo_stack.clear()
@@ -1907,6 +1954,8 @@ class GraphWorkspace(QWidget):
             return
         self.project_dir = bundle_dir
         self._remember_recent_project(bundle_dir)
+        self._last_preview_node_id = None
+        self._last_preview_mode_label = ""
         self._preview_generation += 1
         self._preview_cache.clear()
         self.undo_stack.clear()
@@ -3190,6 +3239,8 @@ class GraphWorkspace(QWidget):
         self._request_preview_node(node, mode_label=mode)
 
     def _request_preview_node(self, node: GraphNode, *, mode_label: str = "") -> None:
+        self._last_preview_node_id = node.node_id
+        self._last_preview_mode_label = mode_label
         self._preview_generation += 1
         generation = self._preview_generation
         snapshot = deepcopy(self.project)
@@ -3224,6 +3275,24 @@ class GraphWorkspace(QWidget):
         thread.finished.connect(lambda current=worker: self._forget_preview_worker(current))
         thread.start()
         self.status_message.emit(f"{node.title}: rendering preview...")
+
+    def _refresh_last_preview_request(self) -> bool:
+        if not self._last_preview_node_id:
+            return False
+        node = next(
+            (
+                graph_node
+                for graph_node in self.project.graph.nodes
+                if graph_node.node_id == self._last_preview_node_id
+            ),
+            None,
+        )
+        if node is None:
+            self._last_preview_node_id = None
+            self._last_preview_mode_label = ""
+            return False
+        self._request_preview_node(node, mode_label=self._last_preview_mode_label)
+        return True
 
     def _on_preview_worker_finished(
         self,

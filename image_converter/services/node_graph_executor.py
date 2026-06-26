@@ -106,6 +106,17 @@ class NodeGraphPreviewCache:
 
 
 class NodeGraphExecutor:
+    _EXPORT_FORMATS = {
+        ".png": "PNG",
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".webp": "WEBP",
+        ".tif": "TIFF",
+        ".tiff": "TIFF",
+        ".bmp": "BMP",
+        ".tga": "TGA",
+    }
+
     def render_display_node(
         self,
         graph: NodeGraph,
@@ -324,6 +335,12 @@ class NodeGraphExecutor:
 
         return GraphExportSummary(results=results)
 
+    def resolve_output_paths(self, graph: NodeGraph, output_root: Path) -> list[Path]:
+        return [
+            self._build_output_path(node, output_root)
+            for node in self._enabled_output_nodes(graph)
+        ]
+
     def _export_output_node(
         self,
         graph: NodeGraph,
@@ -362,12 +379,7 @@ class NodeGraphExecutor:
 
         merged = self._compose_output_image(graph, output_node, target_size)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        merged.save(
-            destination,
-            format="PNG",
-            optimize=options.optimize,
-            compress_level=options.compress_level,
-        )
+        self._save_output_image(merged, destination, options)
         return GraphExportResult(
             output_node_id=output_node.node_id,
             output_name=output_node.title,
@@ -1029,15 +1041,45 @@ class NodeGraphExecutor:
             destination = Path(raw_output_path)
             if not destination.is_absolute():
                 destination = output_root / destination
-            if destination.suffix.lower() != ".png":
+            if not destination.suffix:
                 destination = destination.with_suffix(".png")
             return destination
 
         raw_filename = str(node.properties.get("filename", "")).strip() or f"{node.title}.png"
         destination = output_root / raw_filename
-        if destination.suffix.lower() != ".png":
+        if not destination.suffix:
             destination = destination.with_suffix(".png")
         return destination
+
+    def _save_output_image(
+        self,
+        image: Image.Image,
+        destination: Path,
+        options: ConversionOptions,
+    ) -> None:
+        export_format = self._export_format_for_path(destination)
+        save_kwargs: dict[str, object] = {"format": export_format}
+        output_image = image
+
+        if export_format == "PNG":
+            save_kwargs["optimize"] = options.optimize
+            save_kwargs["compress_level"] = options.compress_level
+        elif export_format == "JPEG":
+            output_image = image.convert("RGB")
+            save_kwargs["quality"] = 95
+            save_kwargs["subsampling"] = 0
+
+        output_image.save(destination, **save_kwargs)
+
+    def _export_format_for_path(self, destination: Path) -> str:
+        export_format = self._EXPORT_FORMATS.get(destination.suffix.lower())
+        if export_format:
+            return export_format
+        supported = ", ".join(sorted(self._EXPORT_FORMATS))
+        raise GraphExecutionError(
+            f"unsupported export format '{destination.suffix or '<none>'}'. "
+            f"Supported formats: {supported}"
+        )
 
     @staticmethod
     def _enabled_output_nodes(graph: NodeGraph) -> list[GraphNode]:

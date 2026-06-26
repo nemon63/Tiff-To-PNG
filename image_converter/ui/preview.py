@@ -388,6 +388,9 @@ class PreviewPanel(QWidget):
     def set_selected_channel(self, channel: PreviewChannel) -> None:
         self._set_selected_channel(channel)
 
+    def current_queue_item(self) -> QueueItem | None:
+        return self._current_item
+
     def set_queue_item(self, item: QueueItem | None) -> None:
         previous_path = self._current_item.path if self._current_item is not None else None
         next_path = item.path if item is not None else None
