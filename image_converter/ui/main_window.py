@@ -570,8 +570,9 @@ class MainWindow(QMainWindow):
             )
         )
 
-    def _show_graph_preview(self, image, title: str, meta: str) -> None:
-        self.preview_panel.set_graph_preview(image, title, meta)
+    def _show_graph_preview(self, image, title: str, meta: str, node_id: str) -> None:
+        preserve_zoom = self.preview_panel.current_graph_preview_node_id() == node_id
+        self.preview_panel.set_graph_preview(image, title, meta, node_id=node_id, preserve_zoom=preserve_zoom)
         self.preview_dock.show()
         self.preview_dock.raise_()
 

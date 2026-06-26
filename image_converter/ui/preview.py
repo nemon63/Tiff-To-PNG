@@ -299,6 +299,7 @@ class PreviewPanel(QWidget):
         self._graph_preview_image: Image.Image | None = None
         self._graph_preview_title = ""
         self._graph_preview_meta = ""
+        self._graph_preview_node_id = ""
         self._selected_channel = PreviewChannel.COMPOSITE
         self._channel_buttons: dict[PreviewChannel, QToolButton] = {}
         self._allow_detach = allow_detach
@@ -391,11 +392,15 @@ class PreviewPanel(QWidget):
     def current_queue_item(self) -> QueueItem | None:
         return self._current_item
 
+    def current_graph_preview_node_id(self) -> str:
+        return self._graph_preview_node_id
+
     def set_queue_item(self, item: QueueItem | None) -> None:
         previous_path = self._current_item.path if self._current_item is not None else None
         next_path = item.path if item is not None else None
         self._current_item = item
         self._graph_preview_image = None
+        self._graph_preview_node_id = ""
         self._rebuild_channels(item)
         if previous_path != next_path:
             self.preview_canvas.reset_zoom()
@@ -403,14 +408,23 @@ class PreviewPanel(QWidget):
         if self._allow_detach and self._detached_window is not None:
             self._detached_window.set_queue_item(item)
 
-    def set_graph_preview(self, image, title: str, meta: str) -> None:
+    def set_graph_preview(
+        self,
+        image,
+        title: str,
+        meta: str,
+        *,
+        node_id: str = "",
+        preserve_zoom: bool = False,
+    ) -> None:
         self._current_item = None
         self._graph_preview_image = image.convert("RGBA").copy()
         self._graph_preview_title = title
         self._graph_preview_meta = meta
+        self._graph_preview_node_id = node_id
         self._selected_channel = PreviewChannel.COMPOSITE
         self._sync_channel_buttons(self._graph_preview_channels())
-        self._refresh_graph_preview(preserve_zoom=False)
+        self._refresh_graph_preview(preserve_zoom=preserve_zoom)
 
     def _refresh_graph_preview(self, *, preserve_zoom: bool = True) -> None:
         image = self._graph_preview_image

@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMenu,
     QPushButton,
+    QSlider,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -214,7 +215,7 @@ class OutputProfilePlan:
 
 
 class GraphPreviewWorker(QObject):
-    finished = pyqtSignal(int, object, str, str)
+    finished = pyqtSignal(int, object, str, str, str)
     failed = pyqtSignal(int, str, str)
     completed = pyqtSignal()
 
@@ -249,7 +250,7 @@ class GraphPreviewWorker(QObject):
                     filename = Path(str(self._node.properties.get("output_path"))).name
                 suffix = f" · {filename}" if filename else ""
                 meta = f"Output preview · {image.width}x{image.height} · {self._mode_label}{suffix}"
-            self.finished.emit(self._generation, image, self._node.title, meta)
+            self.finished.emit(self._generation, image, self._node.title, meta, self._node.node_id)
         except (GraphExecutionError, OSError, ValueError) as exc:
             self.failed.emit(self._generation, self._node.title, str(exc))
         finally:
@@ -1279,6 +1280,18 @@ class NodePropertiesPanel(QWidget):
         spin.valueChanged.connect(self._apply_changes)
         return spin
 
+    def _make_byte_slider_pair(self, initial: int = 0) -> tuple[QSlider, QSpinBox]:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 255)
+        slider.setValue(initial)
+        slider.valueChanged.connect(self._apply_changes)
+
+        spin = self._make_byte_spin()
+        spin.setValue(initial)
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        return slider, spin
+
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
         layout = QVBoxLayout(self)
@@ -1350,10 +1363,12 @@ class NodePropertiesPanel(QWidget):
         self.value_spin.valueChanged.connect(self._apply_changes)
         self.form.addRow("Value", self.value_spin)
 
-        self.level_black_spin = self._make_byte_spin()
-        self.form.addRow("Black", self.level_black_spin)
-        self.level_white_spin = self._make_byte_spin()
-        self.form.addRow("White", self.level_white_spin)
+        self.level_black_slider, self.level_black_spin = self._make_byte_slider_pair()
+        self.level_black_host = self._byte_row_widget(self.level_black_slider, self.level_black_spin)
+        self.form.addRow("Black", self.level_black_host)
+        self.level_white_slider, self.level_white_spin = self._make_byte_slider_pair()
+        self.level_white_host = self._byte_row_widget(self.level_white_slider, self.level_white_spin)
+        self.form.addRow("White", self.level_white_host)
         self.level_gamma_spin = QDoubleSpinBox()
         self.level_gamma_spin.setRange(0.05, 8.0)
         self.level_gamma_spin.setSingleStep(0.05)
@@ -1361,18 +1376,23 @@ class NodePropertiesPanel(QWidget):
         self.level_gamma_spin.setKeyboardTracking(False)
         self.level_gamma_spin.valueChanged.connect(self._apply_changes)
         self.form.addRow("Gamma", self.level_gamma_spin)
-        self.level_out_min_spin = self._make_byte_spin()
-        self.form.addRow("Output Min", self.level_out_min_spin)
-        self.level_out_max_spin = self._make_byte_spin()
-        self.form.addRow("Output Max", self.level_out_max_spin)
+        self.level_out_min_slider, self.level_out_min_spin = self._make_byte_slider_pair()
+        self.level_out_min_host = self._byte_row_widget(self.level_out_min_slider, self.level_out_min_spin)
+        self.form.addRow("Output Min", self.level_out_min_host)
+        self.level_out_max_slider, self.level_out_max_spin = self._make_byte_slider_pair()
+        self.level_out_max_host = self._byte_row_widget(self.level_out_max_slider, self.level_out_max_spin)
+        self.form.addRow("Output Max", self.level_out_max_host)
 
-        self.clamp_min_spin = self._make_byte_spin()
-        self.form.addRow("Min", self.clamp_min_spin)
-        self.clamp_max_spin = self._make_byte_spin()
-        self.form.addRow("Max", self.clamp_max_spin)
+        self.clamp_min_slider, self.clamp_min_spin = self._make_byte_slider_pair()
+        self.clamp_min_host = self._byte_row_widget(self.clamp_min_slider, self.clamp_min_spin)
+        self.form.addRow("Min", self.clamp_min_host)
+        self.clamp_max_slider, self.clamp_max_spin = self._make_byte_slider_pair()
+        self.clamp_max_host = self._byte_row_widget(self.clamp_max_slider, self.clamp_max_spin)
+        self.form.addRow("Max", self.clamp_max_host)
 
-        self.threshold_spin = self._make_byte_spin()
-        self.form.addRow("Threshold", self.threshold_spin)
+        self.threshold_slider, self.threshold_spin = self._make_byte_slider_pair()
+        self.threshold_host = self._byte_row_widget(self.threshold_slider, self.threshold_spin)
+        self.form.addRow("Threshold", self.threshold_host)
 
         self.blend_mode_combo = QComboBox()
         for label, value in (
@@ -1396,7 +1416,7 @@ class NodePropertiesPanel(QWidget):
         self.filename_edit = QLineEdit()
         self.filename_edit.setPlaceholderText("packed_rgba.png")
         self.filename_edit.setToolTip("Output filename inside Export Folder. Add an extension to choose format.")
-        self.filename_edit.editingFinished.connect(self._apply_changes)
+        self.filename_edit.editingFinished.connect(self._on_output_name_finished)
         self.form.addRow("Output Name", self.filename_edit)
 
         self.output_path_edit = QLineEdit()
@@ -1406,7 +1426,7 @@ class NodePropertiesPanel(QWidget):
         self.output_path_edit.setToolTip(
             "Optional override output file path. Relative paths resolve inside Export Folder."
         )
-        self.output_path_edit.editingFinished.connect(self._apply_changes)
+        self.output_path_edit.editingFinished.connect(self._on_output_path_finished)
         self.output_path_button = QPushButton("...")
         self.output_path_button.clicked.connect(self._browse_output_path)
         output_path_row = QHBoxLayout()
@@ -1516,14 +1536,14 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.texture_color_space_combo, node_type is NodeType.TEXTURE_INPUT)
         self._set_row_visible(self.texture_data_role_combo, node_type is NodeType.TEXTURE_INPUT)
         self._set_row_visible(self.value_spin, node_type is NodeType.CONSTANT_CHANNEL)
-        self._set_row_visible(self.level_black_spin, node_type is NodeType.LEVELS_CHANNEL)
-        self._set_row_visible(self.level_white_spin, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.level_black_host, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.level_white_host, node_type is NodeType.LEVELS_CHANNEL)
         self._set_row_visible(self.level_gamma_spin, node_type is NodeType.LEVELS_CHANNEL)
-        self._set_row_visible(self.level_out_min_spin, node_type is NodeType.LEVELS_CHANNEL)
-        self._set_row_visible(self.level_out_max_spin, node_type is NodeType.LEVELS_CHANNEL)
-        self._set_row_visible(self.clamp_min_spin, node_type is NodeType.CLAMP_CHANNEL)
-        self._set_row_visible(self.clamp_max_spin, node_type is NodeType.CLAMP_CHANNEL)
-        self._set_row_visible(self.threshold_spin, node_type is NodeType.THRESHOLD_CHANNEL)
+        self._set_row_visible(self.level_out_min_host, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.level_out_max_host, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.clamp_min_host, node_type is NodeType.CLAMP_CHANNEL)
+        self._set_row_visible(self.clamp_max_host, node_type is NodeType.CLAMP_CHANNEL)
+        self._set_row_visible(self.threshold_host, node_type is NodeType.THRESHOLD_CHANNEL)
         self._set_row_visible(self.blend_mode_combo, node_type is NodeType.BLEND_CHANNEL)
         self._set_row_visible(self.blend_opacity_spin, node_type is NodeType.BLEND_CHANNEL)
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
@@ -1539,6 +1559,17 @@ class NodePropertiesPanel(QWidget):
         label = self.form.labelForField(widget)
         if label is not None:
             label.setVisible(visible)
+
+    @staticmethod
+    def _byte_row_widget(slider: QSlider, spin: QSpinBox) -> QWidget:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        host = QWidget()
+        host.setLayout(row)
+        return host
 
     def _browse_texture(self) -> None:
         if self._node is None:
@@ -1558,8 +1589,47 @@ class NodePropertiesPanel(QWidget):
             GRAPH_EXPORT_FILE_FILTER,
         )
         if path:
-            self.output_path_edit.setText(path)
+            selected_path = Path(path)
+            self.output_path_edit.setText(str(selected_path))
+            self._sync_output_name_from_output_path(selected_path)
             self._apply_changes()
+
+    def _on_output_name_finished(self) -> None:
+        if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
+            self._apply_changes()
+            return
+        self._sync_output_path_from_output_name(self.filename_edit.text().strip())
+        self._apply_changes()
+
+    def _on_output_path_finished(self) -> None:
+        if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
+            self._apply_changes()
+            return
+        raw_path = self.output_path_edit.text().strip()
+        if raw_path:
+            self._sync_output_name_from_output_path(Path(raw_path))
+        self._apply_changes()
+
+    def _sync_output_name_from_output_path(self, path: Path) -> None:
+        if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
+            return
+        filename = path.name.strip()
+        if filename and self.filename_edit.text().strip() != filename:
+            self.filename_edit.setText(filename)
+
+    def _sync_output_path_from_output_name(self, filename: str) -> None:
+        if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
+            return
+        filename = filename.strip() or "packed.png"
+        current_output = self.output_path_edit.text().strip()
+        if not current_output:
+            self.output_path_edit.setText(filename)
+            return
+
+        output_path = Path(current_output)
+        updated_path = output_path.with_name(filename)
+        if str(updated_path) != current_output:
+            self.output_path_edit.setText(str(updated_path))
 
     def _reset_parameters(self) -> None:
         if self._node is None or not node_has_resettable_parameters(self._node.node_type):
@@ -1615,8 +1685,10 @@ class NodePropertiesPanel(QWidget):
             next_properties["mode"] = str(self.blend_mode_combo.currentData() or "multiply")
             next_properties["opacity"] = self.blend_opacity_spin.value()
         elif self._node.node_type is NodeType.OUTPUT_RGBA:
-            next_properties["filename"] = self.filename_edit.text().strip() or "packed.png"
-            next_properties["output_path"] = self.output_path_edit.text().strip()
+            filename_text = self.filename_edit.text().strip() or "packed.png"
+            output_path_text = self.output_path_edit.text().strip()
+            next_properties["filename"] = filename_text
+            next_properties["output_path"] = output_path_text or filename_text
             next_properties["profile"] = str(
                 self.output_profile_combo.currentData()
                 or OutputProfile.GENERIC_RGBA.value
@@ -1655,7 +1727,7 @@ class NodePropertiesPanel(QWidget):
 
 class GraphWorkspace(QWidget):
     export_requested = pyqtSignal()
-    preview_image_requested = pyqtSignal(object, str, str)
+    preview_image_requested = pyqtSignal(object, str, str, str)
     status_message = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None):
@@ -3300,10 +3372,11 @@ class GraphWorkspace(QWidget):
         image: object,
         title: str,
         meta: str,
+        node_id: str,
     ) -> None:
         if generation != self._preview_generation:
             return
-        self.preview_image_requested.emit(image, title, meta)
+        self.preview_image_requested.emit(image, title, meta, node_id)
 
     def _on_preview_worker_failed(self, generation: int, title: str, message: str) -> None:
         if generation != self._preview_generation:

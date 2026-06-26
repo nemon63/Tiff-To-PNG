@@ -41,6 +41,7 @@ from image_converter.services.settings import AppSettingsRepository
 from image_converter.ui.graph_commands import AddNodesCommand, ReplaceInputConnectionCommand
 from image_converter.ui.main_window import MainWindow
 from image_converter.ui.node_editor import GraphNodeItem, GraphWorkspace
+from image_converter.ui.preview import PreviewPanel
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -492,6 +493,54 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertIn("A <- anglerfish_diff.png.A", summary)
         self.assertEqual("Auto Connect Profile", self.workspace.properties_panel.apply_profile_button.text())
 
+    def test_output_file_selection_syncs_output_name(self) -> None:
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={
+                "filename": "graph_output_1.png",
+                "output_path": "exports/graph_output_1.png",
+            },
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+        self.workspace.properties_panel.set_node(output)
+        self.workspace.properties_panel.output_path_edit.setText("D:/temp/graph_output_1.tga")
+        self.workspace.properties_panel._on_output_path_finished()
+
+        self.assertEqual("graph_output_1.tga", self.workspace.properties_panel.filename_edit.text())
+        self.assertEqual("D:/temp/graph_output_1.tga", self.workspace.properties_panel.output_path_edit.text())
+        self.assertEqual("graph_output_1.tga", output.properties["filename"])
+        self.assertEqual("D:/temp/graph_output_1.tga", output.properties["output_path"])
+
+    def test_output_name_with_extension_updates_output_path_extension(self) -> None:
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={
+                "filename": "graph_output_1.png",
+                "output_path": "exports/graph_output_1.png",
+            },
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+        self.workspace.properties_panel.set_node(output)
+        self.workspace.properties_panel.filename_edit.setText("graph_output_1.tga")
+        self.workspace.properties_panel._on_output_name_finished()
+
+        self.assertEqual("graph_output_1.tga", output.properties["filename"])
+        self.assertEqual(Path("exports") / "graph_output_1.tga", Path(output.properties["output_path"]))
+
     def test_clear_output_inputs_is_undoable(self) -> None:
         constant = create_graph_node(NodeType.CONSTANT_CHANNEL)
         output = create_graph_node(NodeType.OUTPUT_RGBA)
@@ -609,6 +658,16 @@ class GraphEditorFoundationTests(unittest.TestCase):
         loop.exec()
         self.assertTrue(received)
         self.assertEqual(constant.title, received[-1][1])
+
+    def test_graph_preview_preserves_zoom_for_same_node_refresh(self) -> None:
+        panel = PreviewPanel(allow_detach=False)
+        image = Image.new("RGBA", (8, 8), (24, 96, 180, 255))
+        panel.set_graph_preview(image, "Output 1", "meta", node_id="node-1", preserve_zoom=False)
+        panel.preview_canvas.change_zoom(3)
+
+        panel.set_graph_preview(image, "Output 1", "meta", node_id="node-1", preserve_zoom=True)
+
+        self.assertGreater(panel.preview_canvas._zoom_factor, 1.0)
 
     def test_deleted_undo_stack_does_not_break_dirty_state_label(self) -> None:
         self.workspace.undo_stack.deleteLater()
