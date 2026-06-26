@@ -19,6 +19,7 @@ from image_converter.domain.models import (
     AssetMetadata,
     BatchSource,
     ConversionOptions,
+    PreviewChannel,
     QueueItem,
     TextureMapType,
 )
@@ -229,6 +230,34 @@ class GraphEditorFoundationTests(unittest.TestCase):
 
         self.assertEqual(260, item.rect().width())
         self.assertLessEqual(item.rect().height(), 150)
+
+    def test_texture_node_refresh_updates_thumbnail_in_place(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "albedo.png"
+            Image.new("RGBA", (8, 8), (255, 0, 0, 255)).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                title="albedo",
+                properties={"path": str(texture_path)},
+            )
+            self.workspace._push_graph_command(
+                AddNodesCommand(
+                    self.workspace.project.graph,
+                    self.workspace._on_graph_command_changed,
+                    [texture],
+                ),
+                select_node_ids=[texture.node_id],
+            )
+            item = self.workspace._scene.node_items[texture.node_id]
+            thumbnail_before = item.thumbnail_item.pixmap().toImage()
+            self.assertEqual(255, thumbnail_before.pixelColor(0, 0).red())
+
+            Image.new("RGBA", (8, 8), (0, 255, 0, 255)).save(texture_path)
+            self.workspace.refresh_asset_paths([texture_path])
+
+            thumbnail_after = item.thumbnail_item.pixmap().toImage()
+            self.assertEqual(0, thumbnail_after.pixelColor(0, 0).red())
+            self.assertEqual(255, thumbnail_after.pixelColor(0, 0).green())
 
     def test_texture_display_flag_renders_composite_color_preview(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -541,6 +570,29 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertEqual("graph_output_1.tga", output.properties["filename"])
         self.assertEqual(Path("exports") / "graph_output_1.tga", Path(output.properties["output_path"]))
 
+    def test_output_name_without_explicit_output_file_keeps_output_path_empty(self) -> None:
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={
+                "filename": "graph_output_1.png",
+                "output_path": "",
+            },
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+        self.workspace.properties_panel.set_node(output)
+        self.workspace.properties_panel.filename_edit.setText("graph_output_1.tga")
+        self.workspace.properties_panel._on_output_name_finished()
+
+        self.assertEqual("graph_output_1.tga", output.properties["filename"])
+        self.assertEqual("", output.properties["output_path"])
+
     def test_constant_value_uses_slider_and_spinbox_pair(self) -> None:
         constant = create_graph_node(
             NodeType.CONSTANT_CHANNEL,
@@ -730,6 +782,26 @@ class GraphEditorFoundationTests(unittest.TestCase):
         panel.set_graph_preview(image, "Output 1", "meta", node_id="node-1", preserve_zoom=True)
 
         self.assertGreater(panel.preview_canvas._zoom_factor, 1.0)
+
+    def test_graph_preview_preserves_selected_channel_for_same_node_refresh(self) -> None:
+        panel = PreviewPanel(allow_detach=False)
+        image = Image.new("RGBA", (8, 8), (24, 96, 180, 255))
+        panel.set_graph_preview(image, "Output 1", "meta", node_id="node-1", preserve_zoom=False)
+        panel.set_selected_channel(PreviewChannel.RED)
+
+        panel.set_graph_preview(image, "Output 1", "meta", node_id="node-1", preserve_zoom=True)
+
+        self.assertEqual(PreviewChannel.RED, panel._selected_channel)
+
+    def test_graph_preview_resets_selected_channel_for_different_node(self) -> None:
+        panel = PreviewPanel(allow_detach=False)
+        image = Image.new("RGBA", (8, 8), (24, 96, 180, 255))
+        panel.set_graph_preview(image, "Output 1", "meta", node_id="node-1", preserve_zoom=False)
+        panel.set_selected_channel(PreviewChannel.RED)
+
+        panel.set_graph_preview(image, "Output 2", "meta", node_id="node-2", preserve_zoom=False)
+
+        self.assertEqual(PreviewChannel.COMPOSITE, panel._selected_channel)
 
     def test_deleted_undo_stack_does_not_break_dirty_state_label(self) -> None:
         self.workspace.undo_stack.deleteLater()

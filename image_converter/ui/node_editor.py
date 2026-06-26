@@ -348,7 +348,15 @@ class GraphNodeItem(QGraphicsRectItem):
         super().__init__()
         self.node = node
         self.node_width = TEXTURE_NODE_WIDTH if node.node_type is NodeType.TEXTURE_INPUT else NODE_WIDTH
+        self.title_item: QGraphicsSimpleTextItem | None = None
+        self.subtitle_item: QGraphicsSimpleTextItem | None = None
+        self.path_label_item: QGraphicsSimpleTextItem | None = None
+        self.metadata_line_item: QGraphicsSimpleTextItem | None = None
+        self.size_line_item: QGraphicsSimpleTextItem | None = None
+        self.thumbnail_bg_item: QGraphicsRectItem | None = None
+        self.thumbnail_item: QGraphicsPixmapItem | None = None
         self.port_items: dict[str, PortItem] = {}
+        self.port_label_items: dict[str, QGraphicsSimpleTextItem] = {}
         self.display_flag_item: QGraphicsRectItem | None = None
         self.display_flag_label: QGraphicsSimpleTextItem | None = None
         self.enable_flag_item: QGraphicsRectItem | None = None
@@ -379,10 +387,10 @@ class GraphNodeItem(QGraphicsRectItem):
         title_bg.setPen(QPen(Qt.PenStyle.NoPen))
         title_bg.setBrush(QColor("#2F3741"))
 
-        title = QGraphicsSimpleTextItem(self._elide_text(self.node.title, self._title_max_chars()), self)
-        title.setBrush(QColor("#E4EAF1"))
-        title.setPos(10, 6)
-        title.setToolTip(self.node.title)
+        self.title_item = QGraphicsSimpleTextItem(self._elide_text(self.node.title, self._title_max_chars()), self)
+        self.title_item.setBrush(QColor("#E4EAF1"))
+        self.title_item.setPos(10, 6)
+        self.title_item.setToolTip(self.node.title)
 
         self._build_flag_items()
 
@@ -394,42 +402,42 @@ class GraphNodeItem(QGraphicsRectItem):
                 TEXTURE_THUMBNAIL_SIZE,
                 TEXTURE_THUMBNAIL_SIZE,
             )
-            thumbnail_bg = QGraphicsRectItem(thumbnail_rect, self)
-            thumbnail_bg.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            thumbnail_bg.setPen(QPen(QColor("#303946"), 1.0))
-            thumbnail_bg.setBrush(QColor("#111820"))
-            thumbnail = self._build_thumbnail()
+            self.thumbnail_bg_item = QGraphicsRectItem(thumbnail_rect, self)
+            self.thumbnail_bg_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.thumbnail_bg_item.setPen(QPen(QColor("#303946"), 1.0))
+            self.thumbnail_bg_item.setBrush(QColor("#111820"))
+            self.thumbnail_item = QGraphicsPixmapItem(self)
+            self.thumbnail_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.thumbnail_item.setVisible(False)
+            thumbnail = self._thumbnail_pixmap()
             if thumbnail is not None:
-                thumbnail.setParentItem(self)
-                thumbnail.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                thumbnail.setPos(
-                    thumbnail_rect.x() + (TEXTURE_THUMBNAIL_SIZE - thumbnail.pixmap().width()) / 2,
-                    thumbnail_rect.y() + (TEXTURE_THUMBNAIL_SIZE - thumbnail.pixmap().height()) / 2,
-                )
+                self.thumbnail_item.setPixmap(thumbnail)
+                self.thumbnail_item.setVisible(True)
+                self._position_thumbnail_item()
             path_text = Path(str(self.node.properties.get("path", ""))).name or "no texture"
-            path_label = QGraphicsSimpleTextItem(self._elide_text(path_text, 16), self)
-            path_label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            path_label.setFont(self._pixel_font(9))
-            path_label.setBrush(QColor("#D6DEE8"))
-            path_label.setPos(TEXTURE_META_X, TITLE_HEIGHT + 15)
-            path_label.setToolTip(str(self.node.properties.get("path", "")) or path_text)
-            metadata_line = QGraphicsSimpleTextItem(self._texture_metadata_line(), self)
-            metadata_line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            metadata_line.setFont(self._pixel_font(8))
-            metadata_line.setBrush(QColor("#8EA0B2"))
-            metadata_line.setPos(TEXTURE_META_X, TITLE_HEIGHT + 35)
+            self.path_label_item = QGraphicsSimpleTextItem(self._elide_text(path_text, 16), self)
+            self.path_label_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.path_label_item.setFont(self._pixel_font(9))
+            self.path_label_item.setBrush(QColor("#D6DEE8"))
+            self.path_label_item.setPos(TEXTURE_META_X, TITLE_HEIGHT + 15)
+            self.path_label_item.setToolTip(str(self.node.properties.get("path", "")) or path_text)
+            self.metadata_line_item = QGraphicsSimpleTextItem(self._texture_metadata_line(), self)
+            self.metadata_line_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.metadata_line_item.setFont(self._pixel_font(8))
+            self.metadata_line_item.setBrush(QColor("#8EA0B2"))
+            self.metadata_line_item.setPos(TEXTURE_META_X, TITLE_HEIGHT + 35)
             size_line_text = self._texture_size_line()
-            if size_line_text:
-                size_line = QGraphicsSimpleTextItem(size_line_text, self)
-                size_line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                size_line.setFont(self._pixel_font(8))
-                size_line.setBrush(QColor("#667484"))
-                size_line.setPos(TEXTURE_META_X, TITLE_HEIGHT + 55)
+            self.size_line_item = QGraphicsSimpleTextItem(size_line_text, self)
+            self.size_line_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.size_line_item.setFont(self._pixel_font(8))
+            self.size_line_item.setBrush(QColor("#667484"))
+            self.size_line_item.setPos(TEXTURE_META_X, TITLE_HEIGHT + 55)
+            self.size_line_item.setVisible(bool(size_line_text))
             y_offset = TEXTURE_PORT_CENTER_Y - 10
         else:
-            subtitle = QGraphicsSimpleTextItem(self.node.node_type.value, self)
-            subtitle.setBrush(QColor("#8E9AA8"))
-            subtitle.setPos(10, TITLE_HEIGHT + 6)
+            self.subtitle_item = QGraphicsSimpleTextItem(self.node.node_type.value, self)
+            self.subtitle_item.setBrush(QColor("#8E9AA8"))
+            self.subtitle_item.setPos(10, TITLE_HEIGHT + 6)
 
         inputs = [socket for socket in socket_definitions(self.node.node_type) if socket.direction is SocketDirection.INPUT]
         outputs = [socket for socket in socket_definitions(self.node.node_type) if socket.direction is SocketDirection.OUTPUT]
@@ -441,6 +449,7 @@ class GraphNodeItem(QGraphicsRectItem):
             label = QGraphicsSimpleTextItem(socket.name, self)
             label.setBrush(QColor("#C9D2DD"))
             label.setPos(14, y)
+            self.port_label_items[socket.socket_id] = label
 
         for index, socket in enumerate(outputs):
             spacing = TEXTURE_PORT_SPACING if self.node.node_type is NodeType.TEXTURE_INPUT else ROW_HEIGHT
@@ -457,8 +466,9 @@ class GraphNodeItem(QGraphicsRectItem):
                 else self.node_width - 28
             )
             label.setPos(label_x, y)
+            self.port_label_items[socket.socket_id] = label
 
-    def _build_thumbnail(self) -> QGraphicsPixmapItem | None:
+    def _thumbnail_pixmap(self) -> QPixmap | None:
         path = Path(str(self.node.properties.get("path", "")))
         if not path.exists():
             return None
@@ -479,8 +489,7 @@ class GraphNodeItem(QGraphicsRectItem):
             rgba.width * 4,
             QImage.Format.Format_RGBA8888,
         ).copy()
-        pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(qimage))
-        return pixmap_item
+        return QPixmap.fromImage(qimage)
 
     def _title_max_chars(self) -> int:
         return 28 if self.node.node_type is NodeType.TEXTURE_INPUT else 22
@@ -618,6 +627,48 @@ class GraphNodeItem(QGraphicsRectItem):
                 render_enabled,
                 QColor("#34A853"),
             )
+
+    def refresh_content(self) -> None:
+        if self.title_item is not None:
+            self.title_item.setText(self._elide_text(self.node.title, self._title_max_chars()))
+            self.title_item.setToolTip(self.node.title)
+
+        if self.node.node_type is NodeType.TEXTURE_INPUT:
+            if self.path_label_item is not None:
+                path_text = Path(str(self.node.properties.get("path", ""))).name or "no texture"
+                self.path_label_item.setText(self._elide_text(path_text, 16))
+                self.path_label_item.setToolTip(str(self.node.properties.get("path", "")) or path_text)
+            if self.metadata_line_item is not None:
+                self.metadata_line_item.setText(self._texture_metadata_line())
+            if self.size_line_item is not None:
+                size_line_text = self._texture_size_line()
+                self.size_line_item.setText(size_line_text)
+                self.size_line_item.setVisible(bool(size_line_text))
+            if self.thumbnail_item is not None:
+                thumbnail = self._thumbnail_pixmap()
+                if thumbnail is None:
+                    self.thumbnail_item.setVisible(False)
+                    self.thumbnail_item.setPixmap(QPixmap())
+                else:
+                    self.thumbnail_item.setPixmap(thumbnail)
+                    self.thumbnail_item.setVisible(True)
+                    self._position_thumbnail_item()
+            for socket_id, label_item in self.port_label_items.items():
+                label_item.setBrush(self._socket_label_color(socket_id))
+        elif self.subtitle_item is not None:
+            self.subtitle_item.setText(self.node.node_type.value)
+
+        self.refresh_flags()
+        self.update()
+
+    def _position_thumbnail_item(self) -> None:
+        if self.thumbnail_item is None or self.thumbnail_item.pixmap().isNull():
+            return
+        pixmap = self.thumbnail_item.pixmap()
+        self.thumbnail_item.setPos(
+            TEXTURE_THUMBNAIL_X + (TEXTURE_THUMBNAIL_SIZE - pixmap.width()) / 2,
+            TEXTURE_THUMBNAIL_Y + (TEXTURE_THUMBNAIL_SIZE - pixmap.height()) / 2,
+        )
 
     def _sync_flag_item(
         self,
@@ -1645,7 +1696,7 @@ class NodePropertiesPanel(QWidget):
         filename = filename.strip() or "packed.png"
         current_output = self.output_path_edit.text().strip()
         if not current_output:
-            self.output_path_edit.setText(filename)
+            self.output_path_edit.clear()
             self._update_output_format_hint()
             return
 
@@ -1660,7 +1711,7 @@ class NodePropertiesPanel(QWidget):
             self.filename_edit.setPlaceholderText("packed_rgba.png")
             self.filename_edit.setToolTip("Output filename inside Export Folder. Add an extension to choose format.")
             self.output_path_edit.setToolTip(
-                "Optional override output file path. Relative paths resolve inside Export Folder."
+                "Optional explicit output file path. Leave empty to export into Export Folder using Output Name."
             )
             return
 
@@ -1674,7 +1725,8 @@ class NodePropertiesPanel(QWidget):
             "Change the extension to choose another format."
         )
         self.output_path_edit.setToolTip(
-            f"Optional override output file path. Relative paths resolve inside Export Folder. "
+            f"Optional explicit output file path. Relative paths resolve inside Export Folder. "
+            "Leave empty to use Output Name. "
             f"Current format: {format_hint}."
         )
 
@@ -1735,7 +1787,7 @@ class NodePropertiesPanel(QWidget):
             filename_text = self.filename_edit.text().strip() or "packed.png"
             output_path_text = self.output_path_edit.text().strip()
             next_properties["filename"] = filename_text
-            next_properties["output_path"] = output_path_text or filename_text
+            next_properties["output_path"] = output_path_text
             next_properties["profile"] = str(
                 self.output_profile_combo.currentData()
                 or OutputProfile.GENERIC_RGBA.value
@@ -1986,9 +2038,24 @@ class GraphWorkspace(QWidget):
         if not selected_ids and self.properties_panel._node is not None:
             selected_ids = [self.properties_panel._node.node_id]
 
+        changed_node_ids = [
+            node.node_id
+            for node in self.project.graph.nodes
+            if node.node_type is NodeType.TEXTURE_INPUT
+            and self._path_key(Path(str(node.properties.get("path", "")))) in changed_keys
+        ]
+        if not changed_node_ids:
+            return
+
         self._preview_generation += 1
-        self._preview_cache.clear()
-        self._scene.rebuild()
+        for node_id in changed_node_ids:
+            self._preview_cache.invalidate_node_and_downstream(self.project.graph, node_id)
+
+        for node_id in changed_node_ids:
+            item = self._scene.node_items.get(node_id)
+            if item is not None:
+                item.refresh_content()
+
         if selected_ids:
             self._scene.select_node_ids(selected_ids)
         self._refresh_validation()

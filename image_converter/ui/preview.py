@@ -417,12 +417,14 @@ class PreviewPanel(QWidget):
         node_id: str = "",
         preserve_zoom: bool = False,
     ) -> None:
+        same_node = bool(node_id) and node_id == self._graph_preview_node_id
         self._current_item = None
         self._graph_preview_image = image.convert("RGBA").copy()
         self._graph_preview_title = title
         self._graph_preview_meta = meta
         self._graph_preview_node_id = node_id
-        self._selected_channel = PreviewChannel.COMPOSITE
+        if not same_node:
+            self._selected_channel = PreviewChannel.COMPOSITE
         self._sync_channel_buttons(self._graph_preview_channels())
         self._refresh_graph_preview(preserve_zoom=preserve_zoom)
 
