@@ -868,11 +868,12 @@ class GraphEditorFoundationTests(unittest.TestCase):
         summary = self.workspace._profile_summary_text(output)
 
         self.assertIn("Generic RGBA -> RGBA / packed_rgba.png", summary)
+        self.assertIn("Target pack: Standard RGBA texture.", summary)
         self.assertIn("R <- anglerfish_diff.png.R", summary)
         self.assertIn("G <- anglerfish_diff.png.G", summary)
         self.assertIn("B <- anglerfish_diff.png.B", summary)
         self.assertIn("A <- anglerfish_diff.png.A", summary)
-        self.assertEqual("Auto Connect Profile", self.workspace.properties_panel.apply_profile_button.text())
+        self.assertEqual("Build Auto-Connect Plan", self.workspace.properties_panel.apply_profile_button.text())
 
     def test_unity_urp_profile_summary_explains_metallic_smoothness_layout(self) -> None:
         roughness = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_rgh.png"})
@@ -893,7 +894,8 @@ class GraphEditorFoundationTests(unittest.TestCase):
         summary = self.workspace._profile_summary_text(output)
 
         self.assertIn("Unity URP Metallic/Smoothness -> RGBA / unity_urp_metallicsmoothness.png", summary)
-        self.assertIn("Uses Metallic/Smoothness layout. AO stays separate in URP.", summary)
+        self.assertIn("R = Metallic, G = 0, B = 0, A = Smoothness or Invert(Roughness).", summary)
+        self.assertIn("AO stays separate in the URP workflow.", summary)
         self.assertIn("R <- anglerfish_met.png.R", summary)
         self.assertIn("A <- Invert(anglerfish_rgh.png.R)", summary)
 
@@ -917,8 +919,64 @@ class GraphEditorFoundationTests(unittest.TestCase):
         summary = self.workspace._profile_summary_text(output)
 
         self.assertIn("Unity HDRP Mask Map -> RGBA / unity_hdrp_maskmap.png", summary)
-        self.assertIn("Uses HDRP Mask Map layout.", summary)
+        self.assertIn("R = Metallic, G = AO, B = Detail Mask, A = Smoothness or Invert(Roughness).", summary)
         self.assertIn("G <- anglerfish_ao.png.R", summary)
+
+    def test_apply_output_profile_autorenames_default_output_title_and_filename(self) -> None:
+        ao = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_ao.png"})
+        roughness = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_rgh.png"})
+        metallic = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_met.png"})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            title="Output 1",
+            properties={
+                "profile": OutputProfile.UNREAL_ORM.value,
+                "filename": "packed_rgba.png",
+            },
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [ao, roughness, metallic, output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+
+        self.workspace._apply_output_profile(output)
+
+        self.assertEqual("Unreal ORM", output.title)
+        self.assertEqual("unreal_orm.png", output.properties["filename"])
+        self.assertTrue(output.properties["title_auto_generated"])
+
+    def test_apply_output_profile_keeps_custom_output_title_and_filename(self) -> None:
+        ao = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_ao.png"})
+        roughness = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_rgh.png"})
+        metallic = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_met.png"})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            title="Sword Final Pack",
+            properties={
+                "profile": OutputProfile.UNREAL_ORM.value,
+                "filename": "sword_special.tga",
+            },
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [ao, roughness, metallic, output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+
+        self.workspace._apply_output_profile(output)
+
+        self.assertEqual("Sword Final Pack", output.title)
+        self.assertEqual("sword_special.tga", output.properties["filename"])
+
+    def test_find_missing_textures_button_uses_updated_label(self) -> None:
+        self.assertEqual("Find Missing Textures", self.workspace.remap_button.text())
 
     def test_output_file_selection_syncs_output_name(self) -> None:
         output = create_graph_node(

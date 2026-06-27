@@ -167,6 +167,39 @@ OUTPUT_PROFILE_SUMMARY_NOTES = {
     OutputProfile.UNITY_HDRP: "Uses HDRP Mask Map layout.",
     OutputProfile.UNREAL_ORM: "Uses ORM packing: AO / Roughness / Metallic.",
 }
+OUTPUT_PROFILE_DESCRIPTIONS = {
+    OutputProfile.GENERIC_RGBA: (
+        "Target pack: Standard RGBA texture.",
+        "Uses BaseColor first, then Emissive, then the first compatible texture.",
+        "Opacity uses a dedicated Opacity map when available, otherwise the source alpha channel.",
+    ),
+    OutputProfile.UNITY_URP: (
+        "Target pack: Unity URP Metallic/Smoothness.",
+        "R = Metallic, G = 0, B = 0, A = Smoothness or Invert(Roughness).",
+        "AO stays separate in the URP workflow.",
+    ),
+    OutputProfile.UNITY_HDRP: (
+        "Target pack: Unity HDRP Mask Map.",
+        "R = Metallic, G = AO, B = Detail Mask, A = Smoothness or Invert(Roughness).",
+        "Detail Mask falls back to white when there is no dedicated source.",
+    ),
+    OutputProfile.UNREAL_ORM: (
+        "Target pack: Unreal ORM.",
+        "R = AO, G = Roughness, B = Metallic.",
+        "If an HDRP Mask Map is detected, AO/Metallic are reused and Smoothness is inverted into Roughness.",
+    ),
+    OutputProfile.METAHUMAN_REPACK: (
+        "Target pack: MetaHuman Repack.",
+        "R = AO, G = Roughness, B = Metallic, A = Opacity.",
+    ),
+}
+OUTPUT_PROFILE_AUTO_TITLE = {
+    OutputProfile.GENERIC_RGBA: "Packed RGBA",
+    OutputProfile.UNITY_URP: "URP MetallicSmoothness",
+    OutputProfile.UNITY_HDRP: "HDRP Mask Map",
+    OutputProfile.UNREAL_ORM: "Unreal ORM",
+    OutputProfile.METAHUMAN_REPACK: "MetaHuman Repack",
+}
 DEFAULT_PROFILE_FILL = {
     TextureMapType.AO: 255,
     TextureMapType.ROUGHNESS: 255,
@@ -228,10 +261,14 @@ GRAPH_EXPORT_FILE_FILTER = (
 class OutputProfilePlan:
     profile: OutputProfile
     mode: OutputMode
+    output_title: str
     properties: dict
     utility_nodes: list[GraphNode]
     utility_connections: list[GraphConnection]
     output_connections: list[GraphConnection]
+    target_label: str
+    target_filename: str
+    description_lines: tuple[str, ...]
     summary_lines: tuple[str, ...]
 
 
@@ -1596,9 +1633,9 @@ class NodePropertiesPanel(QWidget):
         ):
             self.output_profile_combo.addItem(label, value)
         self.output_profile_combo.currentIndexChanged.connect(self._apply_changes)
-        self.form.addRow("Profile", self.output_profile_combo)
+        self.form.addRow("Target Pack", self.output_profile_combo)
 
-        self.apply_profile_button = QPushButton("Auto Connect Profile")
+        self.apply_profile_button = QPushButton("Build Auto-Connect Plan")
         self.apply_profile_button.clicked.connect(self._apply_output_profile)
         self.clear_output_inputs_button = QPushButton("Clear Inputs")
         self.clear_output_inputs_button.clicked.connect(self._clear_output_inputs)
@@ -2085,7 +2122,7 @@ class GraphWorkspace(QWidget):
         self.preview_quality_combo.setCurrentIndex(1)
         self.preview_quality_combo.currentIndexChanged.connect(self._set_preview_quality)
         tools_row.addWidget(self.preview_quality_combo)
-        self.remap_button = QPushButton("Remap Missing")
+        self.remap_button = QPushButton("Find Missing Textures")
         self.remap_button.clicked.connect(self.remap_missing_texture_paths)
         tools_row.addWidget(self.remap_button)
         tools_row.addStretch(1)
@@ -2347,9 +2384,9 @@ class GraphWorkspace(QWidget):
             )
         ]
         if not missing_nodes:
-            self.status_message.emit("No missing texture paths.")
+            self.status_message.emit("All texture paths are valid.")
             return
-        root = QFileDialog.getExistingDirectory(self, "Select folder to remap missing textures")
+        root = QFileDialog.getExistingDirectory(self, "Select folder to search for missing textures")
         if not root:
             return
         root_path = Path(root)
@@ -2911,7 +2948,7 @@ class GraphWorkspace(QWidget):
                     self.project.graph,
                     self._on_graph_command_changed,
                     node,
-                    title=node.title,
+                    title=plan.output_title,
                     properties=plan.properties,
                     text="Set output profile",
                     needs_rebuild=False,
@@ -2974,10 +3011,28 @@ class GraphWorkspace(QWidget):
     def _build_output_profile_plan(self, node: GraphNode) -> OutputProfilePlan:
         profile = self._output_profile(node)
         mode = OUTPUT_PROFILE_MODES.get(profile, OutputMode.RGBA)
+        target_label = OUTPUT_PROFILE_LABELS.get(profile, profile.value)
+        target_filename = OUTPUT_PROFILE_FILENAMES.get(profile, "packed_rgba.png")
+        current_filename = str(node.properties.get("filename", "")).strip()
+        current_output_path = str(node.properties.get("output_path", "")).strip()
         properties = dict(node.properties)
         properties["profile"] = profile.value
         properties["mode"] = mode.value
-        properties["filename"] = OUTPUT_PROFILE_FILENAMES.get(profile, "packed_rgba.png")
+
+        if self._should_autorename_output_title(node):
+            properties["title_auto_generated"] = True
+            node_title = self._auto_output_title(profile)
+        else:
+            properties["title_auto_generated"] = bool(node.properties.get("title_auto_generated", False))
+            node_title = node.title
+
+        auto_filename = self._auto_output_filename(profile, node)
+        if self._should_autorename_output_filename(node):
+            properties["filename"] = auto_filename
+            if current_output_path:
+                output_path = Path(current_output_path)
+                properties["output_path"] = str(output_path.with_name(auto_filename))
+        target_filename = str(properties.get("filename", target_filename))
 
         utility_nodes: list[GraphNode] = []
         utility_connections: list[GraphConnection] = []
@@ -3057,7 +3112,11 @@ class GraphWorkspace(QWidget):
         return OutputProfilePlan(
             profile=profile,
             mode=mode,
+            output_title=node_title,
             properties=properties,
+            target_label=target_label,
+            target_filename=target_filename,
+            description_lines=self._profile_description_lines(profile),
             utility_nodes=utility_nodes,
             utility_connections=utility_connections,
             output_connections=output_connections,
@@ -3077,12 +3136,8 @@ class GraphWorkspace(QWidget):
 
     def _profile_summary_text(self, node: GraphNode) -> str:
         plan = self._build_output_profile_plan(node)
-        profile_label = OUTPUT_PROFILE_LABELS.get(plan.profile, plan.profile.value)
-        filename = str(plan.properties.get("filename", "packed_rgba.png"))
-        lines = [f"{profile_label} -> {plan.mode.value.upper()} / {filename}"]
-        note = OUTPUT_PROFILE_SUMMARY_NOTES.get(plan.profile)
-        if note:
-            lines.append(note)
+        lines = [f"{plan.target_label} -> {plan.mode.value.upper()} / {plan.target_filename}"]
+        lines.extend(plan.description_lines)
         if any(connection.target_node_id == node.node_id for connection in self.project.graph.connections):
             lines.append("Existing input wires will be replaced.")
         if plan.summary_lines:
@@ -3092,11 +3147,10 @@ class GraphWorkspace(QWidget):
         return "\n".join(lines)
 
     def _profile_status_text(self, plan: OutputProfilePlan) -> str:
-        profile_label = OUTPUT_PROFILE_LABELS.get(plan.profile, plan.profile.value)
         mappings = "; ".join(plan.summary_lines)
         if len(mappings) > 180:
             mappings = f"{mappings[:177]}..."
-        return f"{profile_label}: {mappings}" if mappings else f"{profile_label}: no channel mappings."
+        return f"{plan.target_label}: {mappings}" if mappings else f"{plan.target_label}: no channel mappings."
 
     def _profile_plan_summary_lines(
         self,
@@ -3124,6 +3178,50 @@ class GraphWorkspace(QWidget):
             )
             lines.append(f"{connection.target_socket_id.upper()} <- {source_text}")
         return tuple(lines)
+
+    @staticmethod
+    def _profile_description_lines(profile: OutputProfile) -> tuple[str, ...]:
+        return OUTPUT_PROFILE_DESCRIPTIONS.get(profile, ())
+
+    def _auto_output_title(self, profile: OutputProfile) -> str:
+        return OUTPUT_PROFILE_AUTO_TITLE.get(profile, "Packed Output")
+
+    def _auto_output_filename(self, profile: OutputProfile, node: GraphNode) -> str:
+        current_name = str(node.properties.get("filename", "")).strip()
+        current_path = str(node.properties.get("output_path", "")).strip()
+        extension = ".png"
+        source_name = current_name or current_path
+        if source_name:
+            candidate_suffix = Path(source_name).suffix.lower()
+            if candidate_suffix:
+                extension = candidate_suffix
+        base_name = Path(OUTPUT_PROFILE_FILENAMES.get(profile, "packed_rgba.png")).stem
+        return f"{base_name}{extension}"
+
+    def _should_autorename_output_title(self, node: GraphNode) -> bool:
+        if bool(node.properties.get("title_auto_generated", False)):
+            return True
+        title = node.title.strip()
+        if not title:
+            return True
+        if title.lower().startswith("output "):
+            return True
+        return title == "Output"
+
+    def _should_autorename_output_filename(self, node: GraphNode) -> bool:
+        filename = str(node.properties.get("filename", "")).strip()
+        if not filename:
+            return True
+        default_names = {value.casefold() for value in OUTPUT_PROFILE_FILENAMES.values()}
+        if filename.casefold() in default_names:
+            return True
+        if filename.casefold().startswith("graph_output_"):
+            return True
+        if filename.casefold().startswith("output_"):
+            return True
+        if filename.casefold() in {"packed.png", "packed_rgba.png"}:
+            return True
+        return False
 
     def _profile_source_text(
         self,
