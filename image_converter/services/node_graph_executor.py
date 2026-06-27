@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageOps
@@ -26,6 +27,33 @@ from image_converter.services.image_loading import copy_first_frame_preserving_a
 from image_converter.services.pipeline import RESAMPLING_LANCZOS
 
 Logger = Callable[[str], None]
+
+
+@lru_cache(maxsize=1024)
+def _levels_lut(
+    black: int,
+    white: int,
+    gamma: float,
+    out_min: int,
+    out_max: int,
+) -> tuple[int, ...]:
+    scale = 1.0 / max(1, white - black)
+    lut = []
+    for value in range(256):
+        normalized = min(max((value - black) * scale, 0.0), 1.0)
+        adjusted = normalized ** (1.0 / gamma)
+        lut.append(round(out_min + adjusted * (out_max - out_min)))
+    return tuple(lut)
+
+
+@lru_cache(maxsize=512)
+def _clamp_lut(minimum: int, maximum: int) -> tuple[int, ...]:
+    return tuple(min(max(value, minimum), maximum) for value in range(256))
+
+
+@lru_cache(maxsize=256)
+def _threshold_lut(threshold: int) -> tuple[int, ...]:
+    return tuple(255 if value >= threshold else 0 for value in range(256))
 
 
 class GraphExecutionError(RuntimeError):
@@ -77,9 +105,15 @@ class NodeGraphPreviewCache:
     max_side: int = 1024
     fallback_size: tuple[int, int] = (256, 256)
     channels: dict[tuple[str, str, tuple[int, int]], Image.Image] = field(default_factory=dict)
+    texture_channels: dict[tuple[str, str], Image.Image] = field(default_factory=dict)
+    texture_preview_images: dict[str, Image.Image] = field(default_factory=dict)
+    texture_sizes: dict[str, tuple[int, int] | None] = field(default_factory=dict)
 
     def clear(self) -> None:
         self.channels.clear()
+        self.texture_channels.clear()
+        self.texture_preview_images.clear()
+        self.texture_sizes.clear()
 
     def invalidate_node_and_downstream(self, graph: NodeGraph, node_id: str) -> None:
         dirty_node_ids = self._downstream_node_ids(graph, node_id)
@@ -87,6 +121,21 @@ class NodeGraphPreviewCache:
             key: image
             for key, image in self.channels.items()
             if key[0] not in dirty_node_ids
+        }
+        self.texture_channels = {
+            key: image
+            for key, image in self.texture_channels.items()
+            if key[0] not in dirty_node_ids
+        }
+        self.texture_preview_images = {
+            key: image
+            for key, image in self.texture_preview_images.items()
+            if key not in dirty_node_ids
+        }
+        self.texture_sizes = {
+            key: image
+            for key, image in self.texture_sizes.items()
+            if key not in dirty_node_ids
         }
 
     @staticmethod
@@ -128,7 +177,7 @@ class NodeGraphExecutor:
         cache = preview_cache or NodeGraphPreviewCache()
         resolved_fallback = fallback_size or cache.fallback_size
         if node.node_type is NodeType.OUTPUT_RGBA:
-            target_size = self._determine_output_size(graph, node)
+            target_size = self._determine_output_size(graph, node, cache)
             if target_size is None:
                 raise GraphExecutionError("output должен зависеть хотя бы от одной texture-ноды")
             target_size = self._fit_preview_size(target_size, cache.max_side)
@@ -143,7 +192,7 @@ class NodeGraphExecutor:
             )
             return image, f"View preview · {image.width}x{image.height} · channel"
         if node.node_type is NodeType.TEXTURE_INPUT:
-            image = self._load_texture_preview_image(node)
+            image = self._load_texture_preview_image_cached(node, cache)
             target_size = self._fit_preview_size(image.size, cache.max_side)
             if image.size != target_size:
                 image = image.resize(target_size, RESAMPLING_LANCZOS)
@@ -188,11 +237,12 @@ class NodeGraphExecutor:
         if missing:
             raise GraphExecutionError(f"не подключены каналы {', '.join(missing)}")
 
-        target_size = self._determine_output_size(graph, output_node)
+        cache = NodeGraphPreviewCache()
+        target_size = self._determine_output_size(graph, output_node, cache)
         if target_size is None:
             raise GraphExecutionError("output должен зависеть хотя бы от одной texture-ноды")
 
-        return self._compose_output_image(graph, output_node, target_size)
+        return self._compose_output_image(graph, output_node, target_size, cache)
 
     def render_view_node(
         self,
@@ -317,11 +367,12 @@ class NodeGraphExecutor:
         write_log = logger or (lambda _message: None)
         output_root.mkdir(parents=True, exist_ok=True)
         results: list[GraphExportResult] = []
+        cache = NodeGraphPreviewCache()
 
         for output_node in self._enabled_output_nodes(project.graph):
             destination = self._build_output_path(output_node, output_root)
             try:
-                result = self._export_output_node(project.graph, output_node, destination, options)
+                result = self._export_output_node(project.graph, output_node, destination, options, cache)
             except Exception as exc:
                 result = GraphExportResult(
                     output_node_id=output_node.node_id,
@@ -347,6 +398,7 @@ class NodeGraphExecutor:
         output_node: GraphNode,
         destination: Path,
         options: ConversionOptions,
+        cache: NodeGraphPreviewCache | None = None,
     ) -> GraphExportResult:
         missing = self._missing_required_output_inputs(graph, output_node)
         if missing:
@@ -367,7 +419,7 @@ class NodeGraphExecutor:
                 message=f"пропуск (уже есть): {destination.name}",
             )
 
-        target_size = self._determine_output_size(graph, output_node)
+        target_size = self._determine_output_size(graph, output_node, cache)
         if target_size is None:
             return GraphExportResult(
                 output_node_id=output_node.node_id,
@@ -377,7 +429,7 @@ class NodeGraphExecutor:
                 message="ОШИБКА: output должен зависеть хотя бы от одной texture-ноды",
             )
 
-        merged = self._compose_output_image(graph, output_node, target_size)
+        merged = self._compose_output_image(graph, output_node, target_size, cache)
         destination.parent.mkdir(parents=True, exist_ok=True)
         self._save_output_image(merged, destination, options)
         return GraphExportResult(
@@ -393,14 +445,15 @@ class NodeGraphExecutor:
         graph: NodeGraph,
         output_node: GraphNode,
         target_size: tuple[int, int],
+        cache: NodeGraphPreviewCache | None = None,
     ) -> Image.Image:
         mode = self._output_mode(output_node)
         channels = [
-            self._evaluate_output_input(graph, output_node, socket_id, target_size)
+            self._evaluate_output_input(graph, output_node, socket_id, target_size, cache)
             for socket_id in ("r", "g", "b")
         ]
         if mode is OutputMode.RGBA:
-            alpha = self._evaluate_optional_output_input(graph, output_node, "a", target_size)
+            alpha = self._evaluate_optional_output_input(graph, output_node, "a", target_size, cache)
             channels.append(alpha)
 
         return Image.merge("RGBA" if mode is OutputMode.RGBA else "RGB", tuple(channels))
@@ -439,6 +492,7 @@ class NodeGraphExecutor:
         output_node: GraphNode,
         socket_id: str,
         target_size: tuple[int, int],
+        cache: NodeGraphPreviewCache | None = None,
     ) -> Image.Image:
         connection = incoming_connection(
             graph,
@@ -447,6 +501,8 @@ class NodeGraphExecutor:
         )
         if connection is None:
             raise GraphExecutionError(f"Output channel {socket_id.upper()} is not connected.")
+        if cache is not None:
+            return self._evaluate_channel_socket_cached(graph, connection, target_size, set(), cache)
         return self._evaluate_channel_socket(graph, connection, target_size, set())
 
     def _evaluate_optional_output_input(
@@ -455,6 +511,7 @@ class NodeGraphExecutor:
         output_node: GraphNode,
         socket_id: str,
         target_size: tuple[int, int],
+        cache: NodeGraphPreviewCache | None = None,
     ) -> Image.Image:
         connection = incoming_connection(
             graph,
@@ -463,6 +520,8 @@ class NodeGraphExecutor:
         )
         if connection is None:
             return Image.new("L", target_size, 255)
+        if cache is not None:
+            return self._evaluate_channel_socket_cached(graph, connection, target_size, set(), cache)
         return self._evaluate_channel_socket(graph, connection, target_size, set())
 
     def _evaluate_output_input_cached(
@@ -631,7 +690,7 @@ class NodeGraphExecutor:
                 raise GraphExecutionError(f"Source node {connection.source_node_id} not found.")
 
             if source_node.node_type is NodeType.TEXTURE_INPUT:
-                channel = self._load_texture_channel(source_node, connection.source_socket_id)
+                channel = self._load_texture_channel_cached(source_node, connection.source_socket_id, cache)
             elif source_node.node_type is NodeType.CONSTANT_CHANNEL:
                 channel = Image.new("L", target_size, self._constant_value(source_node))
             elif source_node.node_type is NodeType.INVERT_CHANNEL:
@@ -764,6 +823,7 @@ class NodeGraphExecutor:
         self,
         graph: NodeGraph,
         output_node: GraphNode,
+        cache: NodeGraphPreviewCache | None = None,
     ) -> tuple[int, int] | None:
         for socket_id in ("r", "g", "b", "a"):
             connection = incoming_connection(
@@ -773,7 +833,7 @@ class NodeGraphExecutor:
             )
             if connection is None:
                 continue
-            target_size = self._find_upstream_texture_size(graph, connection, set())
+            target_size = self._find_upstream_texture_size(graph, connection, set(), cache)
             if target_size is not None:
                 return target_size
         return None
@@ -783,34 +843,33 @@ class NodeGraphExecutor:
         graph: NodeGraph,
         connection: GraphConnection,
         visiting: set[tuple[str, str]],
+        cache: NodeGraphPreviewCache | None = None,
     ) -> tuple[int, int] | None:
         key = (connection.source_node_id, connection.source_socket_id)
         if key in visiting:
             return None
         visiting.add(key)
-
-        source_node = find_node(graph, connection.source_node_id)
-        if source_node is None:
-            return None
-        if source_node.node_type is NodeType.TEXTURE_INPUT:
-            path = Path(str(source_node.properties.get("path", "")))
-            if not path.exists():
+        try:
+            source_node = find_node(graph, connection.source_node_id)
+            if source_node is None:
                 return None
-            with Image.open(path) as image:
-                return image.size
-        if source_node.node_type is NodeType.INVERT_CHANNEL:
-            return self._find_first_upstream_texture_size(graph, source_node, ("in",), visiting)
-        if source_node.node_type in (
-            NodeType.LEVELS_CHANNEL,
-            NodeType.CLAMP_CHANNEL,
-            NodeType.THRESHOLD_CHANNEL,
-        ):
-            return self._find_first_upstream_texture_size(graph, source_node, ("in",), visiting)
-        if source_node.node_type is NodeType.BLEND_CHANNEL:
-            return self._find_first_upstream_texture_size(graph, source_node, ("a", "b"), visiting)
-        if source_node.node_type is NodeType.LUMINANCE:
-            return self._find_first_upstream_texture_size(graph, source_node, ("r", "g", "b"), visiting)
-        return None
+            if source_node.node_type is NodeType.TEXTURE_INPUT:
+                return self._load_texture_size(source_node, cache)
+            if source_node.node_type is NodeType.INVERT_CHANNEL:
+                return self._find_first_upstream_texture_size(graph, source_node, ("in",), visiting, cache)
+            if source_node.node_type in (
+                NodeType.LEVELS_CHANNEL,
+                NodeType.CLAMP_CHANNEL,
+                NodeType.THRESHOLD_CHANNEL,
+            ):
+                return self._find_first_upstream_texture_size(graph, source_node, ("in",), visiting, cache)
+            if source_node.node_type is NodeType.BLEND_CHANNEL:
+                return self._find_first_upstream_texture_size(graph, source_node, ("a", "b"), visiting, cache)
+            if source_node.node_type is NodeType.LUMINANCE:
+                return self._find_first_upstream_texture_size(graph, source_node, ("r", "g", "b"), visiting, cache)
+            return None
+        finally:
+            visiting.remove(key)
 
     def _find_first_upstream_texture_size(
         self,
@@ -818,6 +877,7 @@ class NodeGraphExecutor:
         node: GraphNode,
         socket_ids: tuple[str, ...],
         visiting: set[tuple[str, str]],
+        cache: NodeGraphPreviewCache | None = None,
     ) -> tuple[int, int] | None:
         for socket_id in socket_ids:
             connection = incoming_connection(
@@ -827,7 +887,7 @@ class NodeGraphExecutor:
             )
             if connection is None:
                 continue
-            target_size = self._find_upstream_texture_size(graph, connection, visiting)
+            target_size = self._find_upstream_texture_size(graph, connection, visiting, cache)
             if target_size is not None:
                 return target_size
         return None
@@ -839,7 +899,7 @@ class NodeGraphExecutor:
         cache: NodeGraphPreviewCache,
         fallback_size: tuple[int, int],
     ) -> tuple[int, int]:
-        target_size = self._find_upstream_texture_size(graph, connection, set())
+        target_size = self._find_upstream_texture_size(graph, connection, set(), cache)
         if target_size is None:
             target_size = fallback_size
         return self._fit_preview_size(target_size, cache.max_side)
@@ -911,13 +971,9 @@ class NodeGraphExecutor:
         out_min = max(0, min(out_min, 255))
         out_max = max(0, min(out_max, 255))
 
-        scale = 1.0 / max(1, white - black)
-        lut = []
-        for value in range(256):
-            normalized = min(max((value - black) * scale, 0.0), 1.0)
-            adjusted = normalized ** (1.0 / gamma)
-            lut.append(round(out_min + adjusted * (out_max - out_min)))
-        return channel.convert("L").point(lut)
+        return self._ensure_l_mode(channel).point(
+            _levels_lut(black, white, gamma, out_min, out_max)
+        )
 
     def _apply_clamp(self, channel: Image.Image, node: GraphNode) -> Image.Image:
         minimum = self._property_int(node, "min", 0)
@@ -926,17 +982,16 @@ class NodeGraphExecutor:
             minimum, maximum = maximum, minimum
         minimum = max(0, min(minimum, 255))
         maximum = max(0, min(maximum, 255))
-        lut = [min(max(value, minimum), maximum) for value in range(256)]
-        return channel.convert("L").point(lut)
+        return self._ensure_l_mode(channel).point(_clamp_lut(minimum, maximum))
 
     def _apply_threshold(self, channel: Image.Image, node: GraphNode) -> Image.Image:
         threshold = self._property_int(node, "threshold", 128)
         threshold = max(0, min(threshold, 255))
-        return channel.convert("L").point(lambda value: 255 if value >= threshold else 0)
+        return self._ensure_l_mode(channel).point(_threshold_lut(threshold))
 
     def _apply_blend(self, a_channel: Image.Image, b_channel: Image.Image, node: GraphNode) -> Image.Image:
-        a = a_channel.convert("L")
-        b = b_channel.convert("L")
+        a = self._ensure_l_mode(a_channel)
+        b = self._ensure_l_mode(b_channel)
         mode = str(node.properties.get("mode", "multiply")).lower()
 
         if mode == "add":
@@ -988,6 +1043,65 @@ class NodeGraphExecutor:
         with Image.open(path) as image:
             return _extract_first_frame(image).convert("RGBA")
 
+    def _load_texture_channel_cached(
+        self,
+        node: GraphNode,
+        socket_id: str,
+        cache: NodeGraphPreviewCache,
+    ) -> Image.Image:
+        cache_key = (node.node_id, socket_id)
+        cached = cache.texture_channels.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+        working_image = self._load_texture_preview_image_cached(node, cache)
+        if socket_id == "r":
+            channel = working_image.getchannel("R").copy()
+        elif socket_id == "g":
+            channel = working_image.getchannel("G").copy()
+        elif socket_id == "b":
+            channel = working_image.getchannel("B").copy()
+        elif socket_id == "a":
+            if "A" in working_image.getbands():
+                channel = working_image.getchannel("A").copy()
+            else:
+                channel = Image.new("L", working_image.size, 255)
+        else:
+            raise GraphExecutionError(f"Unsupported texture channel: {socket_id}")
+        cache.texture_channels[cache_key] = channel.copy()
+        return channel
+
+    def _load_texture_preview_image_cached(
+        self,
+        node: GraphNode,
+        cache: NodeGraphPreviewCache,
+    ) -> Image.Image:
+        cached = cache.texture_preview_images.get(node.node_id)
+        if cached is not None:
+            return cached.copy()
+        image = self._load_texture_preview_image(node)
+        cache.texture_preview_images[node.node_id] = image.copy()
+        cache.texture_sizes[node.node_id] = image.size
+        return image
+
+    def _load_texture_size(
+        self,
+        node: GraphNode,
+        cache: NodeGraphPreviewCache | None = None,
+    ) -> tuple[int, int] | None:
+        if cache is not None and node.node_id in cache.texture_sizes:
+            return cache.texture_sizes[node.node_id]
+
+        path = Path(str(node.properties.get("path", "")))
+        if not path.exists():
+            if cache is not None:
+                cache.texture_sizes[node.node_id] = None
+            return None
+        with Image.open(path) as image:
+            size = image.size
+        if cache is not None:
+            cache.texture_sizes[node.node_id] = size
+        return size
+
     @staticmethod
     def _constant_value(node: GraphNode) -> int:
         try:
@@ -1014,6 +1128,12 @@ class NodeGraphExecutor:
             return float(node.properties.get(key, default))
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _ensure_l_mode(image: Image.Image) -> Image.Image:
+        if image.mode == "L":
+            return image
+        return image.convert("L")
 
     @staticmethod
     def _output_mode(node: GraphNode) -> OutputMode:

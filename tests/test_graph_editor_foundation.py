@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 from PIL import Image
 from PyQt6.QtCore import QEventLoop, QTimer
@@ -121,6 +122,138 @@ class ImageLoadingTests(unittest.TestCase):
             with Image.open(destination) as converted:
                 self.assertEqual("RGBA", converted.mode)
                 self.assertEqual((40, 200), converted.getchannel("A").getextrema())
+
+
+class NodeGraphExecutorPerformanceTests(unittest.TestCase):
+    def test_render_output_node_reuses_cached_texture_image_for_multiple_channels(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "shared.png"
+            Image.new("RGBA", (4, 4), (24, 96, 180, 200)).save(texture_path)
+
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path)},
+            )
+            output = create_graph_node(NodeType.OUTPUT_RGBA)
+            graph = NodeGraph(
+                nodes=[texture, output],
+                connections=[
+                    GraphConnection(make_connection_id(), texture.node_id, "r", output.node_id, "r"),
+                    GraphConnection(make_connection_id(), texture.node_id, "g", output.node_id, "g"),
+                    GraphConnection(make_connection_id(), texture.node_id, "b", output.node_id, "b"),
+                    GraphConnection(make_connection_id(), texture.node_id, "a", output.node_id, "a"),
+                ],
+            )
+
+            executor = NodeGraphExecutor()
+            with (
+                mock.patch.object(
+                    executor,
+                    "_load_texture_preview_image",
+                    wraps=executor._load_texture_preview_image,
+                ) as preview_loader,
+                mock.patch.object(
+                    executor,
+                    "_load_texture_size",
+                    wraps=executor._load_texture_size,
+                ) as size_loader,
+            ):
+                image = executor.render_output_node(graph, output)
+
+            self.assertEqual((4, 4), image.size)
+            self.assertEqual((24, 96, 180, 200), image.getpixel((0, 0)))
+            self.assertEqual(1, preview_loader.call_count)
+            self.assertEqual(1, size_loader.call_count)
+
+    def test_export_enabled_outputs_reuses_shared_branch_across_outputs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "mask.png"
+            Image.new("RGBA", (8, 8), (48, 96, 144, 255)).save(texture_path)
+
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path)},
+            )
+            levels = create_graph_node(
+                NodeType.LEVELS_CHANNEL,
+                properties={"black": 16, "white": 224, "gamma": 1.0, "out_min": 0, "out_max": 255},
+            )
+            output_a = create_graph_node(
+                NodeType.OUTPUT_RGBA,
+                properties={"filename": "packed_a.png"},
+            )
+            output_b = create_graph_node(
+                NodeType.OUTPUT_RGBA,
+                properties={"filename": "packed_b.png"},
+            )
+            graph = NodeGraph(
+                nodes=[texture, levels, output_a, output_b],
+                connections=[
+                    GraphConnection(make_connection_id(), texture.node_id, "r", levels.node_id, "in"),
+                    GraphConnection(make_connection_id(), levels.node_id, "out", output_a.node_id, "r"),
+                    GraphConnection(make_connection_id(), levels.node_id, "out", output_a.node_id, "g"),
+                    GraphConnection(make_connection_id(), levels.node_id, "out", output_a.node_id, "b"),
+                    GraphConnection(make_connection_id(), levels.node_id, "out", output_b.node_id, "r"),
+                    GraphConnection(make_connection_id(), levels.node_id, "out", output_b.node_id, "g"),
+                    GraphConnection(make_connection_id(), levels.node_id, "out", output_b.node_id, "b"),
+                ],
+            )
+
+            executor = NodeGraphExecutor()
+            with (
+                mock.patch.object(
+                    executor,
+                    "_load_texture_preview_image",
+                    wraps=executor._load_texture_preview_image,
+                ) as preview_loader,
+                mock.patch.object(
+                    executor,
+                    "_apply_levels",
+                    wraps=executor._apply_levels,
+                ) as levels_apply,
+            ):
+                summary = executor.export_enabled_outputs(
+                    NodeGraphProject(graph=graph),
+                    Path(tmp),
+                    ConversionOptions(overwrite=True),
+                )
+
+            self.assertEqual(2, summary.succeeded)
+            self.assertEqual(1, preview_loader.call_count)
+            self.assertEqual(1, levels_apply.call_count)
+            self.assertTrue((Path(tmp) / "packed_a.png").exists())
+            self.assertTrue((Path(tmp) / "packed_b.png").exists())
+
+    def test_channel_operations_keep_expected_values(self) -> None:
+        executor = NodeGraphExecutor()
+        source = Image.frombytes("L", (5, 1), bytes((0, 64, 128, 192, 255)))
+
+        levels_node = create_graph_node(
+            NodeType.LEVELS_CHANNEL,
+            properties={"black": 32, "white": 224, "gamma": 2.0, "out_min": 10, "out_max": 240},
+        )
+        clamp_node = create_graph_node(
+            NodeType.CLAMP_CHANNEL,
+            properties={"min": 40, "max": 180},
+        )
+        threshold_node = create_graph_node(
+            NodeType.THRESHOLD_CHANNEL,
+            properties={"threshold": 120},
+        )
+
+        levels_image = executor._apply_levels(source, levels_node)
+        clamp_image = executor._apply_clamp(source, clamp_node)
+        threshold_image = executor._apply_threshold(source, threshold_node)
+
+        expected_levels = []
+        for value in (0, 64, 128, 192, 255):
+            normalized = min(max((value - 32) / 192.0, 0.0), 1.0)
+            adjusted = normalized ** 0.5
+            expected_levels.append(round(10 + adjusted * 230))
+
+        self.assertEqual(expected_levels, list(levels_image.getdata()))
+        self.assertEqual([40, 64, 128, 180, 180], list(clamp_image.getdata()))
+        self.assertEqual([0, 0, 255, 255, 255], list(threshold_image.getdata()))
 
 
 class GraphEditorFoundationTests(unittest.TestCase):
