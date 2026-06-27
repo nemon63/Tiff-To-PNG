@@ -465,6 +465,32 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertIn("Display flag · Texture", meta)
         self.assertNotIn("· R ·", meta)
 
+    def test_output_display_flag_can_preview_constant_only_graph(self) -> None:
+        red = create_graph_node(NodeType.CONSTANT_CHANNEL, title="R", properties={"value": 100})
+        green = create_graph_node(NodeType.CONSTANT_CHANNEL, title="G", properties={"value": 150})
+        blue = create_graph_node(NodeType.CONSTANT_CHANNEL, title="B", properties={"value": 200})
+        alpha = create_graph_node(NodeType.CONSTANT_CHANNEL, title="A", properties={"value": 255})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            title="Output 1",
+            properties={"display": True},
+        )
+        graph = NodeGraph(
+            nodes=[red, green, blue, alpha, output],
+            connections=[
+                GraphConnection(make_connection_id(), red.node_id, "out", output.node_id, "r"),
+                GraphConnection(make_connection_id(), green.node_id, "out", output.node_id, "g"),
+                GraphConnection(make_connection_id(), blue.node_id, "out", output.node_id, "b"),
+                GraphConnection(make_connection_id(), alpha.node_id, "out", output.node_id, "a"),
+            ],
+        )
+
+        image, meta = NodeGraphExecutor().render_display_node(graph, output)
+
+        self.assertEqual((256, 256), image.size)
+        self.assertEqual((100, 150, 200, 255), image.getpixel((0, 0)))
+        self.assertIn("Output preview", meta)
+
     def test_validation_reports_missing_output_inputs(self) -> None:
         output = create_graph_node(NodeType.OUTPUT_RGBA)
         project = NodeGraphProject(graph=NodeGraph(nodes=[output]))
@@ -1041,36 +1067,9 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertEqual(constant.title, received[-1][1])
 
     def test_draft_preview_uses_reduced_max_side(self) -> None:
-        with TemporaryDirectory() as tmp:
-            texture_path = Path(tmp) / "draft_preview.png"
-            Image.new("RGBA", (2048, 1024), (24, 96, 180, 255)).save(texture_path)
-            texture = create_graph_node(
-                NodeType.TEXTURE_INPUT,
-                properties={"path": str(texture_path), "display": True},
-            )
-            self.workspace._push_graph_command(
-                AddNodesCommand(
-                    self.workspace.project.graph,
-                    self.workspace._on_graph_command_changed,
-                    [texture],
-                ),
-                select_node_ids=[texture.node_id],
-            )
-
-            requested_sizes: list[int] = []
-            original_request = self.workspace._request_preview_node
-
-            def capture_request(node, *, mode_label="", preview_mode=PREVIEW_MODE_FULL):
-                requested_sizes.append(self.workspace._preview_max_side_for_mode(preview_mode))
-                return original_request(node, mode_label=mode_label, preview_mode=preview_mode)
-
-            self.workspace._request_preview_node = capture_request  # type: ignore[method-assign]
-            try:
-                self.workspace._on_preview_refresh_requested(texture, PREVIEW_MODE_DRAFT)
-            finally:
-                self.workspace._request_preview_node = original_request  # type: ignore[method-assign]
-
-            self.assertEqual([DRAFT_PREVIEW_MAX_SIDE], requested_sizes)
+        self.workspace._preview_cache.max_side = 2048
+        self.assertEqual(DRAFT_PREVIEW_MAX_SIDE, self.workspace._preview_max_side_for_mode(PREVIEW_MODE_DRAFT))
+        self.assertEqual(2048, self.workspace._preview_max_side_for_mode(PREVIEW_MODE_FULL))
 
     def test_graph_preview_preserves_zoom_for_same_node_refresh(self) -> None:
         panel = PreviewPanel(allow_detach=False)

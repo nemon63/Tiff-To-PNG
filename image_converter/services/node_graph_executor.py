@@ -183,7 +183,7 @@ class NodeGraphExecutor:
         if node.node_type is NodeType.OUTPUT_RGBA:
             target_size = self._determine_output_size(graph, node, cache)
             if target_size is None:
-                raise GraphExecutionError("output должен зависеть хотя бы от одной texture-ноды")
+                target_size = resolved_fallback
             target_size = self._fit_preview_size(target_size, cache.max_side)
             image = self._compose_output_preview_image(graph, node, target_size, cache).convert("RGBA")
             return image, f"Output preview · {image.width}x{image.height} · {image.mode}"
