@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
-from PIL import Image
+from PIL import Image, ImageFilter
 from PyQt6.QtCore import QEventLoop, QTimer
 from PyQt6.QtWidgets import QApplication
 
@@ -228,10 +228,28 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
     def test_channel_operations_keep_expected_values(self) -> None:
         executor = NodeGraphExecutor()
         source = Image.frombytes("L", (5, 1), bytes((0, 64, 128, 192, 255)))
+        blur_source = Image.frombytes("L", (5, 1), bytes((0, 0, 255, 0, 0)))
+        morphology_source = Image.frombytes(
+            "L",
+            (5, 5),
+            bytes(
+                (
+                    0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0,
+                    0, 0, 255, 0, 0,
+                    0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0,
+                )
+            ),
+        )
 
         levels_node = create_graph_node(
             NodeType.LEVELS_CHANNEL,
             properties={"black": 32, "white": 224, "gamma": 2.0, "out_min": 10, "out_max": 240},
+        )
+        remap_node = create_graph_node(
+            NodeType.REMAP_CHANNEL,
+            properties={"in_min": 64, "in_max": 192, "out_min": 32, "out_max": 224},
         )
         clamp_node = create_graph_node(
             NodeType.CLAMP_CHANNEL,
@@ -241,10 +259,26 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
             NodeType.THRESHOLD_CHANNEL,
             properties={"threshold": 120},
         )
+        blur_node = create_graph_node(
+            NodeType.BLUR_CHANNEL,
+            properties={"radius": 1},
+        )
+        dilate_node = create_graph_node(
+            NodeType.DILATE_CHANNEL,
+            properties={"radius": 1},
+        )
+        erode_node = create_graph_node(
+            NodeType.ERODE_CHANNEL,
+            properties={"radius": 1},
+        )
 
         levels_image = executor._apply_levels(source, levels_node)
+        remap_image = executor._apply_remap(source, remap_node)
         clamp_image = executor._apply_clamp(source, clamp_node)
         threshold_image = executor._apply_threshold(source, threshold_node)
+        blur_image = executor._apply_blur(blur_source, blur_node)
+        dilate_image = executor._apply_dilate(morphology_source, dilate_node)
+        erode_image = executor._apply_erode(morphology_source, erode_node)
 
         expected_levels = []
         for value in (0, 64, 128, 192, 255):
@@ -253,8 +287,21 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
             expected_levels.append(round(10 + adjusted * 230))
 
         self.assertEqual(expected_levels, list(levels_image.getdata()))
+        self.assertEqual([32, 32, 128, 224, 224], list(remap_image.getdata()))
         self.assertEqual([40, 64, 128, 180, 180], list(clamp_image.getdata()))
         self.assertEqual([0, 0, 255, 255, 255], list(threshold_image.getdata()))
+        self.assertEqual(
+            list(blur_source.filter(ImageFilter.BoxBlur(1)).getdata()),
+            list(blur_image.getdata()),
+        )
+        self.assertEqual(
+            list(morphology_source.filter(ImageFilter.MaxFilter(3)).getdata()),
+            list(dilate_image.getdata()),
+        )
+        self.assertEqual(
+            list(morphology_source.filter(ImageFilter.MinFilter(3)).getdata()),
+            list(erode_image.getdata()),
+        )
 
 
 class NodePropertiesPanelTests(unittest.TestCase):
@@ -310,6 +357,26 @@ class NodePropertiesPanelTests(unittest.TestCase):
         self.app.processEvents()
 
         self.assertEqual([PREVIEW_MODE_FULL], changed_modes)
+
+    def test_new_mask_nodes_show_expected_controls(self) -> None:
+        self.panel.set_node(create_graph_node(NodeType.REMAP_CHANNEL))
+        self.assertFalse(self.panel.remap_in_min_host.isHidden())
+        self.assertFalse(self.panel.remap_in_max_host.isHidden())
+        self.assertFalse(self.panel.remap_out_min_host.isHidden())
+        self.assertFalse(self.panel.remap_out_max_host.isHidden())
+        self.assertTrue(self.panel.blur_radius_host.isHidden())
+
+        self.panel.set_node(create_graph_node(NodeType.BLUR_CHANNEL))
+        self.assertFalse(self.panel.blur_radius_host.isHidden())
+        self.assertTrue(self.panel.dilate_radius_host.isHidden())
+        self.assertTrue(self.panel.erode_radius_host.isHidden())
+
+        self.panel.set_node(create_graph_node(NodeType.DILATE_CHANNEL))
+        self.assertFalse(self.panel.dilate_radius_host.isHidden())
+        self.assertTrue(self.panel.erode_radius_host.isHidden())
+
+        self.panel.set_node(create_graph_node(NodeType.ERODE_CHANNEL))
+        self.assertFalse(self.panel.erode_radius_host.isHidden())
 
 
 class GraphEditorFoundationTests(unittest.TestCase):

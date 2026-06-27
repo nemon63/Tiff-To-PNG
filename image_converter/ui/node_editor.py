@@ -1231,8 +1231,12 @@ class GraphView(QGraphicsView):
         channel_menu = menu.addMenu("Channel")
         self._add_node_menu_action(channel_menu, "Invert", NodeType.INVERT_CHANNEL, scene_position, wire_port)
         self._add_node_menu_action(channel_menu, "Levels", NodeType.LEVELS_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(channel_menu, "Remap", NodeType.REMAP_CHANNEL, scene_position, wire_port)
         self._add_node_menu_action(channel_menu, "Clamp", NodeType.CLAMP_CHANNEL, scene_position, wire_port)
         self._add_node_menu_action(channel_menu, "Threshold", NodeType.THRESHOLD_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(channel_menu, "Blur", NodeType.BLUR_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(channel_menu, "Dilate", NodeType.DILATE_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(channel_menu, "Erode", NodeType.ERODE_CHANNEL, scene_position, wire_port)
         self._add_node_menu_action(channel_menu, "Luminance", NodeType.LUMINANCE, scene_position, wire_port)
 
         math_menu = menu.addMenu("Math")
@@ -1265,8 +1269,12 @@ class GraphView(QGraphicsView):
         for label, node_type in (
             ("Invert", NodeType.INVERT_CHANNEL),
             ("Levels", NodeType.LEVELS_CHANNEL),
+            ("Remap", NodeType.REMAP_CHANNEL),
             ("Clamp", NodeType.CLAMP_CHANNEL),
             ("Threshold", NodeType.THRESHOLD_CHANNEL),
+            ("Blur", NodeType.BLUR_CHANNEL),
+            ("Dilate", NodeType.DILATE_CHANNEL),
+            ("Erode", NodeType.ERODE_CHANNEL),
         ):
             action = insert_menu.addAction(label)
             action.triggered.connect(
@@ -1477,6 +1485,19 @@ class NodePropertiesPanel(QWidget):
         self.level_out_max_host = self._byte_row_widget(self.level_out_max_slider, self.level_out_max_spin)
         self.form.addRow("Output Max", self.level_out_max_host)
 
+        self.remap_in_min_slider, self.remap_in_min_spin = self._make_byte_slider_pair()
+        self.remap_in_min_host = self._byte_row_widget(self.remap_in_min_slider, self.remap_in_min_spin)
+        self.form.addRow("Input Min", self.remap_in_min_host)
+        self.remap_in_max_slider, self.remap_in_max_spin = self._make_byte_slider_pair(initial=255)
+        self.remap_in_max_host = self._byte_row_widget(self.remap_in_max_slider, self.remap_in_max_spin)
+        self.form.addRow("Input Max", self.remap_in_max_host)
+        self.remap_out_min_slider, self.remap_out_min_spin = self._make_byte_slider_pair()
+        self.remap_out_min_host = self._byte_row_widget(self.remap_out_min_slider, self.remap_out_min_spin)
+        self.form.addRow("Output Min", self.remap_out_min_host)
+        self.remap_out_max_slider, self.remap_out_max_spin = self._make_byte_slider_pair(initial=255)
+        self.remap_out_max_host = self._byte_row_widget(self.remap_out_max_slider, self.remap_out_max_spin)
+        self.form.addRow("Output Max", self.remap_out_max_host)
+
         self.clamp_min_slider, self.clamp_min_spin = self._make_byte_slider_pair()
         self.clamp_min_host = self._byte_row_widget(self.clamp_min_slider, self.clamp_min_spin)
         self.form.addRow("Min", self.clamp_min_host)
@@ -1487,6 +1508,33 @@ class NodePropertiesPanel(QWidget):
         self.threshold_slider, self.threshold_spin = self._make_byte_slider_pair()
         self.threshold_host = self._byte_row_widget(self.threshold_slider, self.threshold_spin)
         self.form.addRow("Threshold", self.threshold_host)
+
+        self.blur_radius_slider, self.blur_radius_spin = self._make_slider_spin_pair(
+            0,
+            64,
+            initial=1,
+            suffix=" px",
+        )
+        self.blur_radius_host = self._byte_row_widget(self.blur_radius_slider, self.blur_radius_spin)
+        self.form.addRow("Radius", self.blur_radius_host)
+
+        self.dilate_radius_slider, self.dilate_radius_spin = self._make_slider_spin_pair(
+            0,
+            64,
+            initial=1,
+            suffix=" px",
+        )
+        self.dilate_radius_host = self._byte_row_widget(self.dilate_radius_slider, self.dilate_radius_spin)
+        self.form.addRow("Radius", self.dilate_radius_host)
+
+        self.erode_radius_slider, self.erode_radius_spin = self._make_slider_spin_pair(
+            0,
+            64,
+            initial=1,
+            suffix=" px",
+        )
+        self.erode_radius_host = self._byte_row_widget(self.erode_radius_slider, self.erode_radius_spin)
+        self.form.addRow("Radius", self.erode_radius_host)
 
         self.blend_mode_combo = QComboBox()
         for label, value in (
@@ -1605,9 +1653,16 @@ class NodePropertiesPanel(QWidget):
             self.level_gamma_spin.setValue(self._coerce_float(node.properties.get("gamma"), 1.0))
             self.level_out_min_spin.setValue(self._coerce_int(node.properties.get("out_min"), 0))
             self.level_out_max_spin.setValue(self._coerce_int(node.properties.get("out_max"), 255))
+            self.remap_in_min_spin.setValue(self._coerce_int(node.properties.get("in_min"), 0))
+            self.remap_in_max_spin.setValue(self._coerce_int(node.properties.get("in_max"), 255))
+            self.remap_out_min_spin.setValue(self._coerce_int(node.properties.get("out_min"), 0))
+            self.remap_out_max_spin.setValue(self._coerce_int(node.properties.get("out_max"), 255))
             self.clamp_min_spin.setValue(self._coerce_int(node.properties.get("min"), 0))
             self.clamp_max_spin.setValue(self._coerce_int(node.properties.get("max"), 255))
             self.threshold_spin.setValue(self._coerce_int(node.properties.get("threshold"), 128))
+            self.blur_radius_spin.setValue(self._coerce_int(node.properties.get("radius"), 1))
+            self.dilate_radius_spin.setValue(self._coerce_int(node.properties.get("radius"), 1))
+            self.erode_radius_spin.setValue(self._coerce_int(node.properties.get("radius"), 1))
             blend_mode = str(node.properties.get("mode", "multiply"))
             self.blend_mode_combo.setCurrentIndex(0)
             for index in range(self.blend_mode_combo.count()):
@@ -1640,9 +1695,16 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.level_gamma_spin, node_type is NodeType.LEVELS_CHANNEL)
         self._set_row_visible(self.level_out_min_host, node_type is NodeType.LEVELS_CHANNEL)
         self._set_row_visible(self.level_out_max_host, node_type is NodeType.LEVELS_CHANNEL)
+        self._set_row_visible(self.remap_in_min_host, node_type is NodeType.REMAP_CHANNEL)
+        self._set_row_visible(self.remap_in_max_host, node_type is NodeType.REMAP_CHANNEL)
+        self._set_row_visible(self.remap_out_min_host, node_type is NodeType.REMAP_CHANNEL)
+        self._set_row_visible(self.remap_out_max_host, node_type is NodeType.REMAP_CHANNEL)
         self._set_row_visible(self.clamp_min_host, node_type is NodeType.CLAMP_CHANNEL)
         self._set_row_visible(self.clamp_max_host, node_type is NodeType.CLAMP_CHANNEL)
         self._set_row_visible(self.threshold_host, node_type is NodeType.THRESHOLD_CHANNEL)
+        self._set_row_visible(self.blur_radius_host, node_type is NodeType.BLUR_CHANNEL)
+        self._set_row_visible(self.dilate_radius_host, node_type is NodeType.DILATE_CHANNEL)
+        self._set_row_visible(self.erode_radius_host, node_type is NodeType.ERODE_CHANNEL)
         self._set_row_visible(self.blend_mode_combo, node_type is NodeType.BLEND_CHANNEL)
         self._set_row_visible(self.blend_opacity_host, node_type is NodeType.BLEND_CHANNEL)
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
@@ -1831,11 +1893,22 @@ class NodePropertiesPanel(QWidget):
             next_properties["gamma"] = self.level_gamma_spin.value()
             next_properties["out_min"] = self.level_out_min_spin.value()
             next_properties["out_max"] = self.level_out_max_spin.value()
+        elif self._node.node_type is NodeType.REMAP_CHANNEL:
+            next_properties["in_min"] = self.remap_in_min_spin.value()
+            next_properties["in_max"] = self.remap_in_max_spin.value()
+            next_properties["out_min"] = self.remap_out_min_spin.value()
+            next_properties["out_max"] = self.remap_out_max_spin.value()
         elif self._node.node_type is NodeType.CLAMP_CHANNEL:
             next_properties["min"] = self.clamp_min_spin.value()
             next_properties["max"] = self.clamp_max_spin.value()
         elif self._node.node_type is NodeType.THRESHOLD_CHANNEL:
             next_properties["threshold"] = self.threshold_spin.value()
+        elif self._node.node_type is NodeType.BLUR_CHANNEL:
+            next_properties["radius"] = self.blur_radius_spin.value()
+        elif self._node.node_type is NodeType.DILATE_CHANNEL:
+            next_properties["radius"] = self.dilate_radius_spin.value()
+        elif self._node.node_type is NodeType.ERODE_CHANNEL:
+            next_properties["radius"] = self.erode_radius_spin.value()
         elif self._node.node_type is NodeType.BLEND_CHANNEL:
             next_properties["mode"] = str(self.blend_mode_combo.currentData() or "multiply")
             next_properties["opacity"] = self.blend_opacity_spin.value()
@@ -2513,8 +2586,12 @@ class GraphWorkspace(QWidget):
         if node_type in (
             NodeType.INVERT_CHANNEL,
             NodeType.LEVELS_CHANNEL,
+            NodeType.REMAP_CHANNEL,
             NodeType.CLAMP_CHANNEL,
             NodeType.THRESHOLD_CHANNEL,
+            NodeType.BLUR_CHANNEL,
+            NodeType.DILATE_CHANNEL,
+            NodeType.ERODE_CHANNEL,
             NodeType.BLEND_CHANNEL,
             NodeType.LUMINANCE,
         ):

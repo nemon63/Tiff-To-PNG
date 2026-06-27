@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from threading import RLock
 
-from PIL import Image, ImageChops, ImageOps
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 from image_converter.domain.models import ConversionOptions, ConversionStatus
 from image_converter.domain.node_graph import (
@@ -55,6 +55,21 @@ def _clamp_lut(minimum: int, maximum: int) -> tuple[int, ...]:
 @lru_cache(maxsize=256)
 def _threshold_lut(threshold: int) -> tuple[int, ...]:
     return tuple(255 if value >= threshold else 0 for value in range(256))
+
+
+@lru_cache(maxsize=1024)
+def _remap_lut(
+    in_min: int,
+    in_max: int,
+    out_min: int,
+    out_max: int,
+) -> tuple[int, ...]:
+    scale = 1.0 / max(1, in_max - in_min)
+    lut = []
+    for value in range(256):
+        normalized = min(max((value - in_min) * scale, 0.0), 1.0)
+        lut.append(round(out_min + normalized * (out_max - out_min)))
+    return tuple(lut)
 
 
 class GraphExecutionError(RuntimeError):
@@ -614,6 +629,18 @@ class NodeGraphExecutor:
                 channel = self._apply_levels(input_channel, source_node)
             else:
                 channel = input_channel
+        elif source_node.node_type is NodeType.REMAP_CHANNEL:
+            input_channel = self._evaluate_required_input(
+                graph,
+                source_node,
+                "in",
+                target_size,
+                visiting,
+            )
+            if self._node_enabled(source_node):
+                channel = self._apply_remap(input_channel, source_node)
+            else:
+                channel = input_channel
         elif source_node.node_type is NodeType.CLAMP_CHANNEL:
             input_channel = self._evaluate_required_input(
                 graph,
@@ -636,6 +663,42 @@ class NodeGraphExecutor:
             )
             if self._node_enabled(source_node):
                 channel = self._apply_threshold(input_channel, source_node)
+            else:
+                channel = input_channel
+        elif source_node.node_type is NodeType.BLUR_CHANNEL:
+            input_channel = self._evaluate_required_input(
+                graph,
+                source_node,
+                "in",
+                target_size,
+                visiting,
+            )
+            if self._node_enabled(source_node):
+                channel = self._apply_blur(input_channel, source_node)
+            else:
+                channel = input_channel
+        elif source_node.node_type is NodeType.DILATE_CHANNEL:
+            input_channel = self._evaluate_required_input(
+                graph,
+                source_node,
+                "in",
+                target_size,
+                visiting,
+            )
+            if self._node_enabled(source_node):
+                channel = self._apply_dilate(input_channel, source_node)
+            else:
+                channel = input_channel
+        elif source_node.node_type is NodeType.ERODE_CHANNEL:
+            input_channel = self._evaluate_required_input(
+                graph,
+                source_node,
+                "in",
+                target_size,
+                visiting,
+            )
+            if self._node_enabled(source_node):
+                channel = self._apply_erode(input_channel, source_node)
             else:
                 channel = input_channel
         elif source_node.node_type is NodeType.BLEND_CHANNEL:
@@ -745,6 +808,19 @@ class NodeGraphExecutor:
                     channel = self._apply_levels(input_channel, source_node)
                 else:
                     channel = input_channel
+            elif source_node.node_type is NodeType.REMAP_CHANNEL:
+                input_channel = self._evaluate_required_input_cached(
+                    graph,
+                    source_node,
+                    "in",
+                    target_size,
+                    visiting,
+                    cache,
+                )
+                if self._node_enabled(source_node):
+                    channel = self._apply_remap(input_channel, source_node)
+                else:
+                    channel = input_channel
             elif source_node.node_type is NodeType.CLAMP_CHANNEL:
                 input_channel = self._evaluate_required_input_cached(
                     graph,
@@ -769,6 +845,45 @@ class NodeGraphExecutor:
                 )
                 if self._node_enabled(source_node):
                     channel = self._apply_threshold(input_channel, source_node)
+                else:
+                    channel = input_channel
+            elif source_node.node_type is NodeType.BLUR_CHANNEL:
+                input_channel = self._evaluate_required_input_cached(
+                    graph,
+                    source_node,
+                    "in",
+                    target_size,
+                    visiting,
+                    cache,
+                )
+                if self._node_enabled(source_node):
+                    channel = self._apply_blur(input_channel, source_node)
+                else:
+                    channel = input_channel
+            elif source_node.node_type is NodeType.DILATE_CHANNEL:
+                input_channel = self._evaluate_required_input_cached(
+                    graph,
+                    source_node,
+                    "in",
+                    target_size,
+                    visiting,
+                    cache,
+                )
+                if self._node_enabled(source_node):
+                    channel = self._apply_dilate(input_channel, source_node)
+                else:
+                    channel = input_channel
+            elif source_node.node_type is NodeType.ERODE_CHANNEL:
+                input_channel = self._evaluate_required_input_cached(
+                    graph,
+                    source_node,
+                    "in",
+                    target_size,
+                    visiting,
+                    cache,
+                )
+                if self._node_enabled(source_node):
+                    channel = self._apply_erode(input_channel, source_node)
                 else:
                     channel = input_channel
             elif source_node.node_type is NodeType.BLEND_CHANNEL:
@@ -873,8 +988,12 @@ class NodeGraphExecutor:
                 return self._find_first_upstream_texture_size(graph, source_node, ("in",), visiting, cache)
             if source_node.node_type in (
                 NodeType.LEVELS_CHANNEL,
+                NodeType.REMAP_CHANNEL,
                 NodeType.CLAMP_CHANNEL,
                 NodeType.THRESHOLD_CHANNEL,
+                NodeType.BLUR_CHANNEL,
+                NodeType.DILATE_CHANNEL,
+                NodeType.ERODE_CHANNEL,
             ):
                 return self._find_first_upstream_texture_size(graph, source_node, ("in",), visiting, cache)
             if source_node.node_type is NodeType.BLEND_CHANNEL:
@@ -989,6 +1108,21 @@ class NodeGraphExecutor:
             _levels_lut(black, white, gamma, out_min, out_max)
         )
 
+    def _apply_remap(self, channel: Image.Image, node: GraphNode) -> Image.Image:
+        in_min = self._property_int(node, "in_min", 0)
+        in_max = self._property_int(node, "in_max", 255)
+        out_min = self._property_int(node, "out_min", 0)
+        out_max = self._property_int(node, "out_max", 255)
+
+        if in_max <= in_min:
+            in_max = min(255, in_min + 1)
+        out_min = max(0, min(out_min, 255))
+        out_max = max(0, min(out_max, 255))
+
+        return self._ensure_l_mode(channel).point(
+            _remap_lut(in_min, in_max, out_min, out_max)
+        )
+
     def _apply_clamp(self, channel: Image.Image, node: GraphNode) -> Image.Image:
         minimum = self._property_int(node, "min", 0)
         maximum = self._property_int(node, "max", 255)
@@ -1002,6 +1136,31 @@ class NodeGraphExecutor:
         threshold = self._property_int(node, "threshold", 128)
         threshold = max(0, min(threshold, 255))
         return self._ensure_l_mode(channel).point(_threshold_lut(threshold))
+
+    def _apply_blur(self, channel: Image.Image, node: GraphNode) -> Image.Image:
+        radius = max(0, min(self._property_int(node, "radius", 1), 64))
+        source = self._ensure_l_mode(channel)
+        if radius <= 0:
+            return source.copy()
+        return source.filter(ImageFilter.BoxBlur(radius))
+
+    def _apply_dilate(self, channel: Image.Image, node: GraphNode) -> Image.Image:
+        return self._apply_morphology(channel, node, ImageFilter.MaxFilter)
+
+    def _apply_erode(self, channel: Image.Image, node: GraphNode) -> Image.Image:
+        return self._apply_morphology(channel, node, ImageFilter.MinFilter)
+
+    def _apply_morphology(
+        self,
+        channel: Image.Image,
+        node: GraphNode,
+        filter_factory,
+    ) -> Image.Image:
+        radius = max(0, min(self._property_int(node, "radius", 1), 64))
+        source = self._ensure_l_mode(channel)
+        if radius <= 0:
+            return source.copy()
+        return source.filter(filter_factory(radius * 2 + 1))
 
     def _apply_blend(self, a_channel: Image.Image, b_channel: Image.Image, node: GraphNode) -> Image.Image:
         a = self._ensure_l_mode(a_channel)

@@ -11,8 +11,12 @@ class NodeType(str, Enum):
     CONSTANT_CHANNEL = "constant_channel"
     INVERT_CHANNEL = "invert_channel"
     LEVELS_CHANNEL = "levels_channel"
+    REMAP_CHANNEL = "remap_channel"
     CLAMP_CHANNEL = "clamp_channel"
     THRESHOLD_CHANNEL = "threshold_channel"
+    BLUR_CHANNEL = "blur_channel"
+    DILATE_CHANNEL = "dilate_channel"
+    ERODE_CHANNEL = "erode_channel"
     BLEND_CHANNEL = "blend_channel"
     LUMINANCE = "luminance"
     VIEW = "view"
@@ -63,8 +67,12 @@ class GraphValidationSeverity(str, Enum):
 OPERATION_NODE_TYPES = (
     NodeType.INVERT_CHANNEL,
     NodeType.LEVELS_CHANNEL,
+    NodeType.REMAP_CHANNEL,
     NodeType.CLAMP_CHANNEL,
     NodeType.THRESHOLD_CHANNEL,
+    NodeType.BLUR_CHANNEL,
+    NodeType.DILATE_CHANNEL,
+    NodeType.ERODE_CHANNEL,
     NodeType.BLEND_CHANNEL,
     NodeType.LUMINANCE,
 )
@@ -133,8 +141,12 @@ def node_type_label(node_type: NodeType) -> str:
         NodeType.CONSTANT_CHANNEL: "Constant",
         NodeType.INVERT_CHANNEL: "Invert",
         NodeType.LEVELS_CHANNEL: "Levels",
+        NodeType.REMAP_CHANNEL: "Remap",
         NodeType.CLAMP_CHANNEL: "Clamp",
         NodeType.THRESHOLD_CHANNEL: "Threshold",
+        NodeType.BLUR_CHANNEL: "Blur",
+        NodeType.DILATE_CHANNEL: "Dilate",
+        NodeType.ERODE_CHANNEL: "Erode",
         NodeType.BLEND_CHANNEL: "Blend",
         NodeType.LUMINANCE: "Luminance",
         NodeType.VIEW: "View",
@@ -167,10 +179,24 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
             "out_min": 0,
             "out_max": 255,
         }
+    if node_type is NodeType.REMAP_CHANNEL:
+        return {
+            "enabled": True,
+            "in_min": 0,
+            "in_max": 255,
+            "out_min": 0,
+            "out_max": 255,
+        }
     if node_type is NodeType.CLAMP_CHANNEL:
         return {"enabled": True, "min": 0, "max": 255}
     if node_type is NodeType.THRESHOLD_CHANNEL:
         return {"enabled": True, "threshold": 128}
+    if node_type is NodeType.BLUR_CHANNEL:
+        return {"enabled": True, "radius": 1}
+    if node_type is NodeType.DILATE_CHANNEL:
+        return {"enabled": True, "radius": 1}
+    if node_type is NodeType.ERODE_CHANNEL:
+        return {"enabled": True, "radius": 1}
     if node_type is NodeType.BLEND_CHANNEL:
         return {"enabled": True, "mode": "multiply", "opacity": 100}
     if node_type is NodeType.LUMINANCE:
@@ -192,8 +218,12 @@ def resettable_node_property_keys(node_type: NodeType) -> tuple[str, ...]:
     mapping = {
         NodeType.CONSTANT_CHANNEL: ("value",),
         NodeType.LEVELS_CHANNEL: ("black", "white", "gamma", "out_min", "out_max"),
+        NodeType.REMAP_CHANNEL: ("in_min", "in_max", "out_min", "out_max"),
         NodeType.CLAMP_CHANNEL: ("min", "max"),
         NodeType.THRESHOLD_CHANNEL: ("threshold",),
+        NodeType.BLUR_CHANNEL: ("radius",),
+        NodeType.DILATE_CHANNEL: ("radius",),
+        NodeType.ERODE_CHANNEL: ("radius",),
         NodeType.BLEND_CHANNEL: ("mode", "opacity"),
     }
     return mapping.get(node_type, ())
@@ -254,12 +284,32 @@ def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
             GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
         )
+    if node_type is NodeType.REMAP_CHANNEL:
+        return (
+            GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
     if node_type is NodeType.CLAMP_CHANNEL:
         return (
             GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
         )
     if node_type is NodeType.THRESHOLD_CHANNEL:
+        return (
+            GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.BLUR_CHANNEL:
+        return (
+            GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.DILATE_CHANNEL:
+        return (
+            GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.ERODE_CHANNEL:
         return (
             GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("out", "Out", SocketDirection.OUTPUT, SocketType.CHANNEL),
