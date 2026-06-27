@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDockWidget,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -28,6 +29,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTableWidget,
@@ -183,7 +185,8 @@ class MainWindow(QMainWindow):
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(10, 10, 10, 8)
         central_layout.setSpacing(8)
-        central_layout.addWidget(self._build_top_toolbar())
+        self.top_toolbar = self._build_top_toolbar()
+        central_layout.addWidget(self.top_toolbar)
         self.workspace_stack = QStackedWidget()
         self.batch_workspace = self._build_batch_workspace()
         self.workspace_stack.addWidget(self.graph_workspace)
@@ -201,10 +204,10 @@ class MainWindow(QMainWindow):
         self.inspector_dock = self._create_dock("Inspector", self.metadata_panel, "InspectorDock")
         self.preview_dock = self._create_dock("Preview", self.preview_panel, "PreviewDock")
         self.log_dock = self._create_dock("Log", self.log_panel, "LogDock")
-        self.assets_dock.setMinimumWidth(260)
-        self.node_properties_dock.setMinimumWidth(320)
-        self.inspector_dock.setMinimumWidth(320)
-        self.preview_dock.setMinimumWidth(320)
+        self.assets_dock.setMinimumWidth(220)
+        self.node_properties_dock.setMinimumWidth(260)
+        self.inspector_dock.setMinimumWidth(260)
+        self.preview_dock.setMinimumWidth(240)
 
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.assets_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.node_properties_dock)
@@ -335,73 +338,89 @@ class MainWindow(QMainWindow):
     def _build_top_toolbar(self) -> QFrame:
         toolbar = QFrame()
         toolbar.setObjectName("TopToolbar")
-        layout = QHBoxLayout(toolbar)
+        toolbar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QVBoxLayout(toolbar)
         layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
+
+        primary_row = QHBoxLayout()
+        primary_row.setSpacing(8)
 
         title = QLabel("Texture Pipeline Workbench")
         title.setObjectName("AppTitle")
-        layout.addWidget(title)
+        primary_row.addWidget(title)
 
         self.batch_mode_button = QPushButton("Batch Converter")
         self.batch_mode_button.setObjectName("ModeButton")
         self.batch_mode_button.setCheckable(True)
         self.batch_mode_button.clicked.connect(lambda: self._set_workspace_mode(WORKSPACE_BATCH))
-        layout.addWidget(self.batch_mode_button)
+        primary_row.addWidget(self.batch_mode_button)
 
         self.graph_mode_button = QPushButton("Graph Workbench")
         self.graph_mode_button.setObjectName("ModeButton")
         self.graph_mode_button.setCheckable(True)
         self.graph_mode_button.clicked.connect(lambda: self._set_workspace_mode(WORKSPACE_GRAPH))
-        layout.addWidget(self.graph_mode_button)
+        primary_row.addWidget(self.graph_mode_button)
 
         self.active_workspace_label = QLabel("Queue")
         self.active_workspace_label.setObjectName("StatusPill")
-        layout.addWidget(self.active_workspace_label)
+        self.active_workspace_label.setMinimumWidth(0)
+        self.active_workspace_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        primary_row.addWidget(self.active_workspace_label)
 
-        layout.addStretch(1)
+        primary_row.addStretch(1)
+
+        self.toolbar_status_label = QLabel("Ready")
+        self.toolbar_status_label.setObjectName("StatusPill")
+        self.toolbar_status_label.setMinimumWidth(0)
+        self.toolbar_status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        primary_row.addWidget(self.toolbar_status_label)
+        layout.addLayout(primary_row)
+
+        secondary_row = QHBoxLayout()
+        secondary_row.setSpacing(8)
         self.top_output_label = QLabel("Export Folder")
         self.top_output_label.setToolTip(
             "Base folder for graph export. Relative Output File values resolve inside this folder."
         )
-        layout.addWidget(self.top_output_label)
+        secondary_row.addWidget(self.top_output_label)
         self.top_output_edit = QLineEdit()
         self.top_output_edit.setPlaceholderText("Base folder for graph exports")
-        self.top_output_edit.setMinimumWidth(240)
-        self.top_output_edit.setMaximumWidth(420)
+        self.top_output_edit.setMinimumWidth(160)
+        self.top_output_edit.setMaximumWidth(360)
+        self.top_output_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.top_output_edit.setToolTip(
             "Base folder for graph export. Relative Output File values resolve inside this folder."
         )
         self.top_output_edit.textEdited.connect(self._apply_top_output_path)
-        layout.addWidget(self.top_output_edit)
+        secondary_row.addWidget(self.top_output_edit, 1)
 
         self.run_batch_button = QPushButton("Run Batch")
         self.run_batch_button.setObjectName("PrimaryButton")
         self.run_batch_button.clicked.connect(self.convert_requested.emit)
-        layout.addWidget(self.run_batch_button)
+        secondary_row.addWidget(self.run_batch_button)
 
         self.export_graph_button = QPushButton("Export Graph")
         self.export_graph_button.clicked.connect(self._export_graph)
         self.export_graph_button.hide()
-        layout.addWidget(self.export_graph_button)
+        secondary_row.addWidget(self.export_graph_button)
 
         self.auto_watch_button = QPushButton("Auto Watch")
         self.auto_watch_button.setCheckable(True)
         self.auto_watch_button.clicked.connect(self._toggle_graph_auto_watch)
-        layout.addWidget(self.auto_watch_button)
+        secondary_row.addWidget(self.auto_watch_button)
 
         self.auto_export_button = QPushButton("Auto Rebuild")
         self.auto_export_button.setCheckable(True)
         self.auto_export_button.clicked.connect(self._toggle_graph_auto_export)
-        layout.addWidget(self.auto_export_button)
+        secondary_row.addWidget(self.auto_export_button)
 
         self.graph_watch_status_label = QLabel(self._graph_auto_watch_status)
         self.graph_watch_status_label.setObjectName("StatusPill")
-        layout.addWidget(self.graph_watch_status_label)
-
-        self.toolbar_status_label = QLabel("Ready")
-        self.toolbar_status_label.setObjectName("StatusPill")
-        layout.addWidget(self.toolbar_status_label)
+        self.graph_watch_status_label.setMinimumWidth(0)
+        self.graph_watch_status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        secondary_row.addWidget(self.graph_watch_status_label)
+        layout.addLayout(secondary_row)
         return toolbar
 
     def _build_assets_panel(self) -> QFrame:
@@ -415,20 +434,22 @@ class MainWindow(QMainWindow):
         title.setObjectName("PanelTitle")
         layout.addWidget(title)
 
-        buttons = QHBoxLayout()
+        buttons = QGridLayout()
+        buttons.setHorizontalSpacing(8)
+        buttons.setVerticalSpacing(8)
         add_files = QPushButton("+ Files")
         add_files.clicked.connect(self.queue_panel._pick_files)
-        buttons.addWidget(add_files)
+        buttons.addWidget(add_files, 0, 0)
         add_folder = QPushButton("+ Folder")
         add_folder.clicked.connect(self.queue_panel._pick_folder)
-        buttons.addWidget(add_folder)
+        buttons.addWidget(add_folder, 0, 1)
         reload_asset = QPushButton("Reload")
         reload_asset.clicked.connect(self._reload_selected_asset)
-        buttons.addWidget(reload_asset)
+        buttons.addWidget(reload_asset, 1, 0)
         self.remove_asset_button = QPushButton("Remove")
         self.remove_asset_button.setObjectName("DangerButton")
         self.remove_asset_button.clicked.connect(self._remove_selected_assets)
-        buttons.addWidget(self.remove_asset_button)
+        buttons.addWidget(self.remove_asset_button, 1, 1)
         layout.addLayout(buttons)
 
         self.asset_filter_edit = QLineEdit()

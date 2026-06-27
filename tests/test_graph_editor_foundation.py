@@ -422,6 +422,17 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window.deleteLater()
             self.app.processEvents()
 
+    def test_main_window_layout_does_not_force_extreme_minimum_width(self) -> None:
+        window = MainWindow()
+        try:
+            self.assertLessEqual(window.minimumSizeHint().width(), 1200)
+            self.assertLessEqual(window.top_toolbar.minimumSizeHint().width(), 900)
+            self.assertLessEqual(window.preview_panel.minimumSizeHint().width(), 260)
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
     def test_graph_asset_browser_can_remove_selected_assets(self) -> None:
         window = MainWindow()
         try:

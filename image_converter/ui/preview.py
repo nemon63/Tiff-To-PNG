@@ -68,6 +68,9 @@ class PreviewCanvas(QFrame):
     def sizeHint(self) -> QSize:
         return QSize(460, 460) if self._square_stage else QSize(920, 640)
 
+    def minimumSizeHint(self) -> QSize:
+        return QSize(180, 180 if self._square_stage else 140)
+
     def set_detach_on_double_click(self, enabled: bool) -> None:
         self._detach_on_double_click = enabled
 
@@ -309,7 +312,8 @@ class PreviewPanel(QWidget):
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
         self.setMinimumHeight(220)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 12)
         layout.setSpacing(8)
@@ -334,12 +338,16 @@ class PreviewPanel(QWidget):
 
         self.asset_label = QLabel("Ничего не выбрано")
         self.asset_label.setObjectName("PreviewFileName")
-        self.asset_label.setWordWrap(False)
+        self.asset_label.setWordWrap(True)
+        self.asset_label.setMinimumWidth(0)
+        self.asset_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.asset_label)
 
         self.asset_meta_label = QLabel("Выберите строку в очереди, чтобы открыть превью текстуры.")
         self.asset_meta_label.setObjectName("PreviewMetaText")
-        self.asset_meta_label.setWordWrap(False)
+        self.asset_meta_label.setWordWrap(True)
+        self.asset_meta_label.setMinimumWidth(0)
+        self.asset_meta_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.asset_meta_label)
 
         self.fit_shortcut = QShortcut(QKeySequence("F"), self)
@@ -644,6 +652,12 @@ class PreviewPanel(QWidget):
         channel_x = stage_rect.right() - margin - self.channel_host.width()
         channel_y = top
         self.channel_host.move(max(left, channel_x), channel_y)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(220, 220)
+
+    def sizeHint(self) -> QSize:
+        return QSize(360, 520)
 
 
 class DetachedPreviewWindow(QWidget):
