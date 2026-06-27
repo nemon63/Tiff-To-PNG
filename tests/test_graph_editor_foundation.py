@@ -18,8 +18,10 @@ from image_converter.domain.models import (
     AppSettings,
     AssetKind,
     AssetMetadata,
+    BatchRequest,
     BatchSource,
     ChannelPackLayout,
+    ChannelPackingMode,
     ChannelPackingOptions,
     ConversionOptions,
     NamingRules,
@@ -38,7 +40,7 @@ from image_converter.domain.node_graph import (
     make_connection_id,
 )
 from image_converter.services.asset_queue import AssetScanner
-from image_converter.services.conversion import ImageConverter
+from image_converter.services.conversion import BatchConversionService, ImageConverter
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.node_graph_executor import NodeGraphExecutor
@@ -448,6 +450,37 @@ class ChannelPackingPlanTests(unittest.TestCase):
 
         self.assertIn("Packing plan (ORM): ready 5, incomplete 0.", summary)
         self.assertIn("... and 1 more set(s).", summary)
+
+    def test_pack_only_mode_creates_packed_texture_without_regular_png_exports(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "textures"
+            output_root = Path(tmp) / "out"
+            root.mkdir()
+            Image.new("L", (8, 8), 64).save(root / "sword_ao.png")
+            Image.new("L", (8, 8), 128).save(root / "sword_roughness.png")
+            Image.new("L", (8, 8), 196).save(root / "sword_metallic.png")
+
+            request = BatchRequest(
+                input_path=root,
+                output_root=output_root,
+                options=ConversionOptions(
+                    packing=ChannelPackingOptions(
+                        enabled=True,
+                        layout=ChannelPackLayout.ORM,
+                        mode=ChannelPackingMode.PACK_ONLY,
+                    ),
+                ),
+            )
+
+            summary = BatchConversionService().run(request)
+
+            self.assertTrue((output_root / "sword_orm.png").exists())
+            self.assertFalse((output_root / "sword_ao.png").exists())
+            self.assertFalse((output_root / "sword_roughness.png").exists())
+            self.assertFalse((output_root / "sword_metallic.png").exists())
+            self.assertEqual(0, summary.total)
+            self.assertEqual(1, summary.packed_created)
+            self.assertIn("packed only", summary.as_text())
 
 
 class GraphEditorFoundationTests(unittest.TestCase):
@@ -1381,11 +1414,58 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window._refresh_packing_preflight()
 
             text = window.settings_panel.packing_queue_label.text()
+            self.assertIn("Mode: Convert + Pack.", text)
             self.assertIn("Packing plan (ORM): ready 1, incomplete 0.", text)
             self.assertIn("- Sword/sword -> Sword/sword_orm.png", text)
             self.assertIn("R=sword_ao.png", text)
             self.assertIn("G=sword_roughness.png", text)
             self.assertIn("B=sword_metallic.png", text)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_pack_only_mode_updates_queue_output_hint_and_preflight(self) -> None:
+        queue_root = Path("D:/textures")
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.ORM,
+                mode=ChannelPackingMode.PACK_ONLY,
+            ),
+        )
+        window = MainWindow()
+        try:
+            window.settings_panel.apply_conversion_options(options)
+            window._queue_items = [
+                QueueItem(
+                    source=BatchSource(queue_root / "Sword/sword_ao.png", queue_root, TextureMapType.AO),
+                    asset_kind=AssetKind.IMAGE,
+                    metadata=AssetMetadata("PNG", 1024, 1024, "L", False, 1024, TextureMapType.AO),
+                ),
+                QueueItem(
+                    source=BatchSource(queue_root / "Sword/sword_roughness.png", queue_root, TextureMapType.ROUGHNESS),
+                    asset_kind=AssetKind.IMAGE,
+                    metadata=AssetMetadata("PNG", 1024, 1024, "L", False, 1024, TextureMapType.ROUGHNESS),
+                ),
+                QueueItem(
+                    source=BatchSource(queue_root / "Sword/sword_metallic.png", queue_root, TextureMapType.METALLIC),
+                    asset_kind=AssetKind.IMAGE,
+                    metadata=AssetMetadata("PNG", 1024, 1024, "L", False, 1024, TextureMapType.METALLIC),
+                ),
+            ]
+
+            window._update_queue_output_paths()
+
+            preflight_text = window.settings_panel.packing_queue_label.text()
+            self.assertIn("Mode: Pack Only.", preflight_text)
+            self.assertIn("Packing plan (ORM): ready 1, incomplete 0.", preflight_text)
+            self.assertEqual("Packed output only", window.queue_panel.table.item(0, 5).text())
+            self.assertIn("sword_orm.png", window.queue_panel.table.item(0, 5).toolTip())
+            self.assertIn(
+                "соберет только итоговый packed texture",
+                window.settings_panel.packing_mode_label.text(),
+            )
         finally:
             window.close()
             window.deleteLater()

@@ -10,6 +10,7 @@ from image_converter.domain.models import (
     BatchRequest,
     BatchSource,
     BatchSummary,
+    ChannelPackingMode,
     ConversionOptions,
     ConversionResult,
     ConversionStatus,
@@ -72,37 +73,45 @@ class BatchConversionService:
         on_item_complete: Callable[[ConversionResult], None] | None = None,
     ) -> BatchSummary:
         write_log = logger or (lambda _message: None)
-        summary = BatchSummary()
+        summary = BatchSummary(packed_only_mode=request.options.packing.mode is ChannelPackingMode.PACK_ONLY)
         source_specs = list(self.iter_request_sources(request))
+        should_convert_sources = not (
+            request.options.packing.enabled
+            and request.options.packing.mode is ChannelPackingMode.PACK_ONLY
+        )
 
-        for source_spec in source_specs:
-            source = source_spec.path
-            destination = self.build_destination_for_source(
-                source_spec,
-                request.output_root,
-                request.options,
-            )
-            try:
-                if on_item_start is not None:
-                    on_item_start(source)
-                result = self._converter.convert(source, destination, request.options)
-                write_log(f"{source.name} -> {result.message}")
-                summary.register(result)
-                if on_item_complete is not None:
-                    on_item_complete(result)
-                if result.is_success and request.options.delete_source:
-                    self._delete_source(source, destination, write_log)
-            except Exception as exc:
-                failed_result = ConversionResult(
-                    source=source,
-                    destination=destination,
-                    status=ConversionStatus.FAILED,
-                    message=f"ОШИБКА: {exc}",
+        if should_convert_sources:
+            for source_spec in source_specs:
+                source = source_spec.path
+                destination = self.build_destination_for_source(
+                    source_spec,
+                    request.output_root,
+                    request.options,
                 )
-                write_log(f"{source.name} -> {failed_result.message}")
-                summary.register(failed_result)
-                if on_item_complete is not None:
-                    on_item_complete(failed_result)
+                try:
+                    if on_item_start is not None:
+                        on_item_start(source)
+                    result = self._converter.convert(source, destination, request.options)
+                    write_log(f"{source.name} -> {result.message}")
+                    summary.register(result)
+                    if on_item_complete is not None:
+                        on_item_complete(result)
+                    if result.is_success and request.options.delete_source:
+                        self._delete_source(source, destination, write_log)
+                except Exception as exc:
+                    failed_result = ConversionResult(
+                        source=source,
+                        destination=destination,
+                        status=ConversionStatus.FAILED,
+                        message=f"ОШИБКА: {exc}",
+                    )
+                    write_log(f"{source.name} -> {failed_result.message}")
+                    summary.register(failed_result)
+                    if on_item_complete is not None:
+                        on_item_complete(failed_result)
+        elif source_specs:
+            write_log("---- Source Conversion ----")
+            write_log("Skipped regular PNG export. Pack Only mode is enabled.")
 
         if request.options.packing.enabled:
             pack_jobs = build_channel_pack_jobs(source_specs, request.output_root, request.options)
@@ -120,6 +129,7 @@ class BatchConversionService:
                 except Exception as exc:
                     write_log(f"PACK {job.layout.label} {job.group_name} -> ОШИБКА: {exc}")
                     pack_failed += 1
+                    summary.register_packed(ConversionStatus.FAILED)
                     continue
 
                 write_log(f"PACK {job.layout.label} {job.group_name} -> {pack_result.message}")
@@ -129,6 +139,7 @@ class BatchConversionService:
                     pack_skipped += 1
                 else:
                     pack_failed += 1
+                summary.register_packed(pack_result.status)
 
             write_log(
                 f"Packing итоги: создано={pack_created}, пропущено={pack_skipped}, ошибок={pack_failed}"

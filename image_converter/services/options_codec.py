@@ -4,6 +4,7 @@ from typing import Any
 
 from image_converter.domain.models import (
     ChannelPackLayout,
+    ChannelPackingMode,
     ChannelPackingOptions,
     ConversionOptions,
     NamingRules,
@@ -33,6 +34,7 @@ def serialize_conversion_options(options: ConversionOptions) -> dict[str, Any]:
         "packing": {
             "enabled": options.packing.enabled,
             "layout": options.packing.layout.value,
+            "mode": options.packing.mode.value,
         },
     }
 
@@ -58,6 +60,13 @@ def deserialize_conversion_options(data: dict[str, Any]) -> ConversionOptions:
     except ValueError:
         packing_layout = ChannelPackLayout.ORM
 
+    try:
+        packing_mode = ChannelPackingMode(
+            packing_data.get("mode", ChannelPackingMode.AFTER_CONVERSION.value)
+        )
+    except ValueError:
+        packing_mode = ChannelPackingMode.AFTER_CONVERSION
+
     return ConversionOptions(
         recursive=bool(data.get("recursive", True)),
         force_rgba=bool(data.get("force_rgba", False)),
@@ -79,6 +88,7 @@ def deserialize_conversion_options(data: dict[str, Any]) -> ConversionOptions:
         packing=ChannelPackingOptions(
             enabled=bool(packing_data.get("enabled", False)),
             layout=packing_layout,
+            mode=packing_mode,
         ),
     )
 

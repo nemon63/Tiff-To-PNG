@@ -26,6 +26,7 @@ from image_converter.domain.models import (
     AppSettings,
     BatchRequest,
     ChannelPackLayout,
+    ChannelPackingMode,
     ChannelPackingOptions,
     ConversionOptions,
     ConversionPreset,
@@ -52,6 +53,7 @@ class SettingsPanel(QWidget):
         self._presets_by_id: dict[str, ConversionPreset] = {}
         self._suppress_option_signal = False
         self._packing_preflight_text = "Подходящих наборов для packing пока нет."
+        self._packing_mode_text = ""
         self._build_ui()
         self._connect_option_change_signals()
         self._update_resize_state()
@@ -69,7 +71,7 @@ class SettingsPanel(QWidget):
         title_label.setObjectName("PanelTitle")
         root_layout.addWidget(title_label)
 
-        subtitle_label = QLabel("Batch export, naming, packing and PNG settings.")
+        subtitle_label = QLabel("Настройки batch-конвертации, packing и формата экспорта.")
         subtitle_label.setObjectName("PanelSubtitle")
         subtitle_label.setWordWrap(True)
         root_layout.addWidget(subtitle_label)
@@ -122,7 +124,7 @@ class SettingsPanel(QWidget):
         return tab
 
     def _build_presets_group(self) -> QGroupBox:
-        group = QGroupBox("Workflow Presets")
+        group = QGroupBox("Workflow Preset")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
@@ -247,22 +249,36 @@ class SettingsPanel(QWidget):
         return group
 
     def _build_packing_group(self) -> QGroupBox:
-        group = QGroupBox("Channel Packing")
+        group = QGroupBox("Packed Texture")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
-        self.pack_enable_checkbox = QCheckBox("Собирать packed-textures после batch")
+        self.pack_enable_checkbox = QCheckBox("Собрать packed texture из набора карт")
         self.pack_enable_checkbox.toggled.connect(self._refresh_packing_ui)
         layout.addWidget(self.pack_enable_checkbox)
 
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        self.pack_mode_combo = QComboBox()
+        for packing_mode in ChannelPackingMode:
+            self.pack_mode_combo.addItem(packing_mode.label, packing_mode)
+        self.pack_mode_combo.currentIndexChanged.connect(self._refresh_packing_ui)
+        mode_row.addWidget(self.pack_mode_combo, 1)
+        layout.addLayout(mode_row)
+
         layout_row = QHBoxLayout()
-        layout_row.addWidget(QLabel("Layout:"))
+        layout_row.addWidget(QLabel("Target Pack:"))
         self.pack_layout_combo = QComboBox()
         for pack_layout in ChannelPackLayout:
             self.pack_layout_combo.addItem(pack_layout.label, pack_layout)
         self.pack_layout_combo.currentIndexChanged.connect(self._refresh_packing_ui)
         layout_row.addWidget(self.pack_layout_combo, 1)
         layout.addLayout(layout_row)
+
+        self.packing_mode_label = QLabel()
+        self.packing_mode_label.setObjectName("SummaryText")
+        self.packing_mode_label.setWordWrap(True)
+        layout.addWidget(self.packing_mode_label)
 
         self.packing_mapping_label = QLabel()
         self.packing_mapping_label.setObjectName("SummaryText")
@@ -274,7 +290,11 @@ class SettingsPanel(QWidget):
         self.packing_queue_label.setWordWrap(True)
         layout.addWidget(self.packing_queue_label)
 
-        self._register_interactive(self.pack_enable_checkbox, self.pack_layout_combo)
+        self._register_interactive(
+            self.pack_enable_checkbox,
+            self.pack_mode_combo,
+            self.pack_layout_combo,
+        )
         return group
 
     def _build_basic_group(self) -> QGroupBox:
@@ -417,6 +437,7 @@ class SettingsPanel(QWidget):
             widget.valueChanged.connect(self._notify_options_changed)
 
         self.pack_layout_combo.currentIndexChanged.connect(self._notify_options_changed)
+        self.pack_mode_combo.currentIndexChanged.connect(self._notify_options_changed)
 
     def _set_input_path(self, path: str) -> None:
         self.input_edit.setText(path)
@@ -489,9 +510,13 @@ class SettingsPanel(QWidget):
         layout_data = self.pack_layout_combo.currentData()
         if not isinstance(layout_data, ChannelPackLayout):
             layout_data = ChannelPackLayout.ORM
+        mode_data = self.pack_mode_combo.currentData()
+        if not isinstance(mode_data, ChannelPackingMode):
+            mode_data = ChannelPackingMode.AFTER_CONVERSION
         return ChannelPackingOptions(
             enabled=self.pack_enable_checkbox.isChecked(),
             layout=layout_data,
+            mode=mode_data,
         )
 
     def build_conversion_options(self) -> ConversionOptions:
@@ -540,6 +565,10 @@ class SettingsPanel(QWidget):
             for index in range(self.pack_layout_combo.count()):
                 if self.pack_layout_combo.itemData(index) == options.packing.layout:
                     self.pack_layout_combo.setCurrentIndex(index)
+                    break
+            for index in range(self.pack_mode_combo.count()):
+                if self.pack_mode_combo.itemData(index) == options.packing.mode:
+                    self.pack_mode_combo.setCurrentIndex(index)
                     break
             self.resize_percent_spin.setValue(options.resize_percent)
             self.max_side_spin.setValue(options.max_side)
@@ -626,13 +655,15 @@ class SettingsPanel(QWidget):
 
         if preset is None:
             self.preset_summary_label.setText(
-                "Current working settings."
+                "Текущие ручные настройки. Preset не применен."
             )
             return
 
         source_label = "Системный" if preset.is_system else "Пользовательский"
         description = preset.description or "Без описания."
-        self.preset_summary_label.setText(f"{source_label} preset: {description}")
+        self.preset_summary_label.setText(
+            f"{source_label} preset для готового сценария экспорта. {description}"
+        )
 
     def _notify_options_changed(self, *_args: object) -> None:
         if self._suppress_option_signal:
@@ -643,7 +674,7 @@ class SettingsPanel(QWidget):
         naming_rules = self.build_naming_rules()
         if not naming_rules.is_enabled:
             self.naming_summary_label.setText(
-                "Output names follow source names."
+                "Имена выходных файлов повторяют исходники."
             )
             return
 
@@ -659,11 +690,13 @@ class SettingsPanel(QWidget):
     def _refresh_packing_ui(self, *_args: object) -> None:
         packing_options = self.build_channel_packing_options()
         self.pack_layout_combo.setEnabled(self.pack_enable_checkbox.isChecked())
+        self.pack_mode_combo.setEnabled(self.pack_enable_checkbox.isChecked())
+        self.packing_mode_label.setText(self._packing_mode_description(packing_options))
         self.packing_mapping_label.setText(channel_pack_mapping_text(packing_options.layout))
 
         if not packing_options.enabled:
             self.packing_queue_label.setText(
-                "Packing disabled."
+                "Packed texture выключен. Будут сохранены обычные PNG по каждому исходнику."
             )
             return
 
@@ -678,3 +711,10 @@ class SettingsPanel(QWidget):
 
     def sizeHint(self) -> QSize:
         return QSize(360, 900)
+
+    def _packing_mode_description(self, packing_options: ChannelPackingOptions) -> str:
+        if not packing_options.enabled:
+            return "Режим packing выключен."
+        if packing_options.mode is ChannelPackingMode.PACK_ONLY:
+            return "Pack Only: приложение соберет только итоговый packed texture и не будет сохранять обычные PNG по каждому исходнику."
+        return "Convert + Pack: сначала сохраняются обычные PNG по каждому исходнику, затем поверх них собирается packed texture."

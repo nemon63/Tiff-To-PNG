@@ -45,6 +45,7 @@ from image_converter.domain.models import (
     AppSettings,
     BatchRequest,
     BatchSource,
+    ChannelPackingMode,
     ConversionPreset,
     QueueItem,
     QueueStatus,
@@ -903,10 +904,20 @@ class MainWindow(QMainWindow):
         selected_key = self._selected_queue_key()
         self.queue_panel.drop_hint.setVisible(not self._queue_items)
         table.setRowCount(len(self._queue_items))
+        options = self.settings_panel.build_conversion_options()
 
         for row, item in enumerate(self._queue_items):
             metadata = item.metadata
-            output_text = str(item.output_path) if item.output_path is not None else "-"
+            if options.packing.enabled and options.packing.mode is ChannelPackingMode.PACK_ONLY:
+                output_text = "Packed output only"
+                output_tooltip = (
+                    str(item.output_path)
+                    if item.output_path is not None
+                    else "Файл будет создан только как часть packed texture."
+                )
+            else:
+                output_text = str(item.output_path) if item.output_path is not None else "-"
+                output_tooltip = output_text
             status_text = _queue_status_display(item)
             status_tooltip = item.message or status_text
             dynamic_warnings = item_preflight_warnings(item)
@@ -919,7 +930,7 @@ class MainWindow(QMainWindow):
                 self._make_table_item(metadata.size_text if metadata else "-", tooltip=self._metadata_tooltip(item)),
                 self._make_table_item(metadata.resolution_text if metadata else "-", tooltip=self._metadata_tooltip(item)),
                 self._make_table_item(status_text, tooltip=status_tooltip),
-                self._make_table_item(output_text, tooltip=output_text),
+                self._make_table_item(output_text, tooltip=output_tooltip),
             ]
             row_items[0].setData(Qt.ItemDataRole.UserRole, self._queue_key(item.path))
 
@@ -1012,12 +1023,17 @@ class MainWindow(QMainWindow):
             return str(path).lower()
 
     def _build_output_path(self, source: BatchSource) -> Path:
+        options = self.settings_panel.build_conversion_options()
         output_root_text = self.settings_panel.output_edit.text().strip()
         output_root = Path(output_root_text) if output_root_text else None
+        if options.packing.enabled and options.packing.mode is ChannelPackingMode.PACK_ONLY:
+            pack_jobs = build_channel_pack_jobs([source], output_root, options)
+            if pack_jobs:
+                return pack_jobs[0].output_path
         return BatchConversionService.build_destination_for_source(
             source,
             output_root,
-            self.settings_panel.build_conversion_options(),
+            options,
         )
 
     def _update_queue_output_paths(self, *_args: object) -> None:
@@ -1064,7 +1080,12 @@ class MainWindow(QMainWindow):
 
         sources = [item.batch_source for item in self._queue_items if item.status is not QueueStatus.ERROR]
         jobs = build_channel_pack_jobs(sources, None, options)
-        self.settings_panel.set_packing_preflight_summary(summarize_channel_pack_jobs(jobs))
+        summary = summarize_channel_pack_jobs(jobs)
+        if options.packing.mode is ChannelPackingMode.PACK_ONLY:
+            summary = "Mode: Pack Only. Будет создан только packed texture.\n" + summary
+        else:
+            summary = "Mode: Convert + Pack. Сначала обычные PNG, затем packed texture.\n" + summary
+        self.settings_panel.set_packing_preflight_summary(summary)
 
     def _apply_preset(self, preset_id: str) -> None:
         preset = self._presets_by_id.get(preset_id)

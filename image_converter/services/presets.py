@@ -6,6 +6,7 @@ from pathlib import Path
 
 from image_converter.domain.models import (
     ChannelPackLayout,
+    ChannelPackingMode,
     ChannelPackingOptions,
     ConversionOptions,
     ConversionPreset,
@@ -62,6 +63,7 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
             packing=ChannelPackingOptions(
                 enabled=True,
                 layout=ChannelPackLayout.UNITY_URP,
+                mode=ChannelPackingMode.PACK_ONLY,
             ),
         ),
     ),
@@ -80,6 +82,7 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
             packing=ChannelPackingOptions(
                 enabled=True,
                 layout=ChannelPackLayout.UNITY_HDRP,
+                mode=ChannelPackingMode.PACK_ONLY,
             ),
         ),
     ),

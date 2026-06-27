@@ -108,6 +108,19 @@ class ChannelPackLayout(str, Enum):
         return mapping[self]
 
 
+class ChannelPackingMode(str, Enum):
+    AFTER_CONVERSION = "after_conversion"
+    PACK_ONLY = "pack_only"
+
+    @property
+    def label(self) -> str:
+        mapping = {
+            ChannelPackingMode.AFTER_CONVERSION: "Сначала PNG, потом Packed",
+            ChannelPackingMode.PACK_ONLY: "Только Packed",
+        }
+        return mapping[self]
+
+
 @dataclass(slots=True, frozen=True)
 class NamingRules:
     lowercase: bool = False
@@ -123,6 +136,7 @@ class NamingRules:
 class ChannelPackingOptions:
     enabled: bool = False
     layout: ChannelPackLayout = ChannelPackLayout.ORM
+    mode: ChannelPackingMode = ChannelPackingMode.AFTER_CONVERSION
 
 
 @dataclass(slots=True, frozen=True)
@@ -253,7 +267,7 @@ class QueueItem:
 @dataclass(slots=True, frozen=True)
 class ConversionResult:
     source: Path
-    destination: Path
+    destination: Path | None
     status: ConversionStatus
     message: str
 
@@ -268,6 +282,10 @@ class BatchSummary:
     succeeded: int = 0
     skipped: int = 0
     failed: int = 0
+    packed_created: int = 0
+    packed_skipped: int = 0
+    packed_failed: int = 0
+    packed_only_mode: bool = False
 
     def register(self, result: ConversionResult) -> None:
         self.total += 1
@@ -278,11 +296,36 @@ class BatchSummary:
         else:
             self.failed += 1
 
+    def register_packed(self, status: ConversionStatus) -> None:
+        if status is ConversionStatus.SUCCESS:
+            self.packed_created += 1
+        elif status is ConversionStatus.SKIPPED:
+            self.packed_skipped += 1
+        else:
+            self.packed_failed += 1
+
     def as_text(self) -> str:
-        return (
+        if self.packed_only_mode:
+            return (
+                "Готово. packed only: "
+                f"создано={self.packed_created}, "
+                f"пропущено={self.packed_skipped}, "
+                f"ошибок={self.packed_failed}"
+            )
+
+        base_text = (
             f"Готово. всего={self.total}, успешно={self.succeeded}, "
             f"пропущено={self.skipped}, ошибок={self.failed}"
         )
+        if self.packed_created or self.packed_skipped or self.packed_failed:
+            return (
+                base_text
+                + "; packed textures: "
+                + f"создано={self.packed_created}, "
+                + f"пропущено={self.packed_skipped}, "
+                + f"ошибок={self.packed_failed}"
+            )
+        return base_text
 
 
 @dataclass(slots=True, frozen=True)

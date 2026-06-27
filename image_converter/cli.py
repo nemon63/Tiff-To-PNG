@@ -8,6 +8,7 @@ from image_converter.domain.errors import ValidationError
 from image_converter.domain.models import (
     BatchRequest,
     ChannelPackLayout,
+    ChannelPackingMode,
     ChannelPackingOptions,
     ConversionOptions,
     NamingRules,
@@ -60,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[layout.value for layout in ChannelPackLayout],
         default="",
         help="Build packed texture after batch conversion: orm, rma, mra, unity_urp or unity_hdrp",
+    )
+    parser.add_argument(
+        "--pack-only",
+        action="store_true",
+        help="Build only packed textures and skip regular per-file PNG conversion",
     )
     parser.add_argument(
         "--compress-level",
@@ -122,6 +128,7 @@ def build_request_from_args(args: argparse.Namespace) -> BatchRequest:
         packing = ChannelPackingOptions(
             enabled=True,
             layout=ChannelPackLayout(args.pack_layout),
+            mode=ChannelPackingMode.PACK_ONLY if args.pack_only else ChannelPackingMode.AFTER_CONVERSION,
         )
 
     return BatchRequest(
