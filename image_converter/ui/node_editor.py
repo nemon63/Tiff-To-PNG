@@ -131,6 +131,10 @@ TEXTURE_PORT_LABEL_X_PAD = 34
 GRAPH_LAYOUT_X_SPACING = 300
 GRAPH_LAYOUT_Y_SPACING = 36
 GRAPH_LAYOUT_GRID = 20
+PREVIEW_MODE_FULL = "full"
+PREVIEW_MODE_DRAFT = "draft"
+DRAFT_PREVIEW_MAX_SIDE = 512
+NUMERIC_PREVIEW_DEBOUNCE_MS = 125
 
 OUTPUT_PROFILE_FILENAMES = {
     OutputProfile.GENERIC_RGBA: "packed_rgba.png",
@@ -1327,7 +1331,8 @@ class GraphView(QGraphicsView):
 
 
 class NodePropertiesPanel(QWidget):
-    node_changed = pyqtSignal(object, object, object, bool)
+    node_changed = pyqtSignal(object, object, object, bool, object)
+    preview_refresh_requested = pyqtSignal(object, object)
     output_profile_apply_requested = pyqtSignal(object)
     output_inputs_clear_requested = pyqtSignal(object)
     node_reset_requested = pyqtSignal(object)
@@ -1336,6 +1341,11 @@ class NodePropertiesPanel(QWidget):
         super().__init__(parent)
         self._node: GraphNode | None = None
         self._suppress = False
+        self._slider_drag_active = False
+        self._numeric_preview_timer = QTimer(self)
+        self._numeric_preview_timer.setSingleShot(True)
+        self._numeric_preview_timer.setInterval(NUMERIC_PREVIEW_DEBOUNCE_MS)
+        self._numeric_preview_timer.timeout.connect(self._flush_numeric_preview)
         self._build_ui()
         self.set_node(None)
 
@@ -1343,7 +1353,7 @@ class NodePropertiesPanel(QWidget):
         spin = QSpinBox()
         spin.setRange(0, 255)
         spin.setKeyboardTracking(False)
-        spin.valueChanged.connect(self._apply_changes)
+        spin.valueChanged.connect(self._on_numeric_value_changed)
         return spin
 
     def _make_int_spin(self, minimum: int, maximum: int, *, suffix: str = "") -> QSpinBox:
@@ -1352,7 +1362,7 @@ class NodePropertiesPanel(QWidget):
         spin.setKeyboardTracking(False)
         if suffix:
             spin.setSuffix(suffix)
-        spin.valueChanged.connect(self._apply_changes)
+        spin.valueChanged.connect(self._on_numeric_value_changed)
         return spin
 
     def _make_slider_spin_pair(
@@ -1366,12 +1376,13 @@ class NodePropertiesPanel(QWidget):
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(minimum, maximum)
         slider.setValue(initial)
-        slider.valueChanged.connect(self._apply_changes)
 
         spin = self._make_int_spin(minimum, maximum, suffix=suffix)
         spin.setValue(initial)
         slider.valueChanged.connect(spin.setValue)
         spin.valueChanged.connect(slider.setValue)
+        slider.sliderPressed.connect(self._on_slider_drag_started)
+        slider.sliderReleased.connect(self._on_slider_drag_finished)
         return slider, spin
 
     def _make_byte_slider_pair(self, initial: int = 0) -> tuple[QSlider, QSpinBox]:
@@ -1457,7 +1468,7 @@ class NodePropertiesPanel(QWidget):
         self.level_gamma_spin.setSingleStep(0.05)
         self.level_gamma_spin.setDecimals(2)
         self.level_gamma_spin.setKeyboardTracking(False)
-        self.level_gamma_spin.valueChanged.connect(self._apply_changes)
+        self.level_gamma_spin.valueChanged.connect(self._on_numeric_value_changed)
         self.form.addRow("Gamma", self.level_gamma_spin)
         self.level_out_min_slider, self.level_out_min_spin = self._make_byte_slider_pair()
         self.level_out_min_host = self._byte_row_widget(self.level_out_min_slider, self.level_out_min_spin)
@@ -1568,6 +1579,8 @@ class NodePropertiesPanel(QWidget):
         self._node = node
         self._suppress = True
         try:
+            self._numeric_preview_timer.stop()
+            self._slider_drag_active = False
             self.empty_label.setVisible(node is None)
             self.form_host.setVisible(node is not None)
             self.reset_parameters_button.setVisible(
@@ -1764,6 +1777,34 @@ class NodePropertiesPanel(QWidget):
         self.profile_summary_label.setText(text)
 
     def _apply_changes(self, *_args: object) -> None:
+        self._emit_node_change(PREVIEW_MODE_FULL)
+
+    def _on_numeric_value_changed(self, *_args: object) -> None:
+        if self._suppress or self._node is None:
+            return
+        if self._slider_drag_active:
+            self._numeric_preview_timer.stop()
+            self._emit_node_change(PREVIEW_MODE_DRAFT)
+            return
+        self._numeric_preview_timer.start()
+
+    def _flush_numeric_preview(self) -> None:
+        self._emit_node_change(PREVIEW_MODE_FULL)
+
+    def _on_slider_drag_started(self) -> None:
+        if self._suppress:
+            return
+        self._slider_drag_active = True
+        self._numeric_preview_timer.stop()
+
+    def _on_slider_drag_finished(self) -> None:
+        was_dragging = self._slider_drag_active
+        self._slider_drag_active = False
+        if self._suppress or self._node is None or not was_dragging:
+            return
+        self.preview_refresh_requested.emit(self._node, PREVIEW_MODE_FULL)
+
+    def _emit_node_change(self, preview_mode: str) -> None:
         if self._suppress or self._node is None:
             return
         previous_title = self._node.title
@@ -1814,7 +1855,7 @@ class NodePropertiesPanel(QWidget):
         needs_rebuild = previous_title != next_title
         if self._node.node_type is NodeType.TEXTURE_INPUT:
             needs_rebuild = needs_rebuild or previous_path != str(next_properties.get("path", ""))
-        self.node_changed.emit(self._node, next_title, next_properties, needs_rebuild)
+        self.node_changed.emit(self._node, next_title, next_properties, needs_rebuild, preview_mode)
 
     @staticmethod
     def _coerce_int(value: object, default: int) -> int:
@@ -1859,7 +1900,8 @@ class GraphWorkspace(QWidget):
         self._preview_threads: list[QThread] = []
         self._preview_workers: list[GraphPreviewWorker] = []
         self._preview_inflight_generation = 0
-        self._pending_preview_request: tuple[str, str] | None = None
+        self._pending_preview_request: tuple[str, str, str] | None = None
+        self._last_preview_quality_request = PREVIEW_MODE_FULL
         self._recent_project_dirs: list[Path] = []
         self._shortcuts = []
         self._repository = NodeGraphProjectRepository()
@@ -1980,6 +2022,7 @@ class GraphWorkspace(QWidget):
         self.view.node_add_requested.connect(self.add_node_of_type)
         self.properties_panel = NodePropertiesPanel()
         self.properties_panel.node_changed.connect(self._on_node_properties_changed)
+        self.properties_panel.preview_refresh_requested.connect(self._on_preview_refresh_requested)
         self.properties_panel.output_profile_apply_requested.connect(self._apply_output_profile)
         self.properties_panel.output_inputs_clear_requested.connect(self._clear_output_inputs)
         self.properties_panel.node_reset_requested.connect(self._on_node_reset_clicked)
@@ -2141,6 +2184,7 @@ class GraphWorkspace(QWidget):
         self._preview_generation += 1
         self._preview_inflight_generation = 0
         self._pending_preview_request = None
+        self._last_preview_quality_request = PREVIEW_MODE_FULL
         self._preview_cache.clear()
         self.undo_stack.clear()
         self._scene.project = self.project
@@ -2203,6 +2247,7 @@ class GraphWorkspace(QWidget):
         self._preview_generation += 1
         self._preview_inflight_generation = 0
         self._pending_preview_request = None
+        self._last_preview_quality_request = PREVIEW_MODE_FULL
         self._preview_cache.clear()
         self.undo_stack.clear()
         self._scene.project = self.project
@@ -2751,6 +2796,7 @@ class GraphWorkspace(QWidget):
         title: object,
         properties: object,
         needs_rebuild: bool,
+        preview_mode: object,
     ) -> None:
         if not isinstance(title, str) or not isinstance(properties, dict):
             return
@@ -2765,6 +2811,10 @@ class GraphWorkspace(QWidget):
                 needs_rebuild=needs_rebuild,
             ),
             select_node_ids=[node.node_id],
+        )
+        self._on_preview_refresh_requested(
+            node,
+            preview_mode if isinstance(preview_mode, str) else PREVIEW_MODE_FULL,
         )
 
     def _apply_output_profile(self, node: GraphNode | None) -> None:
@@ -3592,7 +3642,7 @@ class GraphWorkspace(QWidget):
             self._preview_display_node(display_node)
 
     def _preview_display_node(self, node: GraphNode) -> None:
-        self._request_preview_node(node)
+        self._request_preview_node(node, preview_mode=PREVIEW_MODE_FULL)
 
     def _preview_view_node(self, node: GraphNode | None) -> None:
         if node is None or node.node_type is not NodeType.VIEW:
@@ -3603,23 +3653,36 @@ class GraphWorkspace(QWidget):
             target_socket_id="in",
         ) is None:
             return
-        self._request_preview_node(node)
+        self._request_preview_node(node, preview_mode=PREVIEW_MODE_FULL)
 
     def _preview_output_node(self, node: GraphNode) -> None:
         mode = self._output_mode_label(node)
-        self._request_preview_node(node, mode_label=mode)
+        self._request_preview_node(node, mode_label=mode, preview_mode=PREVIEW_MODE_FULL)
 
-    def _request_preview_node(self, node: GraphNode, *, mode_label: str = "") -> None:
+    def _request_preview_node(
+        self,
+        node: GraphNode,
+        *,
+        mode_label: str = "",
+        preview_mode: str = PREVIEW_MODE_FULL,
+    ) -> None:
         self._last_preview_node_id = node.node_id
         self._last_preview_mode_label = mode_label
+        self._last_preview_quality_request = preview_mode
         self._preview_generation += 1
         generation = self._preview_generation
         if self._preview_inflight_generation:
-            self._pending_preview_request = (node.node_id, mode_label)
+            self._pending_preview_request = (node.node_id, mode_label, preview_mode)
             return
-        self._start_preview_request(node, mode_label, generation)
+        self._start_preview_request(node, mode_label, generation, preview_mode)
 
-    def _start_preview_request(self, node: GraphNode, mode_label: str, generation: int) -> None:
+    def _start_preview_request(
+        self,
+        node: GraphNode,
+        mode_label: str,
+        generation: int,
+        preview_mode: str,
+    ) -> None:
         self._preview_inflight_generation = generation
         snapshot = deepcopy(self.project)
         node_snapshot = next(
@@ -3633,13 +3696,14 @@ class GraphWorkspace(QWidget):
         if node_snapshot is None:
             self._preview_inflight_generation = 0
             return
+        max_side = self._preview_max_side_for_mode(preview_mode)
         thread = QThread(self)
         worker = GraphPreviewWorker(
             generation,
             snapshot,
             node_snapshot,
             mode_label=mode_label,
-            max_side=self._preview_cache.max_side,
+            max_side=max_side,
             preview_cache=self._preview_cache,
         )
         worker.moveToThread(thread)
@@ -3670,8 +3734,13 @@ class GraphWorkspace(QWidget):
         if node is None:
             self._last_preview_node_id = None
             self._last_preview_mode_label = ""
+            self._last_preview_quality_request = PREVIEW_MODE_FULL
             return False
-        self._request_preview_node(node, mode_label=self._last_preview_mode_label)
+        self._request_preview_node(
+            node,
+            mode_label=self._last_preview_mode_label,
+            preview_mode=self._last_preview_quality_request,
+        )
         return True
 
     def _on_preview_worker_finished(
@@ -3705,8 +3774,8 @@ class GraphWorkspace(QWidget):
         if pending is not None:
             self._restart_pending_preview(pending)
 
-    def _restart_pending_preview(self, pending: tuple[str, str]) -> None:
-        node_id, mode_label = pending
+    def _restart_pending_preview(self, pending: tuple[str, str, str]) -> None:
+        node_id, mode_label, preview_mode = pending
         node = next(
             (
                 graph_node
@@ -3717,7 +3786,19 @@ class GraphWorkspace(QWidget):
         )
         if node is None:
             return
-        self._start_preview_request(node, mode_label, self._preview_generation)
+        self._start_preview_request(node, mode_label, self._preview_generation, preview_mode)
+
+    def _on_preview_refresh_requested(self, node: GraphNode, preview_mode: object) -> None:
+        if not isinstance(preview_mode, str):
+            preview_mode = PREVIEW_MODE_FULL
+        preview_target = self._active_display_node() or node
+        mode_label = self._last_preview_mode_label if preview_target.node_id == self._last_preview_node_id else ""
+        self._request_preview_node(preview_target, mode_label=mode_label, preview_mode=preview_mode)
+
+    def _preview_max_side_for_mode(self, preview_mode: str) -> int:
+        if preview_mode == PREVIEW_MODE_DRAFT:
+            return min(self._preview_cache.max_side, DRAFT_PREVIEW_MAX_SIDE)
+        return self._preview_cache.max_side
 
     def _forget_preview_thread(self, thread: QThread) -> None:
         if thread in self._preview_threads:

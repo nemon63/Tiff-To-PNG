@@ -43,6 +43,7 @@ from image_converter.services.settings import AppSettingsRepository
 from image_converter.ui.graph_commands import AddNodesCommand, ReplaceInputConnectionCommand
 from image_converter.ui.main_window import MainWindow
 from image_converter.ui.node_editor import GraphNodeItem, GraphWorkspace
+from image_converter.ui.node_editor import DRAFT_PREVIEW_MAX_SIDE, PREVIEW_MODE_DRAFT, PREVIEW_MODE_FULL, NodePropertiesPanel
 from image_converter.ui.preview import PreviewPanel
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -254,6 +255,61 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
         self.assertEqual(expected_levels, list(levels_image.getdata()))
         self.assertEqual([40, 64, 128, 180, 180], list(clamp_image.getdata()))
         self.assertEqual([0, 0, 255, 255, 255], list(threshold_image.getdata()))
+
+
+class NodePropertiesPanelTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = _app()
+        self.panel = NodePropertiesPanel()
+
+    def tearDown(self) -> None:
+        self.panel.setParent(None)
+        self.panel.deleteLater()
+        self.app.processEvents()
+        del self.panel
+        gc.collect()
+
+    def test_slider_drag_emits_draft_then_full_preview(self) -> None:
+        node = create_graph_node(NodeType.LEVELS_CHANNEL)
+        self.panel.set_node(node)
+
+        changed_modes: list[str] = []
+        refresh_modes: list[str] = []
+        self.panel.node_changed.connect(
+            lambda _node, _title, _properties, _needs_rebuild, preview_mode: changed_modes.append(preview_mode)
+        )
+        self.panel.preview_refresh_requested.connect(
+            lambda _node, preview_mode: refresh_modes.append(preview_mode)
+        )
+
+        self.panel.level_black_slider.sliderPressed.emit()
+        self.panel.level_black_slider.setValue(32)
+        self.app.processEvents()
+        self.panel.level_black_slider.sliderReleased.emit()
+        self.app.processEvents()
+
+        self.assertIn(PREVIEW_MODE_DRAFT, changed_modes)
+        self.assertEqual([PREVIEW_MODE_FULL], refresh_modes)
+
+    def test_numeric_spin_uses_debounced_full_preview(self) -> None:
+        node = create_graph_node(NodeType.THRESHOLD_CHANNEL)
+        self.panel.set_node(node)
+
+        changed_modes: list[str] = []
+        self.panel.node_changed.connect(
+            lambda _node, _title, _properties, _needs_rebuild, preview_mode: changed_modes.append(preview_mode)
+        )
+
+        self.panel.threshold_spin.setValue(200)
+        self.app.processEvents()
+        self.assertEqual([], changed_modes)
+
+        loop = QEventLoop()
+        QTimer.singleShot(250, loop.quit)
+        loop.exec()
+        self.app.processEvents()
+
+        self.assertEqual([PREVIEW_MODE_FULL], changed_modes)
 
 
 class GraphEditorFoundationTests(unittest.TestCase):
@@ -812,6 +868,10 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.workspace.properties_panel.set_node(constant)
 
         self.workspace.properties_panel.value_slider.setValue(144)
+        loop = QEventLoop()
+        QTimer.singleShot(250, loop.quit)
+        loop.exec()
+        self.app.processEvents()
 
         self.assertEqual(144, self.workspace.properties_panel.value_spin.value())
         self.assertEqual(144, constant.properties["value"])
@@ -832,6 +892,10 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.workspace.properties_panel.set_node(blend)
 
         self.workspace.properties_panel.blend_opacity_slider.setValue(42)
+        loop = QEventLoop()
+        QTimer.singleShot(250, loop.quit)
+        loop.exec()
+        self.app.processEvents()
 
         self.assertEqual(42, self.workspace.properties_panel.blend_opacity_spin.value())
         self.assertEqual(42, blend.properties["opacity"])
@@ -975,6 +1039,38 @@ class GraphEditorFoundationTests(unittest.TestCase):
         loop.exec()
         self.assertTrue(received)
         self.assertEqual(constant.title, received[-1][1])
+
+    def test_draft_preview_uses_reduced_max_side(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "draft_preview.png"
+            Image.new("RGBA", (2048, 1024), (24, 96, 180, 255)).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path), "display": True},
+            )
+            self.workspace._push_graph_command(
+                AddNodesCommand(
+                    self.workspace.project.graph,
+                    self.workspace._on_graph_command_changed,
+                    [texture],
+                ),
+                select_node_ids=[texture.node_id],
+            )
+
+            requested_sizes: list[int] = []
+            original_request = self.workspace._request_preview_node
+
+            def capture_request(node, *, mode_label="", preview_mode=PREVIEW_MODE_FULL):
+                requested_sizes.append(self.workspace._preview_max_side_for_mode(preview_mode))
+                return original_request(node, mode_label=mode_label, preview_mode=preview_mode)
+
+            self.workspace._request_preview_node = capture_request  # type: ignore[method-assign]
+            try:
+                self.workspace._on_preview_refresh_requested(texture, PREVIEW_MODE_DRAFT)
+            finally:
+                self.workspace._request_preview_node = original_request  # type: ignore[method-assign]
+
+            self.assertEqual([DRAFT_PREVIEW_MAX_SIDE], requested_sizes)
 
     def test_graph_preview_preserves_zoom_for_same_node_refresh(self) -> None:
         panel = PreviewPanel(allow_detach=False)
