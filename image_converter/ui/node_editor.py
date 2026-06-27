@@ -239,6 +239,7 @@ class GraphPreviewWorker(QObject):
         *,
         mode_label: str = "",
         max_side: int = 1024,
+        preview_cache: NodeGraphPreviewCache | None = None,
     ):
         super().__init__()
         self._generation = generation
@@ -246,11 +247,13 @@ class GraphPreviewWorker(QObject):
         self._node = node
         self._mode_label = mode_label
         self._max_side = max_side
+        self._preview_cache = preview_cache
 
     def run(self) -> None:
         try:
             executor = NodeGraphExecutor()
-            preview_cache = NodeGraphPreviewCache(max_side=self._max_side)
+            preview_cache = self._preview_cache or NodeGraphPreviewCache(max_side=self._max_side)
+            preview_cache.max_side = self._max_side
             image, meta = executor.render_display_node(
                 self._project.graph,
                 self._node,
@@ -1855,6 +1858,8 @@ class GraphWorkspace(QWidget):
         self._preview_generation = 0
         self._preview_threads: list[QThread] = []
         self._preview_workers: list[GraphPreviewWorker] = []
+        self._preview_inflight_generation = 0
+        self._pending_preview_request: tuple[str, str] | None = None
         self._recent_project_dirs: list[Path] = []
         self._shortcuts = []
         self._repository = NodeGraphProjectRepository()
@@ -2134,6 +2139,8 @@ class GraphWorkspace(QWidget):
         self._last_preview_node_id = None
         self._last_preview_mode_label = ""
         self._preview_generation += 1
+        self._preview_inflight_generation = 0
+        self._pending_preview_request = None
         self._preview_cache.clear()
         self.undo_stack.clear()
         self._scene.project = self.project
@@ -2194,6 +2201,8 @@ class GraphWorkspace(QWidget):
         self._last_preview_node_id = None
         self._last_preview_mode_label = ""
         self._preview_generation += 1
+        self._preview_inflight_generation = 0
+        self._pending_preview_request = None
         self._preview_cache.clear()
         self.undo_stack.clear()
         self._scene.project = self.project
@@ -2575,7 +2584,14 @@ class GraphWorkspace(QWidget):
         if not selected_ids and self.properties_panel._node is not None:
             selected_ids = [self.properties_panel._node.node_id]
 
-        self._preview_cache.clear()
+        if needs_rebuild:
+            self._preview_cache.clear()
+        else:
+            selected_node = self._scene.selected_node() or self.properties_panel._node
+            if selected_node is not None:
+                self._invalidate_preview_from_node(selected_node)
+            else:
+                self._preview_cache.clear()
         if needs_rebuild:
             self._scene.rebuild()
             self._scene.select_node_ids(selected_ids)
@@ -2588,7 +2604,8 @@ class GraphWorkspace(QWidget):
         self._preview_active_display_node()
         self._update_project_label()
         self._schedule_autosave()
-        self._rebuild_asset_watchers()
+        if needs_rebuild:
+            self._rebuild_asset_watchers()
 
     def _delete_selection(self) -> None:
         self._scene.delete_selected()
@@ -3597,6 +3614,13 @@ class GraphWorkspace(QWidget):
         self._last_preview_mode_label = mode_label
         self._preview_generation += 1
         generation = self._preview_generation
+        if self._preview_inflight_generation:
+            self._pending_preview_request = (node.node_id, mode_label)
+            return
+        self._start_preview_request(node, mode_label, generation)
+
+    def _start_preview_request(self, node: GraphNode, mode_label: str, generation: int) -> None:
+        self._preview_inflight_generation = generation
         snapshot = deepcopy(self.project)
         node_snapshot = next(
             (
@@ -3607,6 +3631,7 @@ class GraphWorkspace(QWidget):
             None,
         )
         if node_snapshot is None:
+            self._preview_inflight_generation = 0
             return
         thread = QThread(self)
         worker = GraphPreviewWorker(
@@ -3615,6 +3640,7 @@ class GraphWorkspace(QWidget):
             node_snapshot,
             mode_label=mode_label,
             max_side=self._preview_cache.max_side,
+            preview_cache=self._preview_cache,
         )
         worker.moveToThread(thread)
         self._preview_threads.append(thread)
@@ -3656,14 +3682,42 @@ class GraphWorkspace(QWidget):
         meta: str,
         node_id: str,
     ) -> None:
+        self._preview_inflight_generation = 0
+        pending = self._pending_preview_request
+        self._pending_preview_request = None
         if generation != self._preview_generation:
+            if pending is not None:
+                self._restart_pending_preview(pending)
             return
         self.preview_image_requested.emit(image, title, meta, node_id)
+        if pending is not None:
+            self._restart_pending_preview(pending)
 
     def _on_preview_worker_failed(self, generation: int, title: str, message: str) -> None:
+        self._preview_inflight_generation = 0
+        pending = self._pending_preview_request
+        self._pending_preview_request = None
         if generation != self._preview_generation:
+            if pending is not None:
+                self._restart_pending_preview(pending)
             return
         self.status_message.emit(f"{title}: preview failed: {message}")
+        if pending is not None:
+            self._restart_pending_preview(pending)
+
+    def _restart_pending_preview(self, pending: tuple[str, str]) -> None:
+        node_id, mode_label = pending
+        node = next(
+            (
+                graph_node
+                for graph_node in self.project.graph.nodes
+                if graph_node.node_id == node_id
+            ),
+            None,
+        )
+        if node is None:
+            return
+        self._start_preview_request(node, mode_label, self._preview_generation)
 
     def _forget_preview_thread(self, thread: QThread) -> None:
         if thread in self._preview_threads:

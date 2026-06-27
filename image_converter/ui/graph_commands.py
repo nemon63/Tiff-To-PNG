@@ -272,6 +272,8 @@ class InsertNodeInConnectionCommand(GraphCommand):
 
 
 class SetNodeStateCommand(GraphCommand):
+    _COMMAND_ID = 1001
+
     def __init__(
         self,
         graph: NodeGraph,
@@ -295,6 +297,20 @@ class SetNodeStateCommand(GraphCommand):
 
     def undo(self) -> None:
         self._apply(self.before_title, self.before_properties)
+
+    def id(self) -> int:
+        return self._COMMAND_ID
+
+    def mergeWith(self, other: QUndoCommand) -> bool:
+        if not isinstance(other, SetNodeStateCommand):
+            return False
+        if self.node_id != other.node_id:
+            return False
+        if self._needs_rebuild != other._needs_rebuild:
+            return False
+        self.after_title = other.after_title
+        self.after_properties = deepcopy(other.after_properties)
+        return True
 
     def _apply(self, title: str, properties: dict) -> None:
         node = find_node(self.graph, self.node_id)

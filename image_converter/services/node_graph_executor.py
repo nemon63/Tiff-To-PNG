@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from threading import RLock
 
 from PIL import Image, ImageChops, ImageOps
 
@@ -105,38 +106,41 @@ class NodeGraphPreviewCache:
     max_side: int = 1024
     fallback_size: tuple[int, int] = (256, 256)
     channels: dict[tuple[str, str, tuple[int, int]], Image.Image] = field(default_factory=dict)
-    texture_channels: dict[tuple[str, str], Image.Image] = field(default_factory=dict)
-    texture_preview_images: dict[str, Image.Image] = field(default_factory=dict)
+    texture_channels: dict[tuple[str, str, tuple[int, int] | None], Image.Image] = field(default_factory=dict)
+    texture_preview_images: dict[tuple[str, tuple[int, int] | None], Image.Image] = field(default_factory=dict)
     texture_sizes: dict[str, tuple[int, int] | None] = field(default_factory=dict)
+    lock: RLock = field(default_factory=RLock, repr=False)
 
     def clear(self) -> None:
-        self.channels.clear()
-        self.texture_channels.clear()
-        self.texture_preview_images.clear()
-        self.texture_sizes.clear()
+        with self.lock:
+            self.channels.clear()
+            self.texture_channels.clear()
+            self.texture_preview_images.clear()
+            self.texture_sizes.clear()
 
     def invalidate_node_and_downstream(self, graph: NodeGraph, node_id: str) -> None:
         dirty_node_ids = self._downstream_node_ids(graph, node_id)
-        self.channels = {
-            key: image
-            for key, image in self.channels.items()
-            if key[0] not in dirty_node_ids
-        }
-        self.texture_channels = {
-            key: image
-            for key, image in self.texture_channels.items()
-            if key[0] not in dirty_node_ids
-        }
-        self.texture_preview_images = {
-            key: image
-            for key, image in self.texture_preview_images.items()
-            if key not in dirty_node_ids
-        }
-        self.texture_sizes = {
-            key: image
-            for key, image in self.texture_sizes.items()
-            if key not in dirty_node_ids
-        }
+        with self.lock:
+            self.channels = {
+                key: image
+                for key, image in self.channels.items()
+                if key[0] not in dirty_node_ids
+            }
+            self.texture_channels = {
+                key: image
+                for key, image in self.texture_channels.items()
+                if key[0] not in dirty_node_ids
+            }
+            self.texture_preview_images = {
+                key: image
+                for key, image in self.texture_preview_images.items()
+                if key[0] not in dirty_node_ids
+            }
+            self.texture_sizes = {
+                key: image
+                for key, image in self.texture_sizes.items()
+                if key not in dirty_node_ids
+            }
 
     @staticmethod
     def _downstream_node_ids(graph: NodeGraph, node_id: str) -> set[str]:
@@ -192,8 +196,11 @@ class NodeGraphExecutor:
             )
             return image, f"View preview · {image.width}x{image.height} · channel"
         if node.node_type is NodeType.TEXTURE_INPUT:
-            image = self._load_texture_preview_image_cached(node, cache)
-            target_size = self._fit_preview_size(image.size, cache.max_side)
+            target_size = self._fit_preview_size(
+                self._load_texture_size(node, cache) or resolved_fallback,
+                cache.max_side,
+            )
+            image = self._load_texture_preview_image_cached(node, cache, target_size)
             if image.size != target_size:
                 image = image.resize(target_size, RESAMPLING_LANCZOS)
             image = image.convert("RGBA")
@@ -679,7 +686,8 @@ class NodeGraphExecutor:
             raise GraphExecutionError("Graph contains a cycle.")
 
         cache_key = (connection.source_node_id, connection.source_socket_id, target_size)
-        cached = cache.channels.get(cache_key)
+        with cache.lock:
+            cached = cache.channels.get(cache_key)
         if cached is not None:
             return cached.copy()
 
@@ -690,7 +698,12 @@ class NodeGraphExecutor:
                 raise GraphExecutionError(f"Source node {connection.source_node_id} not found.")
 
             if source_node.node_type is NodeType.TEXTURE_INPUT:
-                channel = self._load_texture_channel_cached(source_node, connection.source_socket_id, cache)
+                channel = self._load_texture_channel_cached(
+                    source_node,
+                    connection.source_socket_id,
+                    cache,
+                    target_size,
+                )
             elif source_node.node_type is NodeType.CONSTANT_CHANNEL:
                 channel = Image.new("L", target_size, self._constant_value(source_node))
             elif source_node.node_type is NodeType.INVERT_CHANNEL:
@@ -816,7 +829,8 @@ class NodeGraphExecutor:
         if channel.size != target_size:
             channel = channel.resize(target_size, RESAMPLING_LANCZOS)
         result = channel.copy()
-        cache.channels[cache_key] = result
+        with cache.lock:
+            cache.channels[cache_key] = result
         return result.copy()
 
     def _determine_output_size(
@@ -1048,12 +1062,14 @@ class NodeGraphExecutor:
         node: GraphNode,
         socket_id: str,
         cache: NodeGraphPreviewCache,
+        target_size: tuple[int, int] | None = None,
     ) -> Image.Image:
-        cache_key = (node.node_id, socket_id)
-        cached = cache.texture_channels.get(cache_key)
+        cache_key = (node.node_id, socket_id, target_size)
+        with cache.lock:
+            cached = cache.texture_channels.get(cache_key)
         if cached is not None:
             return cached.copy()
-        working_image = self._load_texture_preview_image_cached(node, cache)
+        working_image = self._load_texture_preview_image_cached(node, cache, target_size)
         if socket_id == "r":
             channel = working_image.getchannel("R").copy()
         elif socket_id == "g":
@@ -1067,20 +1083,28 @@ class NodeGraphExecutor:
                 channel = Image.new("L", working_image.size, 255)
         else:
             raise GraphExecutionError(f"Unsupported texture channel: {socket_id}")
-        cache.texture_channels[cache_key] = channel.copy()
+        with cache.lock:
+            cache.texture_channels[cache_key] = channel.copy()
         return channel
 
     def _load_texture_preview_image_cached(
         self,
         node: GraphNode,
         cache: NodeGraphPreviewCache,
+        target_size: tuple[int, int] | None = None,
     ) -> Image.Image:
-        cached = cache.texture_preview_images.get(node.node_id)
+        cache_key = (node.node_id, target_size)
+        with cache.lock:
+            cached = cache.texture_preview_images.get(cache_key)
         if cached is not None:
             return cached.copy()
         image = self._load_texture_preview_image(node)
-        cache.texture_preview_images[node.node_id] = image.copy()
-        cache.texture_sizes[node.node_id] = image.size
+        full_size = image.size
+        if target_size is not None and image.size != target_size:
+            image = image.resize(target_size, RESAMPLING_LANCZOS)
+        with cache.lock:
+            cache.texture_preview_images[cache_key] = image.copy()
+            cache.texture_sizes[node.node_id] = full_size
         return image
 
     def _load_texture_size(
@@ -1088,18 +1112,22 @@ class NodeGraphExecutor:
         node: GraphNode,
         cache: NodeGraphPreviewCache | None = None,
     ) -> tuple[int, int] | None:
-        if cache is not None and node.node_id in cache.texture_sizes:
-            return cache.texture_sizes[node.node_id]
+        if cache is not None:
+            with cache.lock:
+                if node.node_id in cache.texture_sizes:
+                    return cache.texture_sizes[node.node_id]
 
         path = Path(str(node.properties.get("path", "")))
         if not path.exists():
             if cache is not None:
-                cache.texture_sizes[node.node_id] = None
+                with cache.lock:
+                    cache.texture_sizes[node.node_id] = None
             return None
         with Image.open(path) as image:
             size = image.size
         if cache is not None:
-            cache.texture_sizes[node.node_id] = size
+            with cache.lock:
+                cache.texture_sizes[node.node_id] = size
         return size
 
     @staticmethod
