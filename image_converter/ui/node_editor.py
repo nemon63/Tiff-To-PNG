@@ -6,7 +6,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
-from PyQt6.QtCore import QObject, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import (
+    QFileSystemWatcher,
+    QObject,
+    QPoint,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    pyqtSignal,
+)
 from PyQt6.QtGui import (
     QColor,
     QFont,
@@ -1828,6 +1840,8 @@ class GraphWorkspace(QWidget):
     export_requested = pyqtSignal()
     preview_image_requested = pyqtSignal(object, str, str, str)
     status_message = pyqtSignal(str)
+    watched_paths_changed = pyqtSignal(tuple)
+    assets_changed = pyqtSignal(tuple)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -1850,6 +1864,19 @@ class GraphWorkspace(QWidget):
         self._autosave_timer.setInterval(30000)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self.autosave_project)
+        self._auto_watch_enabled = False
+        self._asset_watch_timer = QTimer(self)
+        self._asset_watch_timer.setInterval(350)
+        self._asset_watch_timer.setSingleShot(True)
+        self._asset_watch_timer.timeout.connect(self._emit_pending_asset_changes)
+        self._asset_watcher = QFileSystemWatcher(self)
+        self._asset_watcher.directoryChanged.connect(self._on_watched_directory_changed)
+        self._asset_watcher.fileChanged.connect(self._on_watched_file_changed)
+        self._watched_texture_keys: dict[str, str] = {}
+        self._watched_file_keys: dict[str, str] = {}
+        self._watched_directory_paths: dict[str, str] = {}
+        self._watched_directory_keys: dict[str, set[str]] = {}
+        self._pending_asset_change_keys: set[str] = set()
         self.undo_stack = QUndoStack(self)
         self.undo_stack.cleanChanged.connect(self._on_undo_stack_changed)
         self.undo_stack.indexChanged.connect(self._on_undo_stack_changed)
@@ -2064,6 +2091,29 @@ class GraphWorkspace(QWidget):
         if not self._refresh_last_preview_request():
             self._preview_active_display_node()
 
+    def set_auto_watch_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._auto_watch_enabled == enabled:
+            if enabled:
+                self._rebuild_asset_watchers()
+            return
+        self._auto_watch_enabled = enabled
+        if enabled:
+            self._rebuild_asset_watchers()
+            self.status_message.emit("Graph Auto Watch enabled.")
+        else:
+            self._clear_asset_watchers()
+            self.status_message.emit("Graph Auto Watch disabled.")
+
+    def auto_watch_enabled(self) -> bool:
+        return self._auto_watch_enabled
+
+    def watched_texture_paths(self) -> tuple[Path, ...]:
+        return tuple(
+            Path(path)
+            for path in sorted(self._watched_texture_keys.values())
+        )
+
     def export_destinations(self, output_root: Path) -> list[Path]:
         return self._executor.resolve_output_paths(self.project.graph, output_root)
 
@@ -2092,6 +2142,7 @@ class GraphWorkspace(QWidget):
         self._update_project_label()
         self.result_table.setRowCount(0)
         self._refresh_validation()
+        self._rebuild_asset_watchers()
         self.status_message.emit("New graph project.")
 
     def load_project_dialog(self) -> None:
@@ -2150,6 +2201,7 @@ class GraphWorkspace(QWidget):
         self.undo_stack.setClean()
         self._update_project_label()
         self._refresh_validation()
+        self._rebuild_asset_watchers()
         self.status_message.emit(f"Loaded graph: {self.project.name}")
 
     def remap_missing_texture_paths(self) -> None:
@@ -2536,6 +2588,7 @@ class GraphWorkspace(QWidget):
         self._preview_active_display_node()
         self._update_project_label()
         self._schedule_autosave()
+        self._rebuild_asset_watchers()
 
     def _delete_selection(self) -> None:
         self._scene.delete_selected()
@@ -3165,6 +3218,121 @@ class GraphWorkspace(QWidget):
             return str(path.resolve()).lower()
         except OSError:
             return str(path).lower()
+
+    def _rebuild_asset_watchers(self) -> None:
+        pending_change_keys = set(self._pending_asset_change_keys)
+        texture_paths: dict[str, str] = {}
+        directory_keys: dict[str, set[str]] = {}
+        directory_paths: dict[str, str] = {}
+        file_keys: dict[str, str] = {}
+
+        if self._auto_watch_enabled:
+            for node in self.project.graph.nodes:
+                if node.node_type is not NodeType.TEXTURE_INPUT:
+                    continue
+                raw_path = str(node.properties.get("path", "")).strip()
+                if not raw_path:
+                    continue
+                texture_path = Path(raw_path)
+                path_key = self._path_key(texture_path)
+                texture_paths[path_key] = str(texture_path)
+                file_keys[path_key] = str(texture_path)
+                directory = texture_path.parent if str(texture_path.parent) else texture_path
+                directory_key = self._path_key(directory)
+                directory_paths[directory_key] = str(directory)
+                directory_keys.setdefault(directory_key, set()).add(path_key)
+
+        self._replace_watched_paths(self._asset_watcher.files(), file_keys.values(), is_file=True)
+        self._replace_watched_paths(
+            self._asset_watcher.directories(),
+            directory_paths.values(),
+            is_file=False,
+        )
+        self._watched_texture_keys = texture_paths
+        self._watched_file_keys = file_keys
+        self._watched_directory_paths = directory_paths
+        self._watched_directory_keys = directory_keys
+        self._pending_asset_change_keys = {
+            path_key
+            for path_key in pending_change_keys
+            if path_key in self._watched_texture_keys
+        }
+        self.watched_paths_changed.emit(self.watched_texture_paths())
+
+    def _clear_asset_watchers(self) -> None:
+        self._asset_watch_timer.stop()
+        self._pending_asset_change_keys.clear()
+        existing_files = self._asset_watcher.files()
+        existing_directories = self._asset_watcher.directories()
+        if existing_files:
+            self._asset_watcher.removePaths(existing_files)
+        if existing_directories:
+            self._asset_watcher.removePaths(existing_directories)
+        self._watched_texture_keys.clear()
+        self._watched_file_keys.clear()
+        self._watched_directory_paths.clear()
+        self._watched_directory_keys.clear()
+        self.watched_paths_changed.emit(())
+
+    def _replace_watched_paths(
+        self,
+        existing_paths: list[str],
+        target_paths: Iterable[str],
+        *,
+        is_file: bool,
+    ) -> None:
+        target_list = list(dict.fromkeys(path for path in target_paths if str(path).strip()))
+        existing_keys = {self._path_key(Path(path)): path for path in existing_paths if str(path).strip()}
+        target_keys = {self._path_key(Path(path)): path for path in target_list}
+        remove_paths = [
+            existing_keys[key]
+            for key in existing_keys.keys() - target_keys.keys()
+        ]
+        add_paths = [
+            path
+            for key, path in target_keys.items()
+            if key not in existing_keys
+        ]
+        if remove_paths:
+            self._asset_watcher.removePaths(remove_paths)
+        if add_paths:
+            filtered_paths = [
+                path
+                for path in add_paths
+                if (Path(path).is_file() if is_file else Path(path).is_dir())
+            ]
+            if filtered_paths:
+                self._asset_watcher.addPaths(filtered_paths)
+
+    def _on_watched_directory_changed(self, directory: str) -> None:
+        directory_key = self._path_key(Path(directory))
+        changed_keys = self._watched_directory_keys.get(directory_key, set())
+        if not changed_keys:
+            return
+        self._pending_asset_change_keys.update(changed_keys)
+        self._asset_watch_timer.start()
+        if self._auto_watch_enabled:
+            self._rebuild_asset_watchers()
+
+    def _on_watched_file_changed(self, path: str) -> None:
+        path_key = self._path_key(Path(path))
+        if path_key in self._watched_file_keys:
+            self._pending_asset_change_keys.add(path_key)
+            self._asset_watch_timer.start()
+        if self._auto_watch_enabled:
+            self._rebuild_asset_watchers()
+
+    def _emit_pending_asset_changes(self) -> None:
+        if not self._pending_asset_change_keys:
+            return
+        changed_paths = tuple(
+            Path(self._watched_texture_keys[path_key])
+            for path_key in sorted(self._pending_asset_change_keys)
+            if path_key in self._watched_texture_keys
+        )
+        self._pending_asset_change_keys.clear()
+        if changed_paths:
+            self.assets_changed.emit(changed_paths)
 
     def _connections_for_new_node_context(
         self,

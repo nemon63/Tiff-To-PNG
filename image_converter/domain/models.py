@@ -290,6 +290,8 @@ class AppSettings:
     input_path: str = ""
     output_path: str = ""
     workspace_mode: str = "batch"
+    graph_auto_watch: bool = False
+    graph_auto_export: bool = False
     recent_graph_projects: tuple[str, ...] = ()
     options: ConversionOptions = field(default_factory=ConversionOptions)
     window_width: int = 1280

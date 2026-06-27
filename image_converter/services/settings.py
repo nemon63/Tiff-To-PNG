@@ -43,6 +43,8 @@ class AppSettingsRepository:
             "input_path": settings.input_path,
             "output_path": settings.output_path,
             "workspace_mode": settings.workspace_mode,
+            "graph_auto_watch": settings.graph_auto_watch,
+            "graph_auto_export": settings.graph_auto_export,
             "recent_graph_projects": list(settings.recent_graph_projects),
             "options": serialize_conversion_options(settings.options),
             "window": {
@@ -71,6 +73,8 @@ class AppSettingsRepository:
             input_path=str(data.get("input_path", "")),
             output_path=str(data.get("output_path", "")),
             workspace_mode=workspace_mode,
+            graph_auto_watch=bool(data.get("graph_auto_watch", False)),
+            graph_auto_export=bool(data.get("graph_auto_export", False)),
             recent_graph_projects=self._coerce_strings(data.get("recent_graph_projects", [])),
             options=deserialize_conversion_options(options_data if isinstance(options_data, dict) else {}),
             window_width=self._coerce_int(window_data.get("width"), 1280),

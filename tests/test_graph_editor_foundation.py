@@ -328,12 +328,71 @@ class GraphEditorFoundationTests(unittest.TestCase):
             repository.save(
                 AppSettings(
                     workspace_mode="batch",
+                    graph_auto_watch=True,
+                    graph_auto_export=True,
                     recent_graph_projects=("A.texturegraph", "B.texturegraph"),
                 )
             )
             loaded = repository.load()
         self.assertEqual("batch", loaded.workspace_mode)
+        self.assertTrue(loaded.graph_auto_watch)
+        self.assertTrue(loaded.graph_auto_export)
         self.assertEqual(("A.texturegraph", "B.texturegraph"), loaded.recent_graph_projects)
+
+    def test_graph_workspace_auto_watch_tracks_texture_paths(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "albedo.png"
+            Image.new("RGBA", (8, 8), (255, 0, 0, 255)).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path)},
+            )
+            self.workspace._push_graph_command(
+                AddNodesCommand(
+                    self.workspace.project.graph,
+                    self.workspace._on_graph_command_changed,
+                    [texture],
+                ),
+                select_node_ids=[texture.node_id],
+            )
+
+            self.workspace.set_auto_watch_enabled(True)
+
+            watched_paths = self.workspace.watched_texture_paths()
+            self.assertEqual((texture_path,), watched_paths)
+
+    def test_graph_workspace_auto_watch_emits_changed_texture_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "albedo.png"
+            Image.new("RGBA", (8, 8), (255, 0, 0, 255)).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path)},
+            )
+            self.workspace._push_graph_command(
+                AddNodesCommand(
+                    self.workspace.project.graph,
+                    self.workspace._on_graph_command_changed,
+                    [texture],
+                ),
+                select_node_ids=[texture.node_id],
+            )
+            self.workspace.set_auto_watch_enabled(True)
+
+            received: list[tuple[Path, ...]] = []
+            loop = QEventLoop()
+
+            def _capture(paths: tuple[Path, ...]) -> None:
+                received.append(paths)
+                loop.quit()
+
+            self.workspace.assets_changed.connect(_capture)
+            self.workspace._on_watched_file_changed(str(texture_path))
+            QTimer.singleShot(1200, loop.quit)
+            loop.exec()
+
+            self.assertTrue(received)
+            self.assertEqual((texture_path,), received[-1])
 
     def test_main_window_switches_between_batch_and_graph_modes(self) -> None:
         window = MainWindow()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QItemSelectionModel, QMimeData, QSize, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QByteArray, QItemSelectionModel, QMimeData, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -117,6 +117,12 @@ class MainWindow(QMainWindow):
         self._presets_by_id: dict[str, ConversionPreset] = {}
         self._workspace_mode = WORKSPACE_GRAPH
         self._graph_node_properties_visible = False
+        self._graph_auto_watch_enabled = False
+        self._graph_auto_export_enabled = False
+        self._graph_auto_export_scheduled = False
+        self._graph_auto_export_paths: tuple[Path, ...] = ()
+        self._graph_export_in_progress = False
+        self._graph_auto_watch_status = "Auto Watch Off"
         self.setWindowTitle("Texture Pipeline Workbench")
         self.resize(1280, 820)
         self.setMinimumSize(720, 480)
@@ -165,7 +171,13 @@ class MainWindow(QMainWindow):
         self.graph_workspace.preview_image_requested.connect(self._show_graph_preview)
         self.graph_workspace.status_message.connect(self.set_status)
         self.graph_workspace.status_message.connect(self.append_log)
+        self.graph_workspace.assets_changed.connect(self._on_graph_assets_changed)
+        self.graph_workspace.watched_paths_changed.connect(self._on_graph_watched_paths_changed)
         self.log_panel = LogPanel()
+        self._graph_auto_export_timer = QTimer(self)
+        self._graph_auto_export_timer.setInterval(250)
+        self._graph_auto_export_timer.setSingleShot(True)
+        self._graph_auto_export_timer.timeout.connect(self._run_graph_auto_export)
 
         central = QWidget()
         central_layout = QVBoxLayout(central)
@@ -373,6 +385,20 @@ class MainWindow(QMainWindow):
         self.export_graph_button.hide()
         layout.addWidget(self.export_graph_button)
 
+        self.auto_watch_button = QPushButton("Auto Watch")
+        self.auto_watch_button.setCheckable(True)
+        self.auto_watch_button.clicked.connect(self._toggle_graph_auto_watch)
+        layout.addWidget(self.auto_watch_button)
+
+        self.auto_export_button = QPushButton("Auto Rebuild")
+        self.auto_export_button.setCheckable(True)
+        self.auto_export_button.clicked.connect(self._toggle_graph_auto_export)
+        layout.addWidget(self.auto_export_button)
+
+        self.graph_watch_status_label = QLabel(self._graph_auto_watch_status)
+        self.graph_watch_status_label.setObjectName("StatusPill")
+        layout.addWidget(self.graph_watch_status_label)
+
         self.toolbar_status_label = QLabel("Ready")
         self.toolbar_status_label.setObjectName("StatusPill")
         layout.addWidget(self.toolbar_status_label)
@@ -459,6 +485,9 @@ class MainWindow(QMainWindow):
             self.export_graph_button.setVisible(False)
             self.top_output_label.setVisible(not is_batch)
             self.top_output_edit.setVisible(not is_batch)
+            self.auto_watch_button.setVisible(not is_batch)
+            self.auto_export_button.setVisible(not is_batch)
+            self.graph_watch_status_label.setVisible(not is_batch)
         if hasattr(self, "assets_dock"):
             if is_batch:
                 self.assets_dock.hide()
@@ -745,6 +774,10 @@ class MainWindow(QMainWindow):
         self.graph_workspace.export_button.setEnabled(not running)
         self.asset_table.setEnabled(not running)
         self.remove_asset_button.setEnabled(not running)
+        if hasattr(self, "auto_watch_button"):
+            self.auto_watch_button.setEnabled(not running)
+        if hasattr(self, "auto_export_button"):
+            self.auto_export_button.setEnabled(not running)
 
     def append_log(self, line: str) -> None:
         self.log_panel.append_line(line)
@@ -765,6 +798,8 @@ class MainWindow(QMainWindow):
         self.settings_panel.apply_app_settings(settings)
         self.graph_workspace.apply_recent_projects(settings.recent_graph_projects)
         self._sync_top_output_path(settings.output_path)
+        self._set_graph_auto_export_enabled(settings.graph_auto_export)
+        self._set_graph_auto_watch_enabled(settings.graph_auto_watch)
         if settings.window_state:
             self.restoreState(QByteArray.fromBase64(settings.window_state.encode("ascii")))
         self._set_workspace_mode(settings.workspace_mode)
@@ -782,6 +817,8 @@ class MainWindow(QMainWindow):
             input_path=str(request.input_path or ""),
             output_path=str(request.output_root or ""),
             workspace_mode=self._workspace_mode,
+            graph_auto_watch=self._graph_auto_watch_enabled,
+            graph_auto_export=self._graph_auto_export_enabled,
             recent_graph_projects=self.graph_workspace.recent_project_paths(),
             options=request.options,
             window_width=self.width(),
@@ -1150,6 +1187,11 @@ class MainWindow(QMainWindow):
         self._sync_status_bar_with_selection()
 
     def _export_graph(self) -> None:
+        self._export_graph_with_feedback(show_dialogs=True)
+
+    def _export_graph_with_feedback(self, *, show_dialogs: bool) -> None:
+        if self._graph_export_in_progress:
+            return
         request = self.settings_panel.build_request()
         output_root = request.output_root
         if output_root is None:
@@ -1163,7 +1205,7 @@ class MainWindow(QMainWindow):
             for path in self.graph_workspace.export_destinations(output_root)
             if path.exists()
         ]
-        if existing_paths and not request.options.overwrite:
+        if show_dialogs and existing_paths and not request.options.overwrite:
             preview_lines = "\n".join(f"- {path.name}" for path in existing_paths[:5])
             if len(existing_paths) > 5:
                 preview_lines += f"\n... и еще {len(existing_paths) - 5}"
@@ -1182,19 +1224,148 @@ class MainWindow(QMainWindow):
                 self.set_status("Graph export canceled.")
                 return
             export_options = replace(request.options, overwrite=True)
+        elif not show_dialogs and not request.options.overwrite:
+            export_options = replace(request.options, overwrite=True)
 
         self.append_log("---- Graph export ----")
-        summary = self.graph_workspace.export_graph(
-            output_root,
-            export_options,
-            self.append_log,
-        )
+        self._graph_export_in_progress = True
+        try:
+            summary = self.graph_workspace.export_graph(
+                output_root,
+                export_options,
+                self.append_log,
+            )
+        finally:
+            self._graph_export_in_progress = False
         self.append_log(summary.as_text())
         self.set_status(summary.as_text())
-        if summary.failed:
-            self.show_error("Graph export", summary.as_text())
-        elif summary.succeeded:
-            self.show_info("Graph export", summary.as_text())
+        if show_dialogs:
+            if summary.failed:
+                self.show_error("Graph export", summary.as_text())
+            elif summary.succeeded:
+                self.show_info("Graph export", summary.as_text())
+        else:
+            self._update_graph_watch_status(summary.as_text())
+
+    def _toggle_graph_auto_watch(self, checked: bool) -> None:
+        self._set_graph_auto_watch_enabled(bool(checked))
+
+    def _toggle_graph_auto_export(self, checked: bool) -> None:
+        self._set_graph_auto_export_enabled(bool(checked))
+
+    def _set_graph_auto_watch_enabled(self, enabled: bool) -> None:
+        self._graph_auto_watch_enabled = bool(enabled)
+        self.graph_workspace.set_auto_watch_enabled(self._graph_auto_watch_enabled)
+        if hasattr(self, "auto_watch_button"):
+            self.auto_watch_button.blockSignals(True)
+            self.auto_watch_button.setChecked(self._graph_auto_watch_enabled)
+            self.auto_watch_button.blockSignals(False)
+        self._update_graph_watch_status()
+
+    def _set_graph_auto_export_enabled(self, enabled: bool) -> None:
+        self._graph_auto_export_enabled = bool(enabled)
+        if hasattr(self, "auto_export_button"):
+            self.auto_export_button.blockSignals(True)
+            self.auto_export_button.setChecked(self._graph_auto_export_enabled)
+            self.auto_export_button.blockSignals(False)
+        self._update_graph_watch_status()
+
+    def _on_graph_assets_changed(self, paths: tuple[Path, ...]) -> None:
+        if not paths:
+            return
+        self.append_log(f"Auto Watch -> changed: {', '.join(path.name for path in paths[:4])}")
+        self._reload_assets_for_paths(paths, source_label="Auto Watch")
+        if self._graph_auto_export_enabled:
+            self._graph_auto_export_paths = paths
+            self._graph_auto_export_scheduled = True
+            self._graph_auto_export_timer.start()
+        else:
+            self._update_graph_watch_status(f"Updated {len(paths)} texture(s)")
+
+    def _reload_assets_for_paths(self, paths: tuple[Path, ...] | list[Path], *, source_label: str) -> None:
+        normalized_paths = [Path(path) for path in paths if str(path).strip()]
+        if not normalized_paths:
+            return
+        changed_keys = {self._queue_key(path) for path in normalized_paths}
+        preview_item = self.preview_panel.current_queue_item()
+        preview_key = self._queue_key(preview_item.path) if preview_item is not None else None
+        updated = False
+        for path in normalized_paths:
+            queue_item = self._find_queue_item(path)
+            if queue_item is None:
+                continue
+            try:
+                refreshed = self._scan_single_queue_item(path, queue_item.batch_source)
+            except Exception as exc:
+                queue_item.status = QueueStatus.ERROR
+                queue_item.metadata = None
+                queue_item.message = str(exc)
+            else:
+                refreshed.output_path = self._build_output_path(refreshed.batch_source)
+                queue_item.asset_kind = refreshed.asset_kind
+                queue_item.metadata = refreshed.metadata
+                queue_item.status = refreshed.status
+                queue_item.message = refreshed.message
+            updated = True
+
+        self.graph_workspace.refresh_asset_paths(normalized_paths)
+        if updated:
+            self._render_queue()
+            self._render_asset_browser()
+            self._refresh_packing_preflight()
+            self._sync_status_bar_with_selection()
+            selected_item = self._selected_queue_item()
+            self.metadata_panel.set_queue_item(selected_item)
+            if self.preview_window.isVisible():
+                self.preview_window.set_queue_item(selected_item)
+        if preview_key in changed_keys:
+            refreshed_item = next(
+                (
+                    queue_item
+                    for queue_item in self._queue_items
+                    if self._queue_key(queue_item.path) == preview_key
+                ),
+                None,
+            )
+            if refreshed_item is not None:
+                self.preview_panel.set_queue_item(refreshed_item)
+        self.set_status(f"{source_label}: reloaded assets {len(normalized_paths)}")
+
+    def _scan_single_queue_item(self, path: Path, batch_source: BatchSource) -> QueueItem:
+        from image_converter.services.asset_queue import AssetScanner
+
+        scanner = AssetScanner()
+        return scanner._build_queue_item(batch_source)
+
+    def _run_graph_auto_export(self) -> None:
+        if not self._graph_auto_export_enabled or not self._graph_auto_export_scheduled:
+            return
+        self._graph_auto_export_scheduled = False
+        self._export_graph_with_feedback(show_dialogs=False)
+
+    def _on_graph_watched_paths_changed(self, paths: tuple[Path, ...]) -> None:
+        if not self._graph_auto_watch_enabled:
+            self._update_graph_watch_status()
+            return
+        if not paths:
+            self._update_graph_watch_status("Watching: no texture nodes")
+            return
+        folder_count = len({str(path.parent).lower() for path in paths})
+        self._update_graph_watch_status(
+            f"Watching {len(paths)} texture(s) in {folder_count} folder(s)"
+        )
+
+    def _update_graph_watch_status(self, text: str | None = None) -> None:
+        if text is None:
+            if not self._graph_auto_watch_enabled:
+                text = "Auto Watch Off"
+            elif self._graph_auto_export_enabled:
+                text = "Auto Watch + Auto Rebuild"
+            else:
+                text = "Auto Watch On"
+        self._graph_auto_watch_status = text
+        if hasattr(self, "graph_watch_status_label"):
+            self.graph_watch_status_label.setText(text[:64])
 
     def _selected_queue_item(self) -> QueueItem | None:
         selection_model = self.queue_panel.table.selectionModel()
