@@ -874,6 +874,52 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertIn("A <- anglerfish_diff.png.A", summary)
         self.assertEqual("Auto Connect Profile", self.workspace.properties_panel.apply_profile_button.text())
 
+    def test_unity_urp_profile_summary_explains_metallic_smoothness_layout(self) -> None:
+        roughness = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_rgh.png"})
+        metallic = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_met.png"})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.UNITY_URP.value},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [roughness, metallic, output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+
+        summary = self.workspace._profile_summary_text(output)
+
+        self.assertIn("Unity URP Metallic/Smoothness -> RGBA / unity_urp_metallicsmoothness.png", summary)
+        self.assertIn("Uses Metallic/Smoothness layout. AO stays separate in URP.", summary)
+        self.assertIn("R <- anglerfish_met.png.R", summary)
+        self.assertIn("A <- Invert(anglerfish_rgh.png.R)", summary)
+
+    def test_unity_hdrp_profile_summary_uses_maskmap_name(self) -> None:
+        ao = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_ao.png"})
+        roughness = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_rgh.png"})
+        metallic = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": "anglerfish_met.png"})
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.UNITY_HDRP.value},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [ao, roughness, metallic, output],
+            ),
+            select_node_ids=[output.node_id],
+        )
+
+        summary = self.workspace._profile_summary_text(output)
+
+        self.assertIn("Unity HDRP Mask Map -> RGBA / unity_hdrp_maskmap.png", summary)
+        self.assertIn("Uses HDRP Mask Map layout.", summary)
+        self.assertIn("G <- anglerfish_ao.png.R", summary)
+
     def test_output_file_selection_syncs_output_name(self) -> None:
         output = create_graph_node(
             NodeType.OUTPUT_RGBA,

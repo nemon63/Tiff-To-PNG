@@ -138,8 +138,8 @@ NUMERIC_PREVIEW_DEBOUNCE_MS = 125
 
 OUTPUT_PROFILE_FILENAMES = {
     OutputProfile.GENERIC_RGBA: "packed_rgba.png",
-    OutputProfile.UNITY_URP: "unity_urp_mask.png",
-    OutputProfile.UNITY_HDRP: "unity_hdrp_mask.png",
+    OutputProfile.UNITY_URP: "unity_urp_metallicsmoothness.png",
+    OutputProfile.UNITY_HDRP: "unity_hdrp_maskmap.png",
     OutputProfile.UNREAL_ORM: "unreal_orm.png",
     OutputProfile.METAHUMAN_REPACK: "metahuman_repack.png",
 }
@@ -157,10 +157,15 @@ OUTPUT_PROFILE_PACK_LAYOUTS = {
 }
 OUTPUT_PROFILE_LABELS = {
     OutputProfile.GENERIC_RGBA: "Generic RGBA",
-    OutputProfile.UNITY_URP: "Unity URP",
-    OutputProfile.UNITY_HDRP: "Unity HDRP",
+    OutputProfile.UNITY_URP: "Unity URP Metallic/Smoothness",
+    OutputProfile.UNITY_HDRP: "Unity HDRP Mask Map",
     OutputProfile.UNREAL_ORM: "Unreal ORM",
     OutputProfile.METAHUMAN_REPACK: "MetaHuman Repack",
+}
+OUTPUT_PROFILE_SUMMARY_NOTES = {
+    OutputProfile.UNITY_URP: "Uses Metallic/Smoothness layout. AO stays separate in URP.",
+    OutputProfile.UNITY_HDRP: "Uses HDRP Mask Map layout.",
+    OutputProfile.UNREAL_ORM: "Uses ORM packing: AO / Roughness / Metallic.",
 }
 DEFAULT_PROFILE_FILL = {
     TextureMapType.AO: 255,
@@ -1584,8 +1589,8 @@ class NodePropertiesPanel(QWidget):
         self.output_profile_combo = QComboBox()
         for label, value in (
             ("Generic RGBA", OutputProfile.GENERIC_RGBA.value),
-            ("Unity URP", OutputProfile.UNITY_URP.value),
-            ("Unity HDRP", OutputProfile.UNITY_HDRP.value),
+            ("Unity URP Metallic/Smoothness", OutputProfile.UNITY_URP.value),
+            ("Unity HDRP Mask Map", OutputProfile.UNITY_HDRP.value),
             ("Unreal ORM", OutputProfile.UNREAL_ORM.value),
             ("MetaHuman Repack", OutputProfile.METAHUMAN_REPACK.value),
         ):
@@ -3075,6 +3080,9 @@ class GraphWorkspace(QWidget):
         profile_label = OUTPUT_PROFILE_LABELS.get(plan.profile, plan.profile.value)
         filename = str(plan.properties.get("filename", "packed_rgba.png"))
         lines = [f"{profile_label} -> {plan.mode.value.upper()} / {filename}"]
+        note = OUTPUT_PROFILE_SUMMARY_NOTES.get(plan.profile)
+        if note:
+            lines.append(note)
         if any(connection.target_node_id == node.node_id for connection in self.project.graph.connections):
             lines.append("Existing input wires will be replaced.")
         if plan.summary_lines:
