@@ -138,6 +138,7 @@ PACK_LAYOUTS: dict[ChannelPackLayout, tuple[PackChannelRule, ...]] = {
 @dataclass(slots=True, frozen=True)
 class ChannelPackJob:
     group_name: str
+    relative_dir: Path
     layout: ChannelPackLayout
     output_path: Path
     channel_sources: tuple[ResolvedPackChannel, ...]
@@ -213,6 +214,7 @@ def build_channel_pack_jobs(
         jobs.append(
             ChannelPackJob(
                 group_name=base_name,
+                relative_dir=relative_dir,
                 layout=options.packing.layout,
                 output_path=output_path,
                 channel_sources=channel_sources,
@@ -301,20 +303,26 @@ def summarize_channel_pack_jobs(jobs: tuple[ChannelPackJob, ...] | list[ChannelP
     ready_jobs = [job for job in jobs if job.is_ready]
     missing_jobs = [job for job in jobs if not job.is_ready]
 
-    if not missing_jobs:
-        return f"Готово к packing: {len(ready_jobs)} set(s)."
-
-    missing_descriptions = [
-        f"{job.group_name}: {missing_map_labels(job.missing_maps)}"
-        for job in missing_jobs[:3]
+    lines = [
+        (
+            f"Packing plan ({jobs[0].layout.label}): ready {len(ready_jobs)}, "
+            f"incomplete {len(missing_jobs)}."
+        )
     ]
-    suffix = "" if len(missing_jobs) <= 3 else f" и еще {len(missing_jobs) - 3}"
-    return (
-        f"Готово: {len(ready_jobs)} set(s). "
-        f"Не хватает карт у {len(missing_jobs)} set(s): "
-        + "; ".join(missing_descriptions)
-        + suffix
-    )
+
+    detail_limit = 4
+    preview_jobs = missing_jobs[:detail_limit]
+    if len(preview_jobs) < detail_limit:
+        preview_jobs.extend(ready_jobs[: detail_limit - len(preview_jobs)])
+
+    for job in preview_jobs:
+        lines.append(_format_pack_job_summary(job))
+
+    remaining_jobs = len(jobs) - len(preview_jobs)
+    if remaining_jobs > 0:
+        lines.append(f"... and {remaining_jobs} more set(s).")
+
+    return "\n".join(lines)
 
 
 def missing_map_labels(map_types: tuple[str, ...] | list[str]) -> str:
@@ -368,20 +376,56 @@ def _describe_channel_rule(rule: PackChannelRule) -> str:
     for candidate in rule.candidates:
         label = candidate.map_type.label
         if candidate.invert:
-            label = f"1-{label}"
+            label = f"Invert({label})"
         parts.append(label)
 
     if rule.fill_value is not None:
-        fill_text = "1" if rule.fill_value >= 255 else "0" if rule.fill_value <= 0 else str(rule.fill_value)
-        if rule.label == "Detail Mask":
-            fill_text = f"{rule.label}={fill_text}"
-        elif rule.label != "Black":
-            fill_text = f"{rule.label}={fill_text}"
+        fill_text = _describe_fill_value(rule.label, rule.fill_value)
         parts.append(fill_text)
 
     if not parts:
         return rule.label
-    return " / ".join(parts)
+    return " or ".join(parts)
+
+
+def _format_pack_job_summary(job: ChannelPackJob) -> str:
+    display_source = _job_display_name(job)
+    display_output = _job_output_display_path(job)
+    channels = ", ".join(_describe_resolved_channel(channel) for channel in job.channel_sources)
+    if job.is_ready:
+        return f"- {display_source} -> {display_output}\n  {channels}"
+    missing = missing_map_labels(job.missing_maps)
+    return f"- {display_source} -> {display_output} (missing: {missing})\n  {channels}"
+
+
+def _describe_resolved_channel(channel: ResolvedPackChannel) -> str:
+    if channel.source is not None:
+        source_text = channel.source.path.name
+        if channel.invert:
+            source_text = f"Invert({source_text})"
+        return f"{channel.channel}={source_text}"
+    if channel.fill_value is not None:
+        return f"{channel.channel}={_describe_fill_value(channel.label, channel.fill_value)}"
+    return f"{channel.channel}=Missing({channel.label})"
+
+
+def _describe_fill_value(label: str, value: int) -> str:
+    fill_text = "1" if value >= 255 else "0" if value <= 0 else str(value)
+    if label == "Black":
+        return fill_text
+    return f"{label}({fill_text})"
+
+
+def _job_display_name(job: ChannelPackJob) -> str:
+    if job.relative_dir == Path():
+        return job.group_name
+    return f"{job.relative_dir.as_posix()}/{job.group_name}"
+
+
+def _job_output_display_path(job: ChannelPackJob) -> str:
+    if job.relative_dir == Path():
+        return job.output_path.name
+    return f"{job.relative_dir.as_posix()}/{job.output_path.name}"
 
 
 def _determine_target_size(

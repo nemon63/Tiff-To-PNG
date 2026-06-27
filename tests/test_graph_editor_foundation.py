@@ -19,7 +19,10 @@ from image_converter.domain.models import (
     AssetKind,
     AssetMetadata,
     BatchSource,
+    ChannelPackLayout,
+    ChannelPackingOptions,
     ConversionOptions,
+    NamingRules,
     PreviewChannel,
     QueueItem,
     TextureMapType,
@@ -38,6 +41,7 @@ from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.conversion import ImageConverter
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.node_graph_executor import NodeGraphExecutor
+from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
 from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
 from image_converter.services.settings import AppSettingsRepository
 from image_converter.ui.graph_commands import AddNodesCommand, ReplaceInputConnectionCommand
@@ -377,6 +381,61 @@ class NodePropertiesPanelTests(unittest.TestCase):
 
         self.panel.set_node(create_graph_node(NodeType.ERODE_CHANNEL))
         self.assertFalse(self.panel.erode_radius_host.isHidden())
+
+
+class ChannelPackingPlanTests(unittest.TestCase):
+    def test_packing_summary_lists_output_mapping_and_missing_maps(self) -> None:
+        options = ConversionOptions(
+            naming=NamingRules(lowercase=True),
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.UNITY_HDRP,
+            ),
+        )
+        sources = [
+            BatchSource(Path("D:/textures/Props/Sword/sword_metallic.png"), Path("D:/textures"), TextureMapType.METALLIC),
+            BatchSource(Path("D:/textures/Props/Sword/sword_roughness.png"), Path("D:/textures"), TextureMapType.ROUGHNESS),
+            BatchSource(Path("D:/textures/Props/Shield/shield_metallic.png"), Path("D:/textures"), TextureMapType.METALLIC),
+            BatchSource(Path("D:/textures/Props/Shield/shield_ao.png"), Path("D:/textures"), TextureMapType.AO),
+            BatchSource(Path("D:/textures/Props/Shield/shield_smoothness.png"), Path("D:/textures"), TextureMapType.SMOOTHNESS),
+        ]
+
+        jobs = build_channel_pack_jobs(sources, None, options)
+        summary = summarize_channel_pack_jobs(jobs)
+
+        self.assertIn("Packing plan (Unity HDRP): ready 1, incomplete 1.", summary)
+        self.assertIn("- Props/Sword/sword -> Props/Sword/sword_maskmap.png (missing: AO)", summary)
+        self.assertIn("R=sword_metallic.png", summary)
+        self.assertIn("A=Invert(sword_roughness.png)", summary)
+        self.assertIn("B=Detail Mask(1)", summary)
+        self.assertIn("- Props/Shield/shield -> Props/Shield/shield_maskmap.png", summary)
+        self.assertIn("G=shield_ao.png", summary)
+        self.assertIn("A=shield_smoothness.png", summary)
+
+    def test_packing_summary_truncates_long_job_list(self) -> None:
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.ORM,
+            ),
+        )
+        sources = []
+        for index in range(5):
+            base = f"crate_{index:02d}"
+            root = Path("D:/library")
+            sources.extend(
+                [
+                    BatchSource(root / f"{base}_ao.png", root, TextureMapType.AO),
+                    BatchSource(root / f"{base}_roughness.png", root, TextureMapType.ROUGHNESS),
+                    BatchSource(root / f"{base}_metallic.png", root, TextureMapType.METALLIC),
+                ]
+            )
+
+        jobs = build_channel_pack_jobs(sources, None, options)
+        summary = summarize_channel_pack_jobs(jobs)
+
+        self.assertIn("Packing plan (ORM): ready 5, incomplete 0.", summary)
+        self.assertIn("... and 1 more set(s).", summary)
 
 
 class GraphEditorFoundationTests(unittest.TestCase):
@@ -1277,6 +1336,48 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(self.workspace.has_unsaved_changes())
         self.workspace._update_project_label()
+
+    def test_batch_packing_preflight_uses_detailed_plan_text(self) -> None:
+        queue_root = Path("D:/textures")
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.ORM,
+            ),
+        )
+        window = MainWindow()
+        try:
+            window.settings_panel.apply_conversion_options(options)
+            window._queue_items = [
+                QueueItem(
+                    source=BatchSource(queue_root / "Sword/sword_ao.png", queue_root, TextureMapType.AO),
+                    asset_kind=AssetKind.IMAGE,
+                    metadata=AssetMetadata("PNG", 1024, 1024, "L", False, 1024, TextureMapType.AO),
+                ),
+                QueueItem(
+                    source=BatchSource(queue_root / "Sword/sword_roughness.png", queue_root, TextureMapType.ROUGHNESS),
+                    asset_kind=AssetKind.IMAGE,
+                    metadata=AssetMetadata("PNG", 1024, 1024, "L", False, 1024, TextureMapType.ROUGHNESS),
+                ),
+                QueueItem(
+                    source=BatchSource(queue_root / "Sword/sword_metallic.png", queue_root, TextureMapType.METALLIC),
+                    asset_kind=AssetKind.IMAGE,
+                    metadata=AssetMetadata("PNG", 1024, 1024, "L", False, 1024, TextureMapType.METALLIC),
+                ),
+            ]
+
+            window._refresh_packing_preflight()
+
+            text = window.settings_panel.packing_queue_label.text()
+            self.assertIn("Packing plan (ORM): ready 1, incomplete 0.", text)
+            self.assertIn("- Sword/sword -> Sword/sword_orm.png", text)
+            self.assertIn("R=sword_ao.png", text)
+            self.assertIn("G=sword_roughness.png", text)
+            self.assertIn("B=sword_metallic.png", text)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
 
 
 if __name__ == "__main__":
