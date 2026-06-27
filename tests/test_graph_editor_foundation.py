@@ -40,6 +40,7 @@ from image_converter.domain.node_graph import (
 from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.conversion import ImageConverter
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
+from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.node_graph_executor import NodeGraphExecutor
 from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
 from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
@@ -127,6 +128,17 @@ class ImageLoadingTests(unittest.TestCase):
             with Image.open(destination) as converted:
                 self.assertEqual("RGBA", converted.mode)
                 self.assertEqual((40, 200), converted.getchannel("A").getextrema())
+
+    def test_emissive_short_alias_ems_is_detected_in_queue(self) -> None:
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "anglerfish_ems.png"
+            Image.new("RGB", (4, 4), (255, 64, 0)).save(source)
+
+            self.assertEqual(TextureMapType.EMISSIVE, detect_texture_map_type(source))
+
+            item = AssetScanner().scan_paths([source], recursive=False).items[0]
+            self.assertIsNotNone(item.metadata)
+            self.assertEqual(TextureMapType.EMISSIVE, item.metadata.map_type)
 
 
 class NodeGraphExecutorPerformanceTests(unittest.TestCase):

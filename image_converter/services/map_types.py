@@ -36,7 +36,7 @@ MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
     ),
     (
         TextureMapType.EMISSIVE,
-        ("emissive", "emission", "emit", "emi", "glow", "selfillum"),
+        ("emissive", "emission", "emit", "emi", "ems", "glow", "selfillum"),
     ),
     (
         TextureMapType.HEIGHT,
