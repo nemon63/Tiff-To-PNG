@@ -58,7 +58,11 @@ from image_converter.services.colorspace import (
     recommended_colorspace_for_map_type,
 )
 from image_converter.services.conversion import BatchConversionService
-from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
+from image_converter.services.packing import (
+    build_channel_pack_jobs,
+    packed_source_map_types,
+    summarize_channel_pack_jobs,
+)
 from image_converter.services.presets import PresetRepository
 from image_converter.ui.common import (
     _colorspace_label,
