@@ -8,9 +8,11 @@ from PyQt6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
+    QColor,
     QDrag,
     QDragEnterEvent,
     QDropEvent,
+    QFont,
     QIcon,
     QKeySequence,
     QPixmap,
@@ -119,6 +121,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._is_running = False
         self._queue_items: list[QueueItem] = []
+        self._queue_row_items: list[QueueItem | None] = []
         self._asset_rows: list[QueueItem] = []
         self._preset_repository: PresetRepository | None = None
         self._presets_by_id: dict[str, ConversionPreset] = {}
@@ -733,11 +736,14 @@ class MainWindow(QMainWindow):
         if selection_model is None:
             return
         selected_rows = {index.row() for index in selection_model.selectedRows()}
-        selected_keys = {
-            self._queue_key(self._queue_items[row].path)
-            for row in selected_rows
-            if row < len(self._queue_items)
-        }
+        selected_keys = set()
+        for row in selected_rows:
+            if row >= len(self._queue_row_items):
+                continue
+            item = self._queue_row_items[row]
+            if item is None:
+                continue
+            selected_keys.add(self._queue_key(item.path))
         removed_count = self._remove_queue_items_by_keys(selected_keys)
         if removed_count:
             self.set_status(f"Удалено элементов: {removed_count}")
@@ -899,52 +905,70 @@ class MainWindow(QMainWindow):
         table = self.queue_panel.table
         selected_key = self._selected_queue_key()
         self.queue_panel.drop_hint.setVisible(not self._queue_items)
-        table.setRowCount(len(self._queue_items))
+        table.clearContents()
+        table.clearSpans()
         options = self.settings_panel.build_conversion_options()
+        grouped_items = self._group_queue_items_by_folder()
+        self._queue_row_items = []
+        total_rows = sum(len(items) + 1 for _label, _tooltip, items in grouped_items)
+        table.setRowCount(total_rows)
 
-        for row, item in enumerate(self._queue_items):
-            metadata = item.metadata
-            if options.packing.enabled and options.packing.mode is ChannelPackingMode.PACK_ONLY:
-                output_text = "В составе packed texture"
-                output_tooltip = (
-                    str(item.output_path)
-                    if item.output_path is not None
-                    else "Файл будет создан только как часть packed texture."
-                )
-            elif (
-                options.packing.enabled
-                and options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER
-                and item.effective_map_type in packed_source_map_types(options.packing.layout)
-            ):
-                output_text = "В составе packed texture"
-                output_tooltip = (
-                    str(self._build_output_path(item.batch_source))
-                    if item.output_path is not None
-                    else "Файл будет включен в packed texture и отдельно не выгружается."
-                )
-            else:
-                output_text = str(item.output_path) if item.output_path is not None else "-"
-                output_tooltip = output_text
-            status_text = _queue_status_display(item)
-            status_tooltip = item.message or status_text
-            dynamic_warnings = item_preflight_warnings(item)
-            if dynamic_warnings and item.status in (QueueStatus.READY, QueueStatus.PENDING):
-                status_tooltip = "; ".join(dynamic_warnings)
+        row = 0
+        for group_label, group_tooltip, items in grouped_items:
+            self._queue_row_items.append(None)
+            header_item = self._make_group_header_item(group_label, tooltip=group_tooltip)
+            table.setItem(row, 0, header_item)
+            table.setSpan(row, 0, 1, table.columnCount())
+            table.setRowHeight(row, 24)
+            row += 1
 
-            row_items = [
-                self._make_table_item(item.path.name, tooltip=str(item.path)),
-                self._make_table_item(self._asset_type_text(item), tooltip=self._map_type_tooltip(item)),
-                self._make_table_item(metadata.size_text if metadata else "-", tooltip=self._metadata_tooltip(item)),
-                self._make_table_item(metadata.resolution_text if metadata else "-", tooltip=self._metadata_tooltip(item)),
-                self._make_table_item(status_text, tooltip=status_tooltip),
-                self._make_table_item(output_text, tooltip=output_tooltip),
-            ]
-            row_items[0].setData(Qt.ItemDataRole.UserRole, self._queue_key(item.path))
+            for item in items:
+                self._queue_row_items.append(item)
+                metadata = item.metadata
+                if options.packing.enabled and options.packing.mode is ChannelPackingMode.PACK_ONLY:
+                    output_text = "В составе packed texture"
+                    output_tooltip = (
+                        str(item.output_path)
+                        if item.output_path is not None
+                        else "Файл будет создан только как часть packed texture."
+                    )
+                elif (
+                    options.packing.enabled
+                    and options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER
+                    and item.effective_map_type in packed_source_map_types(options.packing.layout)
+                ):
+                    output_text = "В составе packed texture"
+                    output_tooltip = (
+                        str(self._build_output_path(item.batch_source))
+                        if item.output_path is not None
+                        else "Файл будет включен в packed texture и отдельно не выгружается."
+                    )
+                else:
+                    output_text = str(item.output_path) if item.output_path is not None else "-"
+                    output_tooltip = output_text
+                status_text = _queue_status_display(item)
+                status_tooltip = item.message or status_text
+                dynamic_warnings = item_preflight_warnings(item)
+                if dynamic_warnings and item.status in (QueueStatus.READY, QueueStatus.PENDING):
+                    status_tooltip = "; ".join(dynamic_warnings)
 
-            for column, table_item in enumerate(row_items):
-                table.setItem(row, column, table_item)
+                row_items = [
+                    self._make_table_item(item.path.name, tooltip=str(item.path)),
+                    self._make_table_item(self._asset_type_text(item), tooltip=self._map_type_tooltip(item)),
+                    self._make_table_item(metadata.size_text if metadata else "-", tooltip=self._metadata_tooltip(item)),
+                    self._make_table_item(metadata.resolution_text if metadata else "-", tooltip=self._metadata_tooltip(item)),
+                    self._make_table_item(status_text, tooltip=status_tooltip),
+                    self._make_table_item(output_text, tooltip=output_tooltip),
+                ]
+                row_items[0].setData(Qt.ItemDataRole.UserRole, self._queue_key(item.path))
 
-            self._apply_row_style(row, item)
+                for column, table_item in enumerate(row_items):
+                    table.setItem(row, column, table_item)
+
+                self._apply_row_style(row, item)
+                row += 1
+
+        self._refresh_output_bundle_summary()
 
         if not self._queue_items:
             self.queue_panel.summary_label.setText("Очередь пуста")
@@ -957,7 +981,10 @@ class MainWindow(QMainWindow):
 
         warning_count = sum(1 for item in self._queue_items if item_warning_count(item))
         error_count = sum(1 for item in self._queue_items if item.status is QueueStatus.ERROR)
-        summary_text = f"Всего: {len(self._queue_items)} | Предупреждений: {warning_count} | Ошибок: {error_count}"
+        summary_text = (
+            f"Всего: {len(self._queue_items)} | Папок: {len(grouped_items)} | "
+            f"Предупреждений: {warning_count} | Ошибок: {error_count}"
+        )
         self.queue_panel.summary_label.setText(summary_text)
         self._restore_queue_selection(selected_key)
 
@@ -974,6 +1001,17 @@ class MainWindow(QMainWindow):
         table_item = QTableWidgetItem(text)
         table_item.setToolTip(tooltip)
         table_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+        return table_item
+
+    def _make_group_header_item(self, text: str, *, tooltip: str = "") -> QTableWidgetItem:
+        table_item = QTableWidgetItem(text)
+        table_item.setToolTip(tooltip)
+        table_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        font = QFont(table_item.font())
+        font.setBold(True)
+        table_item.setFont(font)
+        table_item.setBackground(QColor("#202730"))
+        table_item.setForeground(QColor("#C7D7EB"))
         return table_item
 
     def _asset_type_text(self, item: QueueItem) -> str:
@@ -1111,6 +1149,143 @@ class MainWindow(QMainWindow):
         else:
             summary = "Режим: сначала обычные PNG, затем packed texture.\n" + summary
         self.settings_panel.set_packing_preflight_summary(summary)
+
+    def _refresh_output_bundle_summary(self) -> None:
+        self.settings_panel.set_output_bundle_summary(
+            self._build_output_bundle_summary()
+        )
+
+    def _build_output_bundle_summary(self) -> str:
+        options = self.settings_panel.build_conversion_options()
+        source_items = [
+            item
+            for item in self._queue_items
+            if item.status is not QueueStatus.ERROR
+        ]
+        if not source_items:
+            if not options.packing.enabled:
+                return "Для выбранного сценария\n- Отдельно: все исходные карты\n- Packed texture: не используется"
+            packed_types = packed_source_map_types(options.packing.layout)
+            packed_labels = self._map_type_list_text(packed_types)
+            if options.packing.mode is ChannelPackingMode.PACK_ONLY:
+                return (
+                    "Для выбранного сценария\n"
+                    f"- Packed: {options.packing.layout.label}\n"
+                    f"- Не будут выгружены отдельно: {packed_labels}"
+                )
+            if options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
+                separate_text = self._map_type_list_text(
+                    self._generic_nonpacked_map_types(options.packing.layout)
+                )
+                return (
+                    "Для выбранного сценария\n"
+                    f"- Отдельно при наличии: {separate_text}\n"
+                    f"- Packed: {options.packing.layout.label}\n"
+                    f"- Не дублировать отдельно: {packed_labels}"
+                )
+            return (
+                "Для выбранного сценария\n"
+                "- Отдельно: все исходные карты\n"
+                f"- Дополнительно packed: {options.packing.layout.label}"
+            )
+
+        available_map_types = {
+            item.effective_map_type
+            for item in source_items
+            if item.effective_map_type is not TextureMapType.UNKNOWN
+        }
+
+        if not options.packing.enabled:
+            return (
+                "Для текущей очереди\n"
+                "- Отдельно: все исходные карты\n"
+                "- Packed texture: не используется"
+            )
+
+        packed_types = packed_source_map_types(options.packing.layout)
+        packed_labels = self._map_type_list_text(packed_types)
+
+        if options.packing.mode is ChannelPackingMode.PACK_ONLY:
+            return (
+                "Для текущей очереди\n"
+                f"- Packed: {options.packing.layout.label}\n"
+                f"- Не будут выгружены отдельно: {packed_labels}"
+            )
+
+        if options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
+            separate_source = (
+                available_map_types
+                if available_map_types
+                else self._generic_nonpacked_map_types(options.packing.layout)
+            )
+            separate_types = [
+                map_type
+                for map_type in self._ordered_map_types(separate_source)
+                if map_type not in packed_types
+            ]
+            separate_text = (
+                self._map_type_list_text(separate_types)
+                if separate_types
+                else "нет"
+            )
+            prefix = "Отдельно" if available_map_types else "Отдельно при наличии"
+            return (
+                "Для текущей очереди\n"
+                f"- {prefix}: {separate_text}\n"
+                f"- Packed: {options.packing.layout.label}\n"
+                f"- Не дублировать отдельно: {packed_labels}"
+            )
+
+        return (
+            "Для текущей очереди\n"
+            "- Отдельно: все исходные карты\n"
+            f"- Дополнительно packed: {options.packing.layout.label}"
+        )
+
+    @staticmethod
+    def _ordered_map_types(map_types: set[TextureMapType] | frozenset[TextureMapType]) -> list[TextureMapType]:
+        display_order = (
+            TextureMapType.BASECOLOR,
+            TextureMapType.NORMAL,
+            TextureMapType.EMISSIVE,
+            TextureMapType.HEIGHT,
+            TextureMapType.OPACITY,
+            TextureMapType.AO,
+            TextureMapType.ROUGHNESS,
+            TextureMapType.SMOOTHNESS,
+            TextureMapType.METALLIC,
+        )
+        present = set(map_types)
+        ordered = [map_type for map_type in display_order if map_type in present]
+        remainder = sorted(
+            (map_type for map_type in present if map_type not in set(display_order)),
+            key=lambda value: value.label,
+        )
+        return ordered + remainder
+
+    def _map_type_list_text(
+        self,
+        map_types: set[TextureMapType] | frozenset[TextureMapType] | list[TextureMapType] | tuple[TextureMapType, ...],
+    ) -> str:
+        if not map_types:
+            return "нет"
+        if not isinstance(map_types, list):
+            ordered = self._ordered_map_types(set(map_types))
+        else:
+            ordered = map_types
+        return ", ".join(map_type.label for map_type in ordered)
+
+    @staticmethod
+    def _generic_nonpacked_map_types(layout: object) -> set[TextureMapType]:
+        packed_types = packed_source_map_types(layout)
+        return {
+            TextureMapType.BASECOLOR,
+            TextureMapType.NORMAL,
+            TextureMapType.EMISSIVE,
+            TextureMapType.HEIGHT,
+            TextureMapType.OPACITY,
+            TextureMapType.SMOOTHNESS,
+        } - set(packed_types)
 
     def _apply_preset(self, preset_id: str) -> None:
         preset = self._presets_by_id.get(preset_id)
@@ -1443,10 +1618,14 @@ class MainWindow(QMainWindow):
         if not selected_rows:
             return None
 
-        row = selected_rows[0].row()
-        if row >= len(self._queue_items):
-            return None
-        return self._queue_items[row]
+        for selected_row in selected_rows:
+            row = selected_row.row()
+            if row >= len(self._queue_row_items):
+                continue
+            item = self._queue_row_items[row]
+            if item is not None:
+                return item
+        return None
 
     def _remove_queue_items_by_keys(self, keys: set[str]) -> int:
         if not keys:
@@ -1476,14 +1655,51 @@ class MainWindow(QMainWindow):
         if not self._queue_items:
             return
 
-        target_row = 0
+        target_row = next(
+            (row for row, item in enumerate(self._queue_row_items) if item is not None),
+            None,
+        )
+        if target_row is None:
+            return
         if key is not None:
-            for row, item in enumerate(self._queue_items):
-                if self._queue_key(item.path) == key:
+            for row, item in enumerate(self._queue_row_items):
+                if item is not None and self._queue_key(item.path) == key:
                     target_row = row
                     break
 
         self.queue_panel.table.selectRow(target_row)
+
+    def _group_queue_items_by_folder(self) -> list[tuple[str, str, list[QueueItem]]]:
+        groups: list[tuple[str, str, list[QueueItem]]] = []
+        current_key: str | None = None
+
+        for item in self._queue_items:
+            group_key = self._queue_group_key(item)
+            group_label = self._queue_group_label(item)
+            group_tooltip = str(item.path.parent)
+            if current_key != group_key:
+                groups.append((group_label, group_tooltip, [item]))
+                current_key = group_key
+                continue
+            groups[-1][2].append(item)
+
+        return groups
+
+    def _queue_group_key(self, item: QueueItem) -> str:
+        return self._queue_key(item.path.parent)
+
+    def _queue_group_label(self, item: QueueItem) -> str:
+        root = item.root
+        parent = item.path.parent
+        if root is not None:
+            try:
+                relative = parent.relative_to(root)
+            except ValueError:
+                relative = Path()
+            if relative == Path():
+                return f"Папка: {root.name}"
+            return f"Папка: {root.name}/{relative.as_posix()}"
+        return f"Папка: {parent.as_posix()}"
 
     def _apply_default_splitter_sizes(self) -> None:
         return

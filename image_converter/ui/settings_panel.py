@@ -82,6 +82,7 @@ class SettingsPanel(QWidget):
         scenario_index = self.settings_tabs.addTab(
             self._build_tab(
                 self._build_presets_group(),
+                self._build_output_bundle_group(),
                 self._build_paths_group(),
             ),
             "Сценарий",
@@ -167,6 +168,19 @@ class SettingsPanel(QWidget):
             self.save_preset_button,
             self.delete_preset_button,
         )
+        return group
+
+    def _build_output_bundle_group(self) -> QGroupBox:
+        group = QGroupBox("Итоговый набор файлов")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        self.output_bundle_summary_label = QLabel(
+            "Выберите сценарий и добавьте файлы в очередь, чтобы увидеть ожидаемый состав экспорта."
+        )
+        self.output_bundle_summary_label.setObjectName("SummaryText")
+        self.output_bundle_summary_label.setWordWrap(True)
+        layout.addWidget(self.output_bundle_summary_label)
         return group
 
     def _build_paths_group(self) -> QGroupBox:
@@ -674,6 +688,9 @@ class SettingsPanel(QWidget):
     def set_packing_preflight_summary(self, text: str) -> None:
         self._packing_preflight_text = text
         self._refresh_packing_ui()
+
+    def set_output_bundle_summary(self, text: str) -> None:
+        self.output_bundle_summary_label.setText(text)
 
     def minimumSizeHint(self) -> QSize:
         return QSize(260, 480)

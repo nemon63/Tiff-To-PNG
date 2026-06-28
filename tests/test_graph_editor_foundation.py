@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from PIL import Image, ImageFilter
-from PyQt6.QtCore import QEventLoop, QTimer
+from PyQt6.QtCore import QEventLoop, QTimer, Qt
 from PyQt6.QtWidgets import QApplication, QLabel
 
 from image_converter.domain.models import (
@@ -1547,8 +1547,8 @@ class GraphEditorFoundationTests(unittest.TestCase):
             preflight_text = window.settings_panel.packing_queue_label.text()
             self.assertIn("Режим: только packed texture.", preflight_text)
             self.assertIn("Packing plan (ORM): ready 1, incomplete 0.", preflight_text)
-            self.assertEqual("В составе packed texture", window.queue_panel.table.item(0, 5).text())
-            self.assertIn("sword_orm.png", window.queue_panel.table.item(0, 5).toolTip())
+            self.assertEqual("В составе packed texture", window.queue_panel.table.item(1, 5).text())
+            self.assertIn("sword_orm.png", window.queue_panel.table.item(1, 5).toolTip())
             self.assertIn(
                 "соберет только итоговый packed texture",
                 window.settings_panel.packing_mode_label.text(),
@@ -1602,6 +1602,7 @@ class GraphEditorFoundationTests(unittest.TestCase):
 
             summary_text = window.settings_panel.preset_packing_summary_label.text()
             preset_text = window.settings_panel.preset_summary_label.text()
+            bundle_text = window.settings_panel.output_bundle_summary_label.text()
             self.assertIn("Упаковка каналов", summary_text)
             self.assertIn("Режим: Packed + нужные карты", summary_text)
             self.assertIn("Схема: ORM", summary_text)
@@ -1611,6 +1612,59 @@ class GraphEditorFoundationTests(unittest.TestCase):
                 preset_text,
             )
             self.assertIn("Файлы: перезапись выключена; исходники сохраняются", preset_text)
+            self.assertIn("Packed: ORM", bundle_text)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_output_bundle_summary_lists_remaining_maps_for_unreal_pack(self) -> None:
+        window = MainWindow()
+        try:
+            presets = list(SYSTEM_PRESETS)
+            window._presets_by_id = {preset.preset_id: preset for preset in presets}
+            window.settings_panel.set_available_presets(presets)
+            unreal_preset = next(preset for preset in presets if preset.name == "Unreal ORM Pack")
+            window.settings_panel.apply_conversion_options(unreal_preset.options)
+
+            metadata = AssetMetadata("PNG", 4, 4, "RGBA", True, 64, TextureMapType.BASECOLOR)
+            normal_metadata = AssetMetadata("PNG", 4, 4, "RGB", False, 64, TextureMapType.NORMAL)
+            gray_metadata = AssetMetadata("PNG", 4, 4, "L", False, 64, TextureMapType.AO)
+            window.add_queue_items([
+                QueueItem(BatchSource(Path("D:/textures/key_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR), AssetKind.IMAGE, metadata),
+                QueueItem(BatchSource(Path("D:/textures/key_normal.png"), Path("D:/textures"), TextureMapType.NORMAL), AssetKind.IMAGE, normal_metadata),
+                QueueItem(BatchSource(Path("D:/textures/key_ao.png"), Path("D:/textures"), TextureMapType.AO), AssetKind.IMAGE, gray_metadata),
+                QueueItem(BatchSource(Path("D:/textures/key_roughness.png"), Path("D:/textures"), TextureMapType.ROUGHNESS), AssetKind.IMAGE, gray_metadata),
+                QueueItem(BatchSource(Path("D:/textures/key_metallic.png"), Path("D:/textures"), TextureMapType.METALLIC), AssetKind.IMAGE, gray_metadata),
+            ])
+
+            bundle_text = window.settings_panel.output_bundle_summary_label.text()
+            self.assertIn("Отдельно: BaseColor, Normal", bundle_text)
+            self.assertIn("Packed: ORM", bundle_text)
+            self.assertIn("Не дублировать отдельно: AO, Roughness, Metallic", bundle_text)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_queue_renders_folder_group_headers(self) -> None:
+        window = MainWindow()
+        try:
+            metadata = AssetMetadata("PNG", 4, 4, "RGBA", True, 64, TextureMapType.BASECOLOR)
+            window.add_queue_items([
+                QueueItem(BatchSource(Path("D:/textures/SetA/a_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR), AssetKind.IMAGE, metadata),
+                QueueItem(BatchSource(Path("D:/textures/SetB/b_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR), AssetKind.IMAGE, metadata),
+            ])
+
+            table = window.queue_panel.table
+            self.assertEqual(4, table.rowCount())
+            self.assertEqual("Папка: textures/SetA", table.item(0, 0).text())
+            self.assertEqual("Папка: textures/SetB", table.item(2, 0).text())
+
+            table.selectRow(3)
+            selected = window._selected_queue_item()
+            self.assertIsNotNone(selected)
+            self.assertEqual("b_basecolor.png", selected.path.name)
         finally:
             window.close()
             window.deleteLater()
