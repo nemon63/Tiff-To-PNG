@@ -77,6 +77,8 @@ class SettingsPanel(QWidget):
         root_layout.addWidget(subtitle_label)
 
         self.settings_tabs = QTabWidget()
+        self.settings_tabs.tabBar().setExpanding(True)
+        self.settings_tabs.tabBar().setUsesScrollButtons(False)
         scenario_index = self.settings_tabs.addTab(
             self._build_tab(
                 self._build_presets_group(),
@@ -89,7 +91,7 @@ class SettingsPanel(QWidget):
                 self._build_naming_group(),
                 self._build_packing_group(),
             ),
-            "Имена и каналы",
+            "Каналы",
         )
         format_index = self.settings_tabs.addTab(
             self._build_tab(
@@ -97,7 +99,7 @@ class SettingsPanel(QWidget):
                 self._build_png_group(),
                 self._build_resize_group(),
             ),
-            "Формат и размер",
+            "Формат",
         )
         self.settings_tabs.setTabToolTip(scenario_index, "Готовый сценарий и папка результата.")
         self.settings_tabs.setTabToolTip(naming_index, "Правила именования файлов и упаковка каналов.")

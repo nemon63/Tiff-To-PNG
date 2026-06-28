@@ -257,19 +257,7 @@ class MainWindow(QMainWindow):
         panel.setObjectName("WorkspaceCard")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        header = QHBoxLayout()
-        title = QLabel("Batch Converter")
-        title.setObjectName("PanelTitle")
-        header.addWidget(title)
-        subtitle = QLabel("Очередь справа задает вход, а сценарий слева определяет итоговый результат.")
-        subtitle.setObjectName("SummaryText")
-        subtitle.setWordWrap(True)
-        subtitle.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        header.addWidget(subtitle)
-        header.addStretch(1)
-        layout.addLayout(header)
+        layout.setSpacing(10)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.settings_scroll.setMinimumWidth(340)
@@ -356,13 +344,17 @@ class MainWindow(QMainWindow):
         self.batch_mode_button = QPushButton("Batch Converter")
         self.batch_mode_button.setObjectName("ModeButton")
         self.batch_mode_button.setCheckable(True)
+        self.batch_mode_button.setToolTip("Переключиться в пакетную обработку.")
         self.batch_mode_button.clicked.connect(lambda: self._set_workspace_mode(WORKSPACE_BATCH))
+        self._configure_mode_button(self.batch_mode_button, "Batch Converter")
         primary_row.addWidget(self.batch_mode_button)
 
         self.graph_mode_button = QPushButton("Graph Workbench")
         self.graph_mode_button.setObjectName("ModeButton")
         self.graph_mode_button.setCheckable(True)
+        self.graph_mode_button.setToolTip("Переключиться в режим ручной сборки и правки графа.")
         self.graph_mode_button.clicked.connect(lambda: self._set_workspace_mode(WORKSPACE_GRAPH))
+        self._configure_mode_button(self.graph_mode_button, "Graph Workbench")
         primary_row.addWidget(self.graph_mode_button)
 
         self.active_workspace_label = QLabel("Queue")
@@ -420,6 +412,11 @@ class MainWindow(QMainWindow):
         secondary_row.addWidget(self.graph_watch_status_label)
         layout.addLayout(secondary_row)
         return toolbar
+
+    def _configure_mode_button(self, button: QPushButton, text: str) -> None:
+        button.setMinimumHeight(30)
+        button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        button.setMinimumWidth(button.fontMetrics().horizontalAdvance(text) + 28)
 
     def _build_assets_panel(self) -> QFrame:
         panel = QFrame()

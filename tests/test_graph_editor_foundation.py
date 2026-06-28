@@ -838,6 +838,31 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window.deleteLater()
             self.app.processEvents()
 
+    def test_batch_workspace_does_not_duplicate_mode_header(self) -> None:
+        window = MainWindow()
+        try:
+            panel_titles = [
+                label.text()
+                for label in window.batch_workspace.findChildren(QLabel)
+                if label.objectName() == "PanelTitle"
+            ]
+            self.assertNotIn("Batch Converter", panel_titles)
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_mode_buttons_have_room_for_full_text(self) -> None:
+        window = MainWindow()
+        try:
+            self.assertGreaterEqual(window.batch_mode_button.minimumHeight(), 30)
+            self.assertGreaterEqual(window.batch_mode_button.minimumWidth(), 140)
+            self.assertGreaterEqual(window.graph_mode_button.minimumWidth(), 140)
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
     def test_graph_asset_browser_can_remove_selected_assets(self) -> None:
         window = MainWindow()
         try:
@@ -1573,8 +1598,8 @@ class GraphEditorFoundationTests(unittest.TestCase):
             tabs = window.settings_panel.settings_tabs
 
             self.assertEqual("Сценарий", tabs.tabText(0))
-            self.assertEqual("Имена и каналы", tabs.tabText(1))
-            self.assertEqual("Формат и размер", tabs.tabText(2))
+            self.assertEqual("Каналы", tabs.tabText(1))
+            self.assertEqual("Формат", tabs.tabText(2))
         finally:
             window.close()
             window.deleteLater()
