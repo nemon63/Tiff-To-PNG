@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image
@@ -2215,6 +2215,12 @@ class GraphWorkspace(QWidget):
     def set_assets(self, items: list[QueueItem]) -> None:
         self._assets = [item for item in items if item.metadata is not None]
 
+    def assets(self) -> tuple[QueueItem, ...]:
+        return tuple(self._assets)
+
+    def clear_assets(self) -> None:
+        self._assets = []
+
     def refresh_asset_paths(self, paths: Iterable[Path]) -> None:
         changed_keys = {
             self._path_key(path)
@@ -2476,6 +2482,50 @@ class GraphWorkspace(QWidget):
             AddNodesCommand(self.project.graph, self._on_graph_command_changed, [node], text="Add texture"),
             select_node_ids=[node.node_id],
         )
+
+    def clone_project_with_texture_mapping(
+        self,
+        mapping: dict[TextureMapType, Path],
+        *,
+        output_prefix: str = "",
+    ) -> NodeGraphProject:
+        project = replace(self.project)
+        graph = replace(self.project.graph)
+        graph.nodes = [clone_graph_node(node) for node in self.project.graph.nodes]
+        graph.connections = [clone_graph_connection(connection) for connection in self.project.graph.connections]
+        project.graph = graph
+
+        nodes_by_map_type: dict[TextureMapType, GraphNode] = {}
+        for node in graph.nodes:
+            if node.node_type is not NodeType.TEXTURE_INPUT:
+                continue
+            path = Path(str(node.properties.get("path", "")))
+            map_type = detect_texture_map_type(path)
+            if map_type is TextureMapType.UNKNOWN:
+                continue
+            nodes_by_map_type.setdefault(map_type, node)
+
+        for map_type, replacement_path in mapping.items():
+            node = nodes_by_map_type.get(map_type)
+            if node is None:
+                continue
+            node.properties["path"] = str(replacement_path)
+
+        if output_prefix:
+            safe_prefix = output_prefix.replace("\\", "_").replace("/", "_").strip()
+            for node in graph.nodes:
+                if node.node_type is not NodeType.OUTPUT_RGBA:
+                    continue
+                raw_output_path = str(node.properties.get("output_path", "")).strip()
+                raw_filename = str(node.properties.get("filename", "")).strip()
+                if raw_output_path:
+                    output_path = Path(raw_output_path)
+                    node.properties["output_path"] = str(output_path.with_name(f"{safe_prefix}_{output_path.name}"))
+                elif raw_filename:
+                    node.properties["filename"] = f"{safe_prefix}_{raw_filename}"
+                else:
+                    node.properties["filename"] = f"{safe_prefix}_{node.title}.png"
+        return project
 
     def add_node_of_type(
         self,

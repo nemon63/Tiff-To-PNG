@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
 
@@ -53,6 +54,8 @@ from image_converter.domain.models import (
     QueueStatus,
     TextureMapType,
 )
+from image_converter.domain.errors import ValidationError
+from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.colorspace import (
     item_preflight_warnings,
     item_warning_count,
@@ -60,12 +63,15 @@ from image_converter.services.colorspace import (
     recommended_colorspace_for_map_type,
 )
 from image_converter.services.conversion import BatchConversionService
+from image_converter.services.node_graph_executor import NodeGraphExecutor
 from image_converter.services.packing import (
     build_channel_pack_jobs,
     packed_source_map_types,
     summarize_channel_pack_jobs,
 )
 from image_converter.services.presets import PresetRepository
+from image_converter.services.validation import validate_request
+from image_converter.domain.constants import FILE_DIALOG_FILTER
 from image_converter.ui.common import (
     _colorspace_label,
     _extract_local_paths,
@@ -132,7 +138,9 @@ class MainWindow(QMainWindow):
         self._graph_auto_export_scheduled = False
         self._graph_auto_export_paths: tuple[Path, ...] = ()
         self._graph_export_in_progress = False
+        self._graph_batch_export_in_progress = False
         self._graph_auto_watch_status = "Auto Watch Off"
+        self._asset_scanner = AssetScanner()
         self.setWindowTitle("Texture Pipeline Workbench")
         self.resize(1280, 820)
         self.setMinimumSize(720, 480)
@@ -167,6 +175,9 @@ class MainWindow(QMainWindow):
         self.queue_panel.paths_dropped.connect(self.queue_paths_received.emit)
         self.queue_panel.remove_requested.connect(self.remove_selected_queue_items)
         self.queue_panel.clear_requested.connect(self.clear_queue_items)
+        self.queue_panel.open_selected_set_in_graph_requested.connect(self._open_selected_set_in_graph)
+        self.queue_panel.open_selected_files_in_graph_requested.connect(self._open_selected_files_in_graph)
+        self.queue_panel.apply_graph_to_queue_requested.connect(self._apply_current_graph_to_queue)
         self.queue_panel.table.itemSelectionChanged.connect(self._sync_status_bar_with_selection)
         self.queue_panel.table.itemSelectionChanged.connect(self._sync_workspace_selection)
         self.queue_panel.table.itemDoubleClicked.connect(self._open_selected_preview_window)
@@ -440,10 +451,10 @@ class MainWindow(QMainWindow):
         buttons.setHorizontalSpacing(8)
         buttons.setVerticalSpacing(8)
         add_files = QPushButton("+ Files")
-        add_files.clicked.connect(self.queue_panel._pick_files)
+        add_files.clicked.connect(self._pick_graph_asset_files)
         buttons.addWidget(add_files, 0, 0)
         add_folder = QPushButton("+ Folder")
-        add_folder.clicked.connect(self.queue_panel._pick_folder)
+        add_folder.clicked.connect(self._pick_graph_asset_folder)
         buttons.addWidget(add_folder, 0, 1)
         reload_asset = QPushButton("Reload")
         reload_asset.clicked.connect(self._reload_selected_asset)
@@ -537,7 +548,7 @@ class MainWindow(QMainWindow):
         filter_text = self.asset_filter_edit.text().strip().casefold() if hasattr(self, "asset_filter_edit") else ""
         self._asset_rows = [
             item
-            for item in self._queue_items
+            for item in self.graph_workspace.assets()
             if not filter_text
             or filter_text in item.path.name.casefold()
             or filter_text in _map_type_label(item.effective_map_type).casefold()
@@ -562,7 +573,6 @@ class MainWindow(QMainWindow):
                         table_item.setIcon(icon)
                 table.setItem(row, column, table_item)
         self._restore_asset_selection(selected_keys)
-        self.graph_workspace.set_assets(list(self._queue_items))
 
     def _add_selected_asset_to_graph(self, *_args: object) -> None:
         item = self._selected_asset_item()
@@ -578,6 +588,42 @@ class MainWindow(QMainWindow):
         self.preview_dock.show()
         self.preview_dock.raise_()
 
+    def _pick_graph_asset_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Выберите изображения для Graph", "", FILE_DIALOG_FILTER)
+        if paths:
+            self._add_graph_assets_from_paths(paths)
+
+    def _pick_graph_asset_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Выберите папку с текстурами для Graph")
+        if path:
+            self._add_graph_assets_from_paths([path])
+
+    def _add_graph_assets_from_paths(self, raw_paths: list[str]) -> None:
+        paths = [Path(raw_path) for raw_path in raw_paths]
+        scan_result = self._asset_scanner.scan_paths(
+            paths,
+            recursive=self.queue_recursive_enabled(),
+        )
+        existing_assets = list(self.graph_workspace.assets())
+        existing_index = {self._queue_key(item.path): index for index, item in enumerate(existing_assets)}
+        for item in scan_result.items:
+            key = self._queue_key(item.path)
+            if key in existing_index:
+                existing_assets[existing_index[key]] = item
+            else:
+                existing_assets.append(item)
+        existing_assets.sort(key=lambda item: str(item.path).lower())
+        self.graph_workspace.set_assets(existing_assets)
+        self._render_asset_browser()
+
+        for message in scan_result.ignored_messages:
+            self.append_log(message)
+
+        if scan_result.items:
+            self.set_status(f"Добавлено в Graph Assets: {len(scan_result.items)}")
+        elif scan_result.ignored_messages:
+            self.set_status("Поддерживаемые файлы для Graph не найдены")
+
     def _reload_selected_asset(self) -> None:
         items = self._selected_asset_items()
         if not items:
@@ -586,14 +632,28 @@ class MainWindow(QMainWindow):
         preview_item = self.preview_panel.current_queue_item()
         preview_key = self._queue_key(preview_item.path) if preview_item is not None else None
         reloaded_keys = {self._queue_key(path) for path in paths}
-        self.queue_paths_received.emit([str(path) for path in paths])
+        self._reload_assets_for_paths(tuple(paths), source_label="Reload")
+        graph_assets = list(self.graph_workspace.assets())
+        refreshed_graph_assets: list[QueueItem] = []
+        for asset in graph_assets:
+            key = self._queue_key(asset.path)
+            if key not in reloaded_keys:
+                refreshed_graph_assets.append(asset)
+                continue
+            queue_item = self._find_queue_item(asset.path)
+            if queue_item is not None:
+                refreshed_graph_assets.append(queue_item)
+                continue
+            refreshed_graph_assets.append(self._scan_single_queue_item(asset.path, asset.batch_source))
+        self.graph_workspace.set_assets(refreshed_graph_assets)
         self.graph_workspace.refresh_asset_paths(paths)
+        self._render_asset_browser()
         if preview_key in reloaded_keys:
             refreshed_item = next(
                 (
-                    queue_item
-                    for queue_item in self._queue_items
-                    if self._queue_key(queue_item.path) == preview_key
+                    asset
+                    for asset in self.graph_workspace.assets()
+                    if self._queue_key(asset.path) == preview_key
                 ),
                 None,
             )
@@ -602,9 +662,18 @@ class MainWindow(QMainWindow):
         self.set_status(f"Reloaded assets: {len(paths)}")
 
     def _remove_selected_assets(self) -> None:
-        removed_count = self._remove_queue_items_by_keys(set(self._selected_asset_keys()))
-        if removed_count:
-            self.set_status(f"Удалено ассетов: {removed_count}")
+        selected_items = self._selected_asset_items()
+        if not selected_items:
+            return
+        selected_keys = {self._queue_key(item.path) for item in selected_items}
+        remaining = [
+            item
+            for item in self.graph_workspace.assets()
+            if self._queue_key(item.path) not in selected_keys
+        ]
+        self.graph_workspace.set_assets(remaining)
+        self._render_asset_browser()
+        self.set_status(f"Удалено ассетов из Graph: {len(selected_items)}")
 
     def _asset_thumbnail_icon(self, item: QueueItem) -> QIcon | None:
         if not item.path.exists():
@@ -655,6 +724,26 @@ class MainWindow(QMainWindow):
 
     def _selected_asset_keys(self) -> list[str]:
         return [self._queue_key(item.path) for item in self._selected_asset_items()]
+
+    def _selected_queue_items(self) -> list[QueueItem]:
+        selection_model = self.queue_panel.table.selectionModel()
+        if selection_model is None:
+            return []
+        selected_rows = sorted({index.row() for index in selection_model.selectedRows()})
+        items: list[QueueItem] = []
+        seen: set[str] = set()
+        for row in selected_rows:
+            if row >= len(self._queue_row_items):
+                continue
+            item = self._queue_row_items[row]
+            if item is None:
+                continue
+            key = self._queue_key(item.path)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+        return items
 
     def _restore_asset_selection(self, keys: set[str]) -> None:
         if not keys:
@@ -1574,10 +1663,212 @@ class MainWindow(QMainWindow):
         self.set_status(f"{source_label}: reloaded assets {len(normalized_paths)}")
 
     def _scan_single_queue_item(self, path: Path, batch_source: BatchSource) -> QueueItem:
-        from image_converter.services.asset_queue import AssetScanner
+        return self._asset_scanner._build_queue_item(batch_source)
 
-        scanner = AssetScanner()
-        return scanner._build_queue_item(batch_source)
+    def _open_selected_set_in_graph(self) -> None:
+        seed = self._selected_queue_item()
+        if seed is None:
+            self.set_status("Выберите строку очереди, чтобы открыть набор в Graph.")
+            return
+        items = [
+            item
+            for item in self._queue_items
+            if self._queue_group_key(item) == self._queue_group_key(seed)
+        ]
+        if not items:
+            self.set_status("Для выбранной папки не найдено файлов.")
+            return
+        self.graph_workspace.set_assets(items)
+        self._render_asset_browser()
+        self._set_workspace_mode(WORKSPACE_GRAPH)
+        self.set_status(f"Открыт набор в Graph: {len(items)} файл(ов)")
+
+    def _open_selected_files_in_graph(self) -> None:
+        items = self._selected_queue_items()
+        if not items:
+            self.set_status("Выберите файлы в очереди, чтобы открыть их в Graph.")
+            return
+        self.graph_workspace.set_assets(items)
+        self._render_asset_browser()
+        self._set_workspace_mode(WORKSPACE_GRAPH)
+        self.set_status(f"Открыто файлов в Graph: {len(items)}")
+
+    def _apply_current_graph_to_queue(self) -> None:
+        if self._graph_batch_export_in_progress or self._is_running:
+            return
+        if not self._queue_items:
+            self.show_error("Применить граф к очереди", "Очередь пуста.")
+            return
+        graph_assets = list(self.graph_workspace.assets())
+        if not graph_assets:
+            self.show_error(
+                "Применить граф к очереди",
+                "Сначала откройте набор или файлы в Graph, чтобы задать graph template.",
+            )
+            return
+        if not self.graph_workspace.project.graph.nodes:
+            self.show_error("Применить граф к очереди", "Текущий граф пуст.")
+            return
+
+        request = self.build_request()
+        try:
+            validate_request(request)
+        except ValidationError as exc:
+            self.show_error("Применить граф к очереди", str(exc))
+            return
+
+        template_map_types = {
+            item.effective_map_type
+            for item in graph_assets
+            if item.effective_map_type is not TextureMapType.UNKNOWN
+        }
+        if not template_map_types:
+            self.show_error(
+                "Применить граф к очереди",
+                "В graph-assets не удалось определить типы карт. Откройте корректный набор.",
+            )
+            return
+
+        grouped_items = self._group_queue_items_for_batch_graph(template_map_types)
+        if not grouped_items:
+            self.show_error(
+                "Применить граф к очереди",
+                "В очереди нет подходящих наборов для текущего graph template.",
+            )
+            return
+
+        self.clear_log()
+        self.append_log("---- Применение графа к очереди ----")
+        self.set_status("Применение graph template к очереди...")
+        self.set_running(True)
+        self.reset_queue_statuses_for_run()
+        self._graph_batch_export_in_progress = True
+        self.log_dock.show()
+
+        executor = NodeGraphExecutor()
+        total_outputs = 0
+        succeeded = 0
+        skipped = 0
+        failed = 0
+
+        try:
+            for group_items in grouped_items.values():
+                mapping = {
+                    item.effective_map_type: item.path
+                    for item in group_items
+                    if item.effective_map_type is not TextureMapType.UNKNOWN
+                }
+                output_prefix = self._graph_export_prefix_for_group(group_items)
+                export_root = self._graph_export_root_for_group(group_items, request.output_root)
+                project = self.graph_workspace.clone_project_with_texture_mapping(
+                    mapping,
+                    output_prefix=output_prefix,
+                )
+                self.append_log(f"-- Набор: {output_prefix} ({len(group_items)} файлов)")
+                summary = executor.export_enabled_outputs(
+                    project,
+                    export_root,
+                    request.options,
+                    logger=self.append_log,
+                )
+                total_outputs += summary.total
+                succeeded += summary.succeeded
+                skipped += summary.skipped
+                failed += summary.failed
+
+                if summary.failed:
+                    group_status = QueueStatus.ERROR
+                elif summary.skipped and not summary.succeeded:
+                    group_status = QueueStatus.SKIPPED
+                else:
+                    group_status = QueueStatus.DONE
+                group_message = summary.as_text()
+                for item in group_items:
+                    item.status = group_status
+                    item.message = group_message
+
+                self._render_queue()
+                self._sync_workspace_selection()
+                self.repaint()
+        finally:
+            self._graph_batch_export_in_progress = False
+            self.set_running(False)
+
+        summary_text = (
+            f"Graph batch export: наборов={len(grouped_items)}, "
+            f"outputs={total_outputs}, успешно={succeeded}, "
+            f"пропущено={skipped}, ошибок={failed}"
+        )
+        self.append_log(summary_text)
+        self.set_status(summary_text)
+        if failed:
+            self.show_error("Применить граф к очереди", summary_text)
+        else:
+            self.show_info("Применить граф к очереди", summary_text)
+
+    def _group_queue_items_for_batch_graph(
+        self,
+        template_map_types: set[TextureMapType],
+    ) -> OrderedDict[str, list[QueueItem]]:
+        groups: OrderedDict[str, list[QueueItem]] = OrderedDict()
+        for item in self._queue_items:
+            groups.setdefault(self._queue_group_key(item), []).append(item)
+
+        usable: OrderedDict[str, list[QueueItem]] = OrderedDict()
+        for group_key, items in groups.items():
+            map_index: dict[TextureMapType, QueueItem] = {}
+            for item in items:
+                map_type = item.effective_map_type
+                if map_type is TextureMapType.UNKNOWN:
+                    continue
+                map_index.setdefault(map_type, item)
+            if not template_map_types.issubset(map_index.keys()):
+                continue
+            usable[group_key] = [
+                map_index[map_type]
+                for map_type in sorted(template_map_types, key=lambda value: value.value)
+            ]
+        return usable
+
+    def _graph_export_root_for_group(self, items: list[QueueItem], output_root: Path | None) -> Path:
+        base_root = output_root or (Path.cwd() / "graph_batch_exports")
+        seed = items[0]
+        root = seed.root
+        parent = seed.path.parent
+        if root is not None:
+            try:
+                relative = parent.relative_to(root)
+            except ValueError:
+                relative = Path()
+            return base_root / relative
+        return base_root
+
+    def _graph_export_prefix_for_group(self, items: list[QueueItem]) -> str:
+        suffixes_by_map_type: dict[TextureMapType, tuple[str, ...]] = {
+            TextureMapType.BASECOLOR: ("_basecolor", "_albedo", "_diffuse", "_diff", "_dif", "_color", "_col"),
+            TextureMapType.NORMAL: ("_normal", "_normalmap", "_nrm", "_nml", "_nor"),
+            TextureMapType.ROUGHNESS: ("_roughness", "_rough", "_rgh"),
+            TextureMapType.SMOOTHNESS: ("_smoothness", "_smooth", "_gloss", "_gls"),
+            TextureMapType.METALLIC: ("_metallic", "_metalness", "_metal", "_met", "_mtl"),
+            TextureMapType.AO: ("_ambientocclusion", "_ambient_occlusion", "_occlusion", "_occ", "_ao"),
+            TextureMapType.OPACITY: ("_opacity", "_alpha", "_mask", "_opc"),
+            TextureMapType.EMISSIVE: ("_emissive", "_emission", "_emit", "_emi", "_ems"),
+            TextureMapType.HEIGHT: ("_height", "_displacement", "_disp", "_bump", "_hgt"),
+        }
+        base_candidates: list[str] = []
+        for item in items:
+            stem = item.path.stem
+            lowered = stem.lower()
+            for suffix in suffixes_by_map_type.get(item.effective_map_type, ()):
+                if lowered.endswith(suffix):
+                    stem = stem[: -len(suffix)]
+                    break
+            stem = stem.strip("_- ")
+            if stem:
+                base_candidates.append(stem)
+        if base_candidates:
+            return min(base_candidates, key=len)
+        return items[0].path.parent.name or items[0].path.stem
 
     def _run_graph_auto_export(self) -> None:
         if not self._graph_auto_export_enabled or not self._graph_auto_export_scheduled:
@@ -1610,22 +1901,8 @@ class MainWindow(QMainWindow):
             self.graph_watch_status_label.setText(text[:64])
 
     def _selected_queue_item(self) -> QueueItem | None:
-        selection_model = self.queue_panel.table.selectionModel()
-        if selection_model is None:
-            return None
-
-        selected_rows = selection_model.selectedRows()
-        if not selected_rows:
-            return None
-
-        for selected_row in selected_rows:
-            row = selected_row.row()
-            if row >= len(self._queue_row_items):
-                continue
-            item = self._queue_row_items[row]
-            if item is not None:
-                return item
-        return None
+        items = self._selected_queue_items()
+        return items[0] if items else None
 
     def _remove_queue_items_by_keys(self, keys: set[str]) -> int:
         if not keys:

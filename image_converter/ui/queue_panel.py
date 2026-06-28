@@ -52,6 +52,9 @@ class QueuePanel(QWidget):
     paths_dropped = pyqtSignal(list)
     remove_requested = pyqtSignal()
     clear_requested = pyqtSignal()
+    open_selected_set_in_graph_requested = pyqtSignal()
+    open_selected_files_in_graph_requested = pyqtSignal()
+    apply_graph_to_queue_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -101,6 +104,31 @@ class QueuePanel(QWidget):
         controls_row.addStretch(1)
         layout.addLayout(controls_row)
 
+        graph_actions_row = QHBoxLayout()
+        graph_actions_row.setSpacing(6)
+        self.open_set_in_graph_button = QPushButton("Открыть набор в Graph")
+        self.open_set_in_graph_button.setToolTip(
+            "Открыть в Graph Workbench весь набор текстур из выбранной папки."
+        )
+        self.open_set_in_graph_button.clicked.connect(self.open_selected_set_in_graph_requested.emit)
+        graph_actions_row.addWidget(self.open_set_in_graph_button)
+
+        self.open_files_in_graph_button = QPushButton("Открыть файлы в Graph")
+        self.open_files_in_graph_button.setToolTip(
+            "Открыть в Graph Workbench только выбранные файлы из очереди."
+        )
+        self.open_files_in_graph_button.clicked.connect(self.open_selected_files_in_graph_requested.emit)
+        graph_actions_row.addWidget(self.open_files_in_graph_button)
+
+        self.apply_graph_to_queue_button = QPushButton("Применить граф к очереди")
+        self.apply_graph_to_queue_button.setObjectName("PrimaryButton")
+        self.apply_graph_to_queue_button.setToolTip(
+            "Применить текущий graph template к каждому набору текстур в очереди."
+        )
+        self.apply_graph_to_queue_button.clicked.connect(self.apply_graph_to_queue_requested.emit)
+        graph_actions_row.addWidget(self.apply_graph_to_queue_button)
+        layout.addLayout(graph_actions_row)
+
         self.drop_hint = QLabel("Перетащите сюда файлы или папки с текстурами.")
         self.drop_hint.setObjectName("DropHint")
         self.drop_hint.setWordWrap(True)
@@ -149,6 +177,9 @@ class QueuePanel(QWidget):
             self.add_folder_button,
             self.remove_selected_button,
             self.clear_button,
+            self.open_set_in_graph_button,
+            self.open_files_in_graph_button,
+            self.apply_graph_to_queue_button,
             self.table,
         )
 

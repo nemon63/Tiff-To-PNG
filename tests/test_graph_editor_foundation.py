@@ -12,6 +12,7 @@ from unittest import mock
 
 from PIL import Image, ImageFilter
 from PyQt6.QtCore import QEventLoop, QTimer, Qt
+from PyQt6.QtCore import QItemSelectionModel
 from PyQt6.QtWidgets import QApplication, QLabel
 
 from image_converter.domain.models import (
@@ -923,12 +924,90 @@ class GraphEditorFoundationTests(unittest.TestCase):
                 QueueItem(BatchSource(Path("normal.png")), AssetKind.IMAGE, metadata),
             ]
             window.add_queue_items(items)
+            window.graph_workspace.set_assets(items)
+            window._render_asset_browser()
 
             window.asset_table.selectRow(0)
             window._remove_selected_assets()
 
-            self.assertEqual(1, len(window._queue_items))
-            self.assertEqual("normal.png", window._queue_items[0].path.name)
+            self.assertEqual(2, len(window._queue_items))
+            self.assertEqual(1, len(window.graph_workspace.assets()))
+            self.assertEqual("normal.png", window.graph_workspace.assets()[0].path.name)
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_open_selected_set_in_graph_uses_only_current_queue_group(self) -> None:
+        window = MainWindow()
+        try:
+            metadata = AssetMetadata("PNG", 4, 4, "RGBA", True, 64, TextureMapType.BASECOLOR)
+            normal_metadata = AssetMetadata("PNG", 4, 4, "RGB", False, 64, TextureMapType.NORMAL)
+            items = [
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetA/a_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR),
+                    AssetKind.IMAGE,
+                    metadata,
+                ),
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetA/a_normal.png"), Path("D:/textures"), TextureMapType.NORMAL),
+                    AssetKind.IMAGE,
+                    normal_metadata,
+                ),
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetB/b_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR),
+                    AssetKind.IMAGE,
+                    metadata,
+                ),
+            ]
+            window.add_queue_items(items)
+
+            window.queue_panel.table.selectRow(1)
+            window._open_selected_set_in_graph()
+
+            graph_assets = window.graph_workspace.assets()
+            self.assertEqual(2, len(graph_assets))
+            self.assertEqual({"a_basecolor.png", "a_normal.png"}, {item.path.name for item in graph_assets})
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_open_selected_files_in_graph_uses_only_selected_queue_rows(self) -> None:
+        window = MainWindow()
+        try:
+            metadata = AssetMetadata("PNG", 4, 4, "RGBA", True, 64, TextureMapType.BASECOLOR)
+            items = [
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetA/a_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR),
+                    AssetKind.IMAGE,
+                    metadata,
+                ),
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetB/b_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR),
+                    AssetKind.IMAGE,
+                    metadata,
+                ),
+            ]
+            window.add_queue_items(items)
+
+            selection_model = window.queue_panel.table.selectionModel()
+            first_index = window.queue_panel.table.model().index(1, 0)
+            second_index = window.queue_panel.table.model().index(3, 0)
+            selection_model.select(
+                first_index,
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+            )
+            selection_model.select(
+                second_index,
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+            )
+
+            window._open_selected_files_in_graph()
+
+            graph_assets = window.graph_workspace.assets()
+            self.assertEqual(2, len(graph_assets))
+            self.assertEqual({"a_basecolor.png", "b_basecolor.png"}, {item.path.name for item in graph_assets})
         finally:
             window.setParent(None)
             window.deleteLater()
