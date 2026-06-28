@@ -46,6 +46,7 @@ from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.node_graph_executor import NodeGraphExecutor
 from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
 from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
+from image_converter.services.presets import SYSTEM_PRESETS
 from image_converter.services.settings import AppSettingsRepository
 from image_converter.ui.graph_commands import AddNodesCommand, ReplaceInputConnectionCommand
 from image_converter.ui.main_window import MainWindow
@@ -481,6 +482,22 @@ class ChannelPackingPlanTests(unittest.TestCase):
             self.assertEqual(0, summary.total)
             self.assertEqual(1, summary.packed_created)
             self.assertIn("packed only", summary.as_text())
+
+    def test_system_presets_include_clear_packing_workflows(self) -> None:
+        preset_names = {preset.name: preset for preset in SYSTEM_PRESETS}
+
+        self.assertIn("Unreal ORM Pack", preset_names)
+        self.assertIn("Unity URP Pack", preset_names)
+        self.assertIn("Unity HDRP Mask Map", preset_names)
+        self.assertIn("Fast Preview 1K", preset_names)
+        self.assertEqual(
+            ChannelPackingMode.PACK_ONLY,
+            preset_names["Unreal ORM Pack"].options.packing.mode,
+        )
+        self.assertEqual(
+            ChannelPackLayout.ORM,
+            preset_names["Unreal ORM Pack"].options.packing.layout,
+        )
 
 
 class GraphEditorFoundationTests(unittest.TestCase):

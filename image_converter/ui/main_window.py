@@ -1094,14 +1094,14 @@ class MainWindow(QMainWindow):
 
         self.settings_panel.apply_conversion_options(preset.options)
         self.settings_panel.set_selected_preset_id(preset.preset_id)
-        self.set_status(f"Применен preset: {preset.name}")
+        self.set_status(f"Применен workflow preset: {preset.name}")
 
     def _save_current_preset(self) -> None:
         if self._preset_repository is None:
             return
 
         selected_preset = self._presets_by_id.get(self.settings_panel.selected_preset_id() or "")
-        suggested_name = "My Preset"
+        suggested_name = "My Workflow"
         if selected_preset is not None:
             suggested_name = (
                 f"{selected_preset.name} Copy" if selected_preset.is_system else selected_preset.name
@@ -1109,7 +1109,7 @@ class MainWindow(QMainWindow):
 
         name, accepted = QInputDialog.getText(
             self,
-            "Сохранить preset",
+            "Сохранить workflow preset",
             "Название preset:",
             text=suggested_name,
         )
@@ -1133,7 +1133,7 @@ class MainWindow(QMainWindow):
             button = QMessageBox.question(
                 self,
                 "Перезаписать preset",
-                f"Preset '{existing_user_preset.name}' уже существует. Перезаписать его?",
+                f"Workflow preset '{existing_user_preset.name}' уже существует. Перезаписать его?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1151,7 +1151,7 @@ class MainWindow(QMainWindow):
 
         self._reload_presets()
         self.settings_panel.set_selected_preset_id(preset.preset_id)
-        self.set_status(f"Сохранен preset: {preset.name}")
+        self.set_status(f"Сохранен workflow preset: {preset.name}")
 
     def _delete_preset(self, preset_id: str) -> None:
         if self._preset_repository is None:
@@ -1164,7 +1164,7 @@ class MainWindow(QMainWindow):
         button = QMessageBox.question(
             self,
             "Удалить preset",
-            f"Удалить пользовательский preset '{preset.name}'?",
+            f"Удалить пользовательский workflow preset '{preset.name}'?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1181,7 +1181,7 @@ class MainWindow(QMainWindow):
             return
 
         self._reload_presets()
-        self.set_status(f"Удален preset: {preset.name}")
+        self.set_status(f"Удален workflow preset: {preset.name}")
 
     def _sync_status_bar_with_selection(self) -> None:
         item = self._selected_queue_item()

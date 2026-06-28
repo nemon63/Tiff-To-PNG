@@ -124,7 +124,7 @@ class SettingsPanel(QWidget):
         return tab
 
     def _build_presets_group(self) -> QGroupBox:
-        group = QGroupBox("Workflow Preset")
+        group = QGroupBox("Workflow Presets")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
@@ -608,11 +608,11 @@ class SettingsPanel(QWidget):
         self._presets_by_id = {preset.preset_id: preset for preset in presets}
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
-        self.preset_combo.addItem("Текущие настройки", CURRENT_PRESET_DATA)
+        self.preset_combo.addItem("Текущие ручные настройки", CURRENT_PRESET_DATA)
 
         for preset in presets:
-            source_label = "Системный" if preset.is_system else "Пользовательский"
-            self.preset_combo.addItem(f"{source_label} · {preset.name}", preset.preset_id)
+            source_label = "Built-in" if preset.is_system else "Custom"
+            self.preset_combo.addItem(f"{preset.name} [{source_label}]", preset.preset_id)
 
         self.preset_combo.blockSignals(False)
         self.set_selected_preset_id(None)
@@ -662,7 +662,7 @@ class SettingsPanel(QWidget):
         source_label = "Системный" if preset.is_system else "Пользовательский"
         description = preset.description or "Без описания."
         self.preset_summary_label.setText(
-            f"{source_label} preset для готового сценария экспорта. {description}"
+            f"{source_label} preset. {description}"
         )
 
     def _notify_options_changed(self, *_args: object) -> None:

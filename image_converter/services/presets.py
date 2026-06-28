@@ -22,9 +22,9 @@ from image_converter.services.options_codec import (
 SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
     ConversionPreset(
         preset_id="system:web",
-        name="Web",
+        name="Web Preview 2K",
         scope=PresetScope.SYSTEM,
-        description="Легкий web-экспорт: PNG-8, dithering и ограничение до 2048 px.",
+        description="Легкий PNG-8 экспорт для веба, чатов и таск-трекеров. Ограничивает размер до 2048 px и включает dithering.",
         options=ConversionOptions(
             optimize=True,
             compress_level=9,
@@ -37,9 +37,9 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
     ),
     ConversionPreset(
         preset_id="system:game",
-        name="Game",
+        name="Game Texture 4K",
         scope=PresetScope.SYSTEM,
-        description="Полноцветный игровой экспорт с безопасными настройками и лимитом 4096 px.",
+        description="Базовый игровой экспорт без packing. Полный цвет, безопасное сжатие и лимит до 4096 px.",
         options=ConversionOptions(
             optimize=True,
             compress_level=6,
@@ -49,10 +49,29 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
         ),
     ),
     ConversionPreset(
-        preset_id="system:unity-urp",
-        name="Unity URP",
+        preset_id="system:unreal-orm",
+        name="Unreal ORM Pack",
         scope=PresetScope.SYSTEM,
-        description="Собирает metallic/smoothness карту для Unity URP. Альфа берет Smoothness или считает 1-Roughness.",
+        description="Собирает packed texture для Unreal: R=AO, G=Roughness, B=Metallic. Работает в режиме Pack Only.",
+        options=ConversionOptions(
+            optimize=True,
+            compress_level=6,
+            resize_mode=ResizeMode.MAX_SIDE,
+            max_side=4096,
+            png8=False,
+            naming=NamingRules(normalize_map_suffix=True),
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.ORM,
+                mode=ChannelPackingMode.PACK_ONLY,
+            ),
+        ),
+    ),
+    ConversionPreset(
+        preset_id="system:unity-urp",
+        name="Unity URP Pack",
+        scope=PresetScope.SYSTEM,
+        description="Собирает Metallic/Smoothness карту для Unity URP: R=Metallic, A=Smoothness или 1-Roughness. Режим Pack Only.",
         options=ConversionOptions(
             optimize=True,
             compress_level=6,
@@ -69,9 +88,9 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
     ),
     ConversionPreset(
         preset_id="system:unity-hdrp",
-        name="Unity HDRP",
+        name="Unity HDRP Mask Map",
         scope=PresetScope.SYSTEM,
-        description="Собирает HDRP Mask Map. B-канал заполняется белым как detail mask по умолчанию, альфа берет Smoothness или 1-Roughness.",
+        description="Собирает HDRP Mask Map: R=Metallic, G=AO, B=Detail Mask(1), A=Smoothness или 1-Roughness. Режим Pack Only.",
         options=ConversionOptions(
             optimize=True,
             compress_level=6,
@@ -88,9 +107,9 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
     ),
     ConversionPreset(
         preset_id="system:ui",
-        name="UI",
+        name="UI RGBA Clean",
         scope=PresetScope.SYSTEM,
-        description="RGBA-режим для интерфейсных текстур с высоким сжатием без потери альфы.",
+        description="Для иконок и UI-элементов с альфой. Сохраняет RGBA без PNG-8 и с высоким уровнем сжатия.",
         options=ConversionOptions(
             force_rgba=True,
             optimize=True,
@@ -100,9 +119,9 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
     ),
     ConversionPreset(
         preset_id="system:preview",
-        name="Preview",
+        name="Fast Preview 1K",
         scope=PresetScope.SYSTEM,
-        description="Быстрый предпросмотр: мягкое сжатие и даунскейл до 1024 px.",
+        description="Быстрый черновой экспорт для проверки и согласования. Мягкое сжатие и даунскейл до 1024 px.",
         options=ConversionOptions(
             optimize=False,
             compress_level=4,
@@ -113,9 +132,9 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
     ),
     ConversionPreset(
         preset_id="system:lossless",
-        name="Lossless",
+        name="Lossless Archive",
         scope=PresetScope.SYSTEM,
-        description="Максимально бережный экспорт без PNG-8 и без изменения разрешения.",
+        description="Максимально бережный PNG без PNG-8 и без ресайза. Подходит для мастер-копий и промежуточного архива.",
         options=ConversionOptions(
             optimize=True,
             compress_level=9,
@@ -151,7 +170,7 @@ class PresetRepository:
                 name=clean_name,
                 options=options,
                 scope=PresetScope.USER,
-                description="Пользовательский preset",
+                description="Пользовательский сценарий",
             )
             user_presets.append(preset)
         else:
@@ -160,7 +179,7 @@ class PresetRepository:
                 name=clean_name,
                 options=options,
                 scope=PresetScope.USER,
-                description=existing.description or "Пользовательский preset",
+                description=existing.description or "Пользовательский сценарий",
             )
             user_presets = [
                 preset if candidate.preset_id == existing.preset_id else candidate
@@ -206,7 +225,7 @@ class PresetRepository:
                     name=name,
                     options=deserialize_conversion_options(options_data),
                     scope=PresetScope.USER,
-                    description=str(raw_preset.get("description", "Пользовательский preset")),
+                    description=str(raw_preset.get("description", "Пользовательский сценарий")),
                 )
             )
 
