@@ -490,6 +490,10 @@ class ChannelPackingPlanTests(unittest.TestCase):
         self.assertIn("Unity URP Pack", preset_names)
         self.assertIn("Unity HDRP Mask Map", preset_names)
         self.assertIn("Fast Preview 1K", preset_names)
+        self.assertIn("Portfolio PNG 2K", preset_names)
+        self.assertIn("Mask Authoring", preset_names)
+        self.assertIn("Mobile Texture 1K", preset_names)
+        self.assertIn("Substance Export Cleanup", preset_names)
         self.assertEqual(
             ChannelPackingMode.PACK_ONLY,
             preset_names["Unreal ORM Pack"].options.packing.mode,
@@ -1483,6 +1487,30 @@ class GraphEditorFoundationTests(unittest.TestCase):
                 "соберет только итоговый packed texture",
                 window.settings_panel.packing_mode_label.text(),
             )
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_selecting_ui_preset_applies_options_immediately(self) -> None:
+        window = MainWindow()
+        try:
+            presets = list(SYSTEM_PRESETS)
+            window._presets_by_id = {preset.preset_id: preset for preset in presets}
+            window.settings_panel.set_available_presets(presets)
+
+            ui_preset = next(preset for preset in presets if preset.name == "UI RGBA Clean")
+            for index in range(window.settings_panel.preset_combo.count()):
+                if window.settings_panel.preset_combo.itemData(index) == ui_preset.preset_id:
+                    window.settings_panel.preset_combo.setCurrentIndex(index)
+                    break
+            self.app.processEvents()
+
+            options = window.settings_panel.build_conversion_options()
+            self.assertTrue(options.force_rgba)
+            self.assertFalse(options.packing.enabled)
+            self.assertEqual("UI RGBA Clean", window.settings_panel.preset_combo.currentText().split(" [")[0])
+            self.assertIn("иконок и UI-элементов", window.settings_panel.preset_summary_label.text())
         finally:
             window.close()
             window.deleteLater()

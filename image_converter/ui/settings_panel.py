@@ -129,15 +129,11 @@ class SettingsPanel(QWidget):
         layout.setSpacing(10)
 
         self.preset_combo = QComboBox()
-        self.preset_combo.currentIndexChanged.connect(self._refresh_preset_ui)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_selection_changed)
         layout.addWidget(self.preset_combo)
 
         actions_row = QHBoxLayout()
         actions_row.setSpacing(8)
-
-        self.apply_preset_button = QPushButton("Применить")
-        self.apply_preset_button.clicked.connect(self._emit_apply_selected_preset)
-        actions_row.addWidget(self.apply_preset_button, 1)
 
         self.save_preset_button = QPushButton("Сохранить как...")
         self.save_preset_button.setObjectName("GhostButton")
@@ -158,7 +154,6 @@ class SettingsPanel(QWidget):
 
         self._register_interactive(
             self.preset_combo,
-            self.apply_preset_button,
             self.save_preset_button,
             self.delete_preset_button,
         )
@@ -646,11 +641,16 @@ class SettingsPanel(QWidget):
         if preset_id is not None:
             self.preset_delete_requested.emit(preset_id)
 
+    def _on_preset_selection_changed(self, *_args: object) -> None:
+        self._refresh_preset_ui()
+        preset_id = self.selected_preset_id()
+        if preset_id is not None and not self._suppress_option_signal:
+            self.preset_apply_requested.emit(preset_id)
+
     def _refresh_preset_ui(self, *_args: object) -> None:
         preset_id = self.selected_preset_id()
         preset = self._presets_by_id.get(preset_id or "")
 
-        self.apply_preset_button.setEnabled(preset is not None)
         self.delete_preset_button.setEnabled(preset is not None and not preset.is_system)
 
         if preset is None:
