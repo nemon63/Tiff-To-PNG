@@ -1511,6 +1511,32 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertFalse(options.packing.enabled)
             self.assertEqual("UI RGBA Clean", window.settings_panel.preset_combo.currentText().split(" [")[0])
             self.assertIn("иконок и UI-элементов", window.settings_panel.preset_summary_label.text())
+            self.assertIn("Packed Texture", window.settings_panel.preset_packing_summary_label.text())
+            self.assertIn("Сборка packed texture выключена", window.settings_panel.preset_packing_summary_label.text())
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_selecting_unreal_pack_preset_shows_packing_summary_in_source_tab(self) -> None:
+        window = MainWindow()
+        try:
+            presets = list(SYSTEM_PRESETS)
+            window._presets_by_id = {preset.preset_id: preset for preset in presets}
+            window.settings_panel.set_available_presets(presets)
+
+            unreal_preset = next(preset for preset in presets if preset.name == "Unreal ORM Pack")
+            for index in range(window.settings_panel.preset_combo.count()):
+                if window.settings_panel.preset_combo.itemData(index) == unreal_preset.preset_id:
+                    window.settings_panel.preset_combo.setCurrentIndex(index)
+                    break
+            self.app.processEvents()
+
+            summary_text = window.settings_panel.preset_packing_summary_label.text()
+            self.assertIn("Packed Texture", summary_text)
+            self.assertIn("Mode: Только Packed", summary_text)
+            self.assertIn("Target Pack: ORM", summary_text)
+            self.assertIn("ORM: R=AO, G=Roughness, B=Metallic", summary_text)
         finally:
             window.close()
             window.deleteLater()

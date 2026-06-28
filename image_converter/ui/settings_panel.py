@@ -152,6 +152,11 @@ class SettingsPanel(QWidget):
         self.preset_summary_label.setWordWrap(True)
         layout.addWidget(self.preset_summary_label)
 
+        self.preset_packing_summary_label = QLabel()
+        self.preset_packing_summary_label.setObjectName("SummaryText")
+        self.preset_packing_summary_label.setWordWrap(True)
+        layout.addWidget(self.preset_packing_summary_label)
+
         self._register_interactive(
             self.preset_combo,
             self.save_preset_button,
@@ -657,12 +662,18 @@ class SettingsPanel(QWidget):
             self.preset_summary_label.setText(
                 "Текущие ручные настройки. Preset не применен."
             )
+            self.preset_packing_summary_label.setText(
+                self._preset_packing_summary(self.build_conversion_options())
+            )
             return
 
         source_label = "Системный" if preset.is_system else "Пользовательский"
         description = preset.description or "Без описания."
         self.preset_summary_label.setText(
             f"{source_label} preset. {description}"
+        )
+        self.preset_packing_summary_label.setText(
+            self._preset_packing_summary(preset.options)
         )
 
     def _notify_options_changed(self, *_args: object) -> None:
@@ -718,3 +729,23 @@ class SettingsPanel(QWidget):
         if packing_options.mode is ChannelPackingMode.PACK_ONLY:
             return "Pack Only: приложение соберет только итоговый packed texture и не будет сохранять обычные PNG по каждому исходнику."
         return "Convert + Pack: сначала сохраняются обычные PNG по каждому исходнику, затем поверх них собирается packed texture."
+
+    def _preset_packing_summary(self, options: ConversionOptions) -> str:
+        packing = options.packing
+        if not packing.enabled:
+            return (
+                "Packed Texture\n"
+                "Сборка packed texture выключена.\n"
+                "Будут сохранены обычные PNG по каждому исходнику."
+            )
+
+        mode_label = packing.mode.label
+        mapping_text = channel_pack_mapping_text(packing.layout)
+        mode_description = self._packing_mode_description(packing)
+        return (
+            "Packed Texture\n"
+            f"Mode: {mode_label}\n"
+            f"Target Pack: {packing.layout.label}\n"
+            f"{mapping_text}\n"
+            f"{mode_description}"
+        )
