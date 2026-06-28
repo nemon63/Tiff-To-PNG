@@ -1615,6 +1615,26 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertTrue(received)
         self.assertEqual(constant.title, received[-1][1])
 
+    def test_selecting_texture_node_without_display_flag_does_not_request_preview(self) -> None:
+        texture = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            properties={"path": "D:/textures/test_basecolor.png"},
+        )
+        with mock.patch.object(self.workspace, "_request_preview_node") as request_preview:
+            self.workspace._push_graph_command(
+                AddNodesCommand(
+                    self.workspace.project.graph,
+                    self.workspace._on_graph_command_changed,
+                    [texture],
+                ),
+                select_node_ids=[texture.node_id],
+            )
+            request_preview.reset_mock()
+
+            self.workspace._on_node_selected(texture)
+
+        request_preview.assert_not_called()
+
     def test_draft_preview_uses_reduced_max_side(self) -> None:
         self.workspace._preview_cache.max_side = 2048
         self.assertEqual(DRAFT_PREVIEW_MAX_SIDE, self.workspace._preview_max_side_for_mode(PREVIEW_MODE_DRAFT))
