@@ -22,6 +22,7 @@ from image_converter.services.image_loading import copy_first_frame_preserving_a
 from image_converter.services.packing import (
     build_channel_pack_jobs,
     execute_channel_pack_job,
+    packed_source_map_types,
     summarize_channel_pack_jobs,
 )
 from image_converter.services.pipeline import ConversionPipeline
@@ -75,13 +76,10 @@ class BatchConversionService:
         write_log = logger or (lambda _message: None)
         summary = BatchSummary(packed_only_mode=request.options.packing.mode is ChannelPackingMode.PACK_ONLY)
         source_specs = list(self.iter_request_sources(request))
-        should_convert_sources = not (
-            request.options.packing.enabled
-            and request.options.packing.mode is ChannelPackingMode.PACK_ONLY
-        )
+        conversion_sources = self._conversion_sources_for_request(source_specs, request.options)
 
-        if should_convert_sources:
-            for source_spec in source_specs:
+        if conversion_sources:
+            for source_spec in conversion_sources:
                 source = source_spec.path
                 destination = self.build_destination_for_source(
                     source_spec,
@@ -111,7 +109,10 @@ class BatchConversionService:
                         on_item_complete(failed_result)
         elif source_specs:
             write_log("---- Source Conversion ----")
-            write_log("Skipped regular PNG export. Pack Only mode is enabled.")
+            if request.options.packing.enabled and request.options.packing.mode is ChannelPackingMode.PACK_ONLY:
+                write_log("Skipped regular PNG export. Pack Only mode is enabled.")
+            else:
+                write_log("Skipped regular PNG export. Nothing outside the packed channels needs export.")
 
         if request.options.packing.enabled:
             pack_jobs = build_channel_pack_jobs(source_specs, request.output_root, request.options)
@@ -146,6 +147,27 @@ class BatchConversionService:
             )
 
         return summary
+
+    @staticmethod
+    def _conversion_sources_for_request(
+        source_specs: list[BatchSource],
+        options: ConversionOptions,
+    ) -> list[BatchSource]:
+        if not options.packing.enabled:
+            return list(source_specs)
+
+        if options.packing.mode is ChannelPackingMode.PACK_ONLY:
+            return []
+
+        if options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
+            packed_map_types = packed_source_map_types(options.packing.layout)
+            return [
+                source_spec
+                for source_spec in source_specs
+                if source_spec.map_type not in packed_map_types
+            ]
+
+        return list(source_specs)
 
     def iter_request_sources(self, request: BatchRequest) -> Iterator[BatchSource]:
         if request.sources:

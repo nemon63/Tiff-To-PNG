@@ -168,6 +168,14 @@ def channel_pack_mapping_text(layout: ChannelPackLayout) -> str:
     return f"{layout.label}: " + ", ".join(parts)
 
 
+def packed_source_map_types(layout: ChannelPackLayout) -> frozenset[TextureMapType]:
+    return frozenset(
+        candidate.map_type
+        for rule in PACK_LAYOUTS[layout]
+        for candidate in rule.candidates
+    )
+
+
 def build_channel_pack_jobs(
     sources: tuple[BatchSource, ...] | list[BatchSource],
     output_root: Path | None,

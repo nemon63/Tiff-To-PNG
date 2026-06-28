@@ -495,7 +495,7 @@ class ChannelPackingPlanTests(unittest.TestCase):
         self.assertIn("Mobile Texture 1K", preset_names)
         self.assertIn("Substance Export Cleanup", preset_names)
         self.assertEqual(
-            ChannelPackingMode.PACK_ONLY,
+            ChannelPackingMode.PACK_WITH_REMAINDER,
             preset_names["Unreal ORM Pack"].options.packing.mode,
         )
         self.assertEqual(
@@ -506,6 +506,45 @@ class ChannelPackingPlanTests(unittest.TestCase):
             "длинная сторона больше 4096 px",
             preset_names["Game Texture 4K"].description,
         )
+
+    def test_pack_with_remainder_mode_skips_duplicate_channel_exports(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src"
+            root.mkdir()
+            output_root = Path(tmp) / "out"
+            for name in ("key_dif.png", "key_nml.png", "key_ao.png", "key_rgh.png", "key_met.png"):
+                Image.new("RGB", (4, 4), (128, 128, 128)).save(root / name)
+
+            request = BatchRequest(
+                input_path=None,
+                output_root=output_root,
+                sources=(
+                    BatchSource(root / "key_dif.png", root, TextureMapType.BASECOLOR),
+                    BatchSource(root / "key_nml.png", root, TextureMapType.NORMAL),
+                    BatchSource(root / "key_ao.png", root, TextureMapType.AO),
+                    BatchSource(root / "key_rgh.png", root, TextureMapType.ROUGHNESS),
+                    BatchSource(root / "key_met.png", root, TextureMapType.METALLIC),
+                ),
+                options=ConversionOptions(
+                    packing=ChannelPackingOptions(
+                        enabled=True,
+                        layout=ChannelPackLayout.ORM,
+                        mode=ChannelPackingMode.PACK_WITH_REMAINDER,
+                    ),
+                ),
+            )
+
+            summary = BatchConversionService().run(request)
+
+            self.assertTrue((output_root / "key_dif.png").exists())
+            self.assertTrue((output_root / "key_nml.png").exists())
+            self.assertTrue((output_root / "key_orm.png").exists())
+            self.assertFalse((output_root / "key_ao.png").exists())
+            self.assertFalse((output_root / "key_rgh.png").exists())
+            self.assertFalse((output_root / "key_met.png").exists())
+            self.assertEqual(2, summary.total)
+            self.assertEqual(2, summary.succeeded)
+            self.assertEqual(1, summary.packed_created)
 
 
 class GraphEditorFoundationTests(unittest.TestCase):
@@ -1564,7 +1603,7 @@ class GraphEditorFoundationTests(unittest.TestCase):
             summary_text = window.settings_panel.preset_packing_summary_label.text()
             preset_text = window.settings_panel.preset_summary_label.text()
             self.assertIn("Упаковка каналов", summary_text)
-            self.assertIn("Режим: Только Packed", summary_text)
+            self.assertIn("Режим: Packed + нужные карты", summary_text)
             self.assertIn("Схема: ORM", summary_text)
             self.assertIn("ORM: R=AO, G=Roughness, B=Metallic", summary_text)
             self.assertIn(

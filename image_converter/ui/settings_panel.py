@@ -684,6 +684,8 @@ class SettingsPanel(QWidget):
     def _packing_mode_description(self, packing_options: ChannelPackingOptions) -> str:
         if not packing_options.enabled:
             return "Режим упаковки каналов выключен."
+        if packing_options.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
+            return "Packed + нужные карты: приложение сохранит итоговую packed texture и отдельно выгрузит только те карты, которые не входят в packed-схему."
         if packing_options.mode is ChannelPackingMode.PACK_ONLY:
             return "Только Packed: приложение соберет только итоговый packed texture и не будет сохранять отдельные PNG по каждому исходнику."
         return "Сначала PNG, потом Packed: приложение сохранит отдельные PNG по каждому исходнику и затем соберет итоговую packed texture."

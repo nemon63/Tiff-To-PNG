@@ -907,6 +907,17 @@ class MainWindow(QMainWindow):
                     if item.output_path is not None
                     else "Файл будет создан только как часть packed texture."
                 )
+            elif (
+                options.packing.enabled
+                and options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER
+                and item.effective_map_type in packed_source_map_types(options.packing.layout)
+            ):
+                output_text = "В составе packed texture"
+                output_tooltip = (
+                    str(self._build_output_path(item.batch_source))
+                    if item.output_path is not None
+                    else "Файл будет включен в packed texture и отдельно не выгружается."
+                )
             else:
                 output_text = str(item.output_path) if item.output_path is not None else "-"
                 output_tooltip = output_text
@@ -1018,9 +1029,21 @@ class MainWindow(QMainWindow):
         options = self.settings_panel.build_conversion_options()
         output_root_text = self.settings_panel.output_edit.text().strip()
         output_root = Path(output_root_text) if output_root_text else None
-        if options.packing.enabled and options.packing.mode is ChannelPackingMode.PACK_ONLY:
+        if options.packing.enabled and options.packing.mode in {
+            ChannelPackingMode.PACK_ONLY,
+            ChannelPackingMode.PACK_WITH_REMAINDER,
+        }:
             pack_jobs = build_channel_pack_jobs([source], output_root, options)
-            if pack_jobs:
+            if (
+                pack_jobs
+                and options.packing.mode is ChannelPackingMode.PACK_ONLY
+            ):
+                return pack_jobs[0].output_path
+            if (
+                pack_jobs
+                and options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER
+                and source.map_type in packed_source_map_types(options.packing.layout)
+            ):
                 return pack_jobs[0].output_path
         return BatchConversionService.build_destination_for_source(
             source,
@@ -1075,6 +1098,12 @@ class MainWindow(QMainWindow):
         summary = summarize_channel_pack_jobs(jobs)
         if options.packing.mode is ChannelPackingMode.PACK_ONLY:
             summary = "Режим: только packed texture. Будет создан только итоговый packed texture.\n" + summary
+        elif options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
+            summary = (
+                "Режим: packed texture + остальные нужные карты. "
+                "Карты, вошедшие в packed texture, отдельно не выгружаются.\n"
+                + summary
+            )
         else:
             summary = "Режим: сначала обычные PNG, затем packed texture.\n" + summary
         self.settings_panel.set_packing_preflight_summary(summary)

@@ -52,7 +52,7 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
         preset_id="system:unreal-orm",
         name="Unreal ORM Pack",
         scope=PresetScope.SYSTEM,
-        description="Собирает packed texture для Unreal: R=AO, G=Roughness, B=Metallic. Работает в режиме Pack Only.",
+        description="Собирает итоговый набор для Unreal: BaseColor/Normal и packed ORM. AO, Roughness и Metallic отдельно не дублируются.",
         options=ConversionOptions(
             optimize=True,
             compress_level=6,
@@ -63,7 +63,7 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
             packing=ChannelPackingOptions(
                 enabled=True,
                 layout=ChannelPackLayout.ORM,
-                mode=ChannelPackingMode.PACK_ONLY,
+                mode=ChannelPackingMode.PACK_WITH_REMAINDER,
             ),
         ),
     ),
@@ -71,7 +71,7 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
         preset_id="system:unity-urp",
         name="Unity URP Pack",
         scope=PresetScope.SYSTEM,
-        description="Собирает Metallic/Smoothness карту для Unity URP: R=Metallic, A=Smoothness или 1-Roughness. Режим Pack Only.",
+        description="Собирает итоговый набор для Unity URP: BaseColor/Normal и MetallicSmoothness. Metallic, Smoothness и Roughness отдельно не дублируются.",
         options=ConversionOptions(
             optimize=True,
             compress_level=6,
@@ -82,7 +82,7 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
             packing=ChannelPackingOptions(
                 enabled=True,
                 layout=ChannelPackLayout.UNITY_URP,
-                mode=ChannelPackingMode.PACK_ONLY,
+                mode=ChannelPackingMode.PACK_WITH_REMAINDER,
             ),
         ),
     ),
@@ -90,7 +90,7 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
         preset_id="system:unity-hdrp",
         name="Unity HDRP Mask Map",
         scope=PresetScope.SYSTEM,
-        description="Собирает HDRP Mask Map: R=Metallic, G=AO, B=Detail Mask(1), A=Smoothness или 1-Roughness. Режим Pack Only.",
+        description="Собирает итоговый набор для Unity HDRP: BaseColor/Normal и Mask Map. Metallic, AO, Smoothness и Roughness отдельно не дублируются.",
         options=ConversionOptions(
             optimize=True,
             compress_level=6,
@@ -101,7 +101,7 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
             packing=ChannelPackingOptions(
                 enabled=True,
                 layout=ChannelPackLayout.UNITY_HDRP,
-                mode=ChannelPackingMode.PACK_ONLY,
+                mode=ChannelPackingMode.PACK_WITH_REMAINDER,
             ),
         ),
     ),

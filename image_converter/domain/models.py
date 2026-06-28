@@ -110,12 +110,14 @@ class ChannelPackLayout(str, Enum):
 
 class ChannelPackingMode(str, Enum):
     AFTER_CONVERSION = "after_conversion"
+    PACK_WITH_REMAINDER = "pack_with_remainder"
     PACK_ONLY = "pack_only"
 
     @property
     def label(self) -> str:
         mapping = {
             ChannelPackingMode.AFTER_CONVERSION: "Сначала PNG, потом Packed",
+            ChannelPackingMode.PACK_WITH_REMAINDER: "Packed + нужные карты",
             ChannelPackingMode.PACK_ONLY: "Только Packed",
         }
         return mapping[self]
