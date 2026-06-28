@@ -1635,6 +1635,32 @@ class GraphEditorFoundationTests(unittest.TestCase):
 
         request_preview.assert_not_called()
 
+    def test_selection_signal_is_deferred_while_node_move_starts(self) -> None:
+        texture = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            properties={"path": "D:/textures/test_basecolor.png"},
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [texture],
+            ),
+            select_node_ids=[texture.node_id],
+        )
+
+        selection_events: list[GraphNode | None] = []
+        self.workspace._scene.node_selection_changed.connect(selection_events.append)
+
+        self.workspace._scene.begin_node_move(texture.node_id)
+        self.workspace._scene._emit_selection()
+        self.assertEqual([], selection_events)
+
+        self.workspace._scene.finish_node_move()
+        self.assertEqual(1, len(selection_events))
+        self.assertIsNotNone(selection_events[0])
+        self.assertEqual(texture.node_id, selection_events[0].node_id)
+
     def test_draft_preview_uses_reduced_max_side(self) -> None:
         self.workspace._preview_cache.max_side = 2048
         self.assertEqual(DRAFT_PREVIEW_MAX_SIDE, self.workspace._preview_max_side_for_mode(PREVIEW_MODE_DRAFT))

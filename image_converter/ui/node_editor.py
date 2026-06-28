@@ -873,6 +873,8 @@ class GraphScene(QGraphicsScene):
         self.drag_start_scene_pos: QPointF | None = None
         self.drag_wire: QGraphicsPathItem | None = None
         self.move_start_positions: dict[str, tuple[float, float]] = {}
+        self._pending_selection_active = False
+        self._pending_selection_node_id: str | None = None
         self.selectionChanged.connect(self._emit_selection)
         self.setSceneRect(-3000, -3000, 6000, 6000)
 
@@ -1057,6 +1059,7 @@ class GraphScene(QGraphicsScene):
     def finish_node_move(self) -> None:
         if not self.move_start_positions:
             return
+        pending_selection_active = self._pending_selection_active
         before_positions = dict(self.move_start_positions)
         self.move_start_positions = {}
         after_positions = {}
@@ -1075,6 +1078,8 @@ class GraphScene(QGraphicsScene):
                 for node_id in changed_after
             }
             self.nodes_moved.emit(changed_before, changed_after)
+        if pending_selection_active:
+            self._flush_pending_selection()
 
     def selected_node(self) -> GraphNode | None:
         for item in self.selectedItems():
@@ -1118,7 +1123,24 @@ class GraphScene(QGraphicsScene):
         self.connection_items[connection.connection_id] = item
 
     def _emit_selection(self) -> None:
-        self.node_selection_changed.emit(self.selected_node())
+        node = self.selected_node()
+        if self.move_start_positions:
+            self._pending_selection_active = True
+            self._pending_selection_node_id = node.node_id if node is not None else None
+            return
+        self._pending_selection_active = False
+        self._pending_selection_node_id = None
+        self.node_selection_changed.emit(node)
+
+    def _flush_pending_selection(self) -> None:
+        node: GraphNode | None = None
+        if self._pending_selection_node_id is not None:
+            item = self.node_items.get(self._pending_selection_node_id)
+            if item is not None:
+                node = item.node
+        self._pending_selection_active = False
+        self._pending_selection_node_id = None
+        self.node_selection_changed.emit(node)
 
 
 class GraphView(QGraphicsView):
