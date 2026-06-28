@@ -366,7 +366,8 @@ class SettingsPanel(QWidget):
         layout.addWidget(self.resize_none_radio)
 
         percent_row = QHBoxLayout()
-        self.resize_percent_radio = QRadioButton("Процент от оригинала")
+        self.resize_percent_radio = QRadioButton("Масштаб в процентах")
+        self.resize_percent_radio.setToolTip("Может как уменьшать, так и увеличивать изображение.")
         self.resize_percent_radio.toggled.connect(self._update_resize_state)
         percent_row.addWidget(self.resize_percent_radio)
         self.resize_percent_spin = QSpinBox()
@@ -378,7 +379,10 @@ class SettingsPanel(QWidget):
         layout.addLayout(percent_row)
 
         max_side_row = QHBoxLayout()
-        self.resize_max_side_radio = QRadioButton("Ограничить длинную сторону")
+        self.resize_max_side_radio = QRadioButton("Уменьшать, если длинная сторона больше")
+        self.resize_max_side_radio.setToolTip(
+            "Только уменьшение. Если исходная текстура меньше указанного лимита, размер не изменится."
+        )
         self.resize_max_side_radio.toggled.connect(self._update_resize_state)
         max_side_row.addWidget(self.resize_max_side_radio)
         self.max_side_spin = QSpinBox()
@@ -708,7 +712,7 @@ class SettingsPanel(QWidget):
         if options.resize_mode is ResizeMode.PERCENT:
             return f"{options.resize_percent}% от оригинала"
         if options.resize_mode is ResizeMode.MAX_SIDE:
-            return f"длинная сторона до {options.max_side} px"
+            return f"уменьшать только если длинная сторона больше {options.max_side} px"
         return "без изменения размера"
 
     def _compression_summary(self, options: ConversionOptions) -> str:

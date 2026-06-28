@@ -502,6 +502,10 @@ class ChannelPackingPlanTests(unittest.TestCase):
             ChannelPackLayout.ORM,
             preset_names["Unreal ORM Pack"].options.packing.layout,
         )
+        self.assertIn(
+            "длинная сторона больше 4096 px",
+            preset_names["Game Texture 4K"].description,
+        )
 
 
 class GraphEditorFoundationTests(unittest.TestCase):
@@ -1563,6 +1567,10 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertIn("Режим: Только Packed", summary_text)
             self.assertIn("Схема: ORM", summary_text)
             self.assertIn("ORM: R=AO, G=Roughness, B=Metallic", summary_text)
+            self.assertIn(
+                "Размер: уменьшать только если длинная сторона больше 4096 px",
+                preset_text,
+            )
             self.assertIn("Файлы: перезапись выключена; исходники сохраняются", preset_text)
         finally:
             window.close()
