@@ -165,30 +165,17 @@ class SettingsPanel(QWidget):
         return group
 
     def _build_paths_group(self) -> QGroupBox:
-        group = QGroupBox("Пути")
-        layout = QFormLayout(group)
-        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        group = QGroupBox("Batch Output")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
 
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Файл или папка с исходниками")
-        self.input_edit.editingFinished.connect(self._on_input_editing_finished)
-        self.input_edit.setToolTip(
-            "Путь к файлу или папке.\nПоддерживаются DDS, PNG, TIFF, TGA, JPEG, BMP, GIF, WEBP и PSD."
+        info_label = QLabel(
+            "Входные файлы и папки добавляются в очередь справа.\n"
+            "Здесь указывается только общая папка вывода для batch-конвертации."
         )
-
-        input_row = QHBoxLayout()
-        input_row.addWidget(self.input_edit)
-        self.input_file_button = QPushButton("Файл")
-        self.input_file_button.clicked.connect(self._pick_input_file)
-        input_row.addWidget(self.input_file_button)
-        self.input_folder_button = QPushButton("Папка")
-        self.input_folder_button.clicked.connect(self._pick_input_folder)
-        input_row.addWidget(self.input_folder_button)
-
-        input_wrapper = QWidget()
-        input_wrapper.setLayout(input_row)
-        layout.addRow("Вход:", input_wrapper)
+        info_label.setObjectName("SummaryText")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
 
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("Папка назначения")
@@ -205,13 +192,14 @@ class SettingsPanel(QWidget):
 
         output_wrapper = QWidget()
         output_wrapper.setLayout(output_row)
-        layout.addRow("Выход:", output_wrapper)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form.addRow("Выход:", output_wrapper)
+        layout.addLayout(form)
 
         self._register_interactive(
-            self.input_edit,
             self.output_edit,
-            self.input_file_button,
-            self.input_folder_button,
             self.output_button,
         )
         return group
@@ -439,45 +427,6 @@ class SettingsPanel(QWidget):
         self.pack_layout_combo.currentIndexChanged.connect(self._notify_options_changed)
         self.pack_mode_combo.currentIndexChanged.connect(self._notify_options_changed)
 
-    def _set_input_path(self, path: str) -> None:
-        self.input_edit.setText(path)
-        self._auto_fill_output_from_input(force=True)
-
-    def _on_input_editing_finished(self) -> None:
-        self._auto_fill_output_from_input(force=False)
-
-    def _auto_fill_output_from_input(self, force: bool = False) -> None:
-        if not force and self.output_edit.text().strip():
-            return
-
-        raw_input = self.input_edit.text().strip()
-        if not raw_input:
-            return
-
-        input_path = Path(raw_input)
-        if input_path.exists():
-            output_path = input_path if input_path.is_dir() else input_path.parent
-        else:
-            output_path = input_path.parent if input_path.suffix else input_path
-
-        if str(output_path):
-            self.output_edit.setText(str(output_path))
-
-    def _pick_input_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Выберите файл изображения",
-            "",
-            FILE_DIALOG_FILTER,
-        )
-        if path:
-            self._set_input_path(path)
-
-    def _pick_input_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Выберите входную папку")
-        if path:
-            self._set_input_path(path)
-
     def _pick_output_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Выберите выходную папку")
         if path:
@@ -538,10 +487,9 @@ class SettingsPanel(QWidget):
         )
 
     def build_request(self) -> BatchRequest:
-        input_text = self.input_edit.text().strip()
         output_text = self.output_edit.text().strip()
         return BatchRequest(
-            input_path=Path(input_text) if input_text else None,
+            input_path=None,
             output_root=Path(output_text) if output_text else None,
             options=self.build_conversion_options(),
         )
@@ -589,7 +537,6 @@ class SettingsPanel(QWidget):
         self._notify_options_changed()
 
     def apply_app_settings(self, settings: AppSettings) -> None:
-        self.input_edit.setText(settings.input_path)
         self.output_edit.setText(settings.output_path)
         self.apply_conversion_options(settings.options)
 

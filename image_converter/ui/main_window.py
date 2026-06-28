@@ -396,11 +396,6 @@ class MainWindow(QMainWindow):
         self.top_output_edit.textEdited.connect(self._apply_top_output_path)
         secondary_row.addWidget(self.top_output_edit, 1)
 
-        self.run_batch_button = QPushButton("Run Batch")
-        self.run_batch_button.setObjectName("PrimaryButton")
-        self.run_batch_button.clicked.connect(self.convert_requested.emit)
-        secondary_row.addWidget(self.run_batch_button)
-
         self.export_graph_button = QPushButton("Export Graph")
         self.export_graph_button.clicked.connect(self._export_graph)
         self.export_graph_button.hide()
@@ -502,8 +497,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "active_workspace_label"):
             self.active_workspace_label.setText("Batch" if is_batch else "Graph")
 
-        if hasattr(self, "run_batch_button"):
-            self.run_batch_button.setVisible(is_batch)
+        if hasattr(self, "export_graph_button"):
             self.export_graph_button.setVisible(False)
             self.top_output_label.setVisible(not is_batch)
             self.top_output_edit.setVisible(not is_batch)
@@ -704,7 +698,7 @@ class MainWindow(QMainWindow):
             item.batch_source for item in self._queue_items if item.status is not QueueStatus.ERROR
         )
         return BatchRequest(
-            input_path=request.input_path,
+            input_path=None,
             output_root=request.output_root,
             options=request.options,
             sources=queue_sources,
@@ -791,7 +785,6 @@ class MainWindow(QMainWindow):
         self._is_running = running
         self.settings_panel.set_controls_enabled(not running)
         self.queue_panel.set_controls_enabled(not running)
-        self.run_batch_button.setEnabled(not running)
         self.export_graph_button.setEnabled(not running)
         self.graph_workspace.export_button.setEnabled(not running)
         self.asset_table.setEnabled(not running)
@@ -836,7 +829,7 @@ class MainWindow(QMainWindow):
     def build_app_settings(self) -> AppSettings:
         request = self.settings_panel.build_request()
         return AppSettings(
-            input_path=str(request.input_path or ""),
+            input_path="",
             output_path=str(request.output_root or ""),
             workspace_mode=self._workspace_mode,
             graph_auto_watch=self._graph_auto_watch_enabled,

@@ -12,7 +12,7 @@ from unittest import mock
 
 from PIL import Image, ImageFilter
 from PyQt6.QtCore import QEventLoop, QTimer
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from image_converter.domain.models import (
     AppSettings,
@@ -807,7 +807,6 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window._set_workspace_mode("batch")
             self.assertEqual("batch", window._workspace_mode)
             self.assertIs(window.workspace_stack.currentWidget(), window.batch_workspace)
-            self.assertFalse(window.run_batch_button.isHidden())
             self.assertTrue(window.export_graph_button.isHidden())
             self.assertTrue(window.top_output_edit.isHidden())
             self.assertTrue(window.assets_dock.isHidden())
@@ -817,7 +816,6 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window._set_workspace_mode("graph")
             self.assertEqual("graph", window._workspace_mode)
             self.assertIs(window.workspace_stack.currentWidget(), window.graph_workspace)
-            self.assertTrue(window.run_batch_button.isHidden())
             self.assertTrue(window.export_graph_button.isHidden())
             self.assertFalse(window.top_output_edit.isHidden())
             self.assertFalse(window.assets_dock.isHidden())
@@ -1537,6 +1535,44 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertIn("Mode: Только Packed", summary_text)
             self.assertIn("Target Pack: ORM", summary_text)
             self.assertIn("ORM: R=AO, G=Roughness, B=Metallic", summary_text)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_batch_request_uses_queue_as_only_input_source(self) -> None:
+        window = MainWindow()
+        try:
+            window.settings_panel.output_edit.setText("D:/exports")
+            metadata = AssetMetadata("PNG", 4, 4, "RGBA", True, 64, TextureMapType.BASECOLOR)
+            window.add_queue_items([
+                QueueItem(
+                    BatchSource(Path("D:/textures/wood_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR),
+                    AssetKind.IMAGE,
+                    metadata,
+                )
+            ])
+
+            request = window.build_request()
+
+            self.assertIsNone(request.input_path)
+            self.assertEqual(Path("D:/exports"), request.output_root)
+            self.assertEqual(1, len(request.sources))
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_source_tab_explains_that_input_comes_from_queue(self) -> None:
+        window = MainWindow()
+        try:
+            source_tab = window.settings_panel.settings_tabs.widget(0)
+            labels = source_tab.findChildren(QLabel)
+            texts = "\n".join(label.text() for label in labels)
+
+            self.assertIn("Входные файлы и папки добавляются в очередь справа.", texts)
+            self.assertIn("общая папка вывода", texts)
+            self.assertNotIn("Вход:", texts)
         finally:
             window.close()
             window.deleteLater()
