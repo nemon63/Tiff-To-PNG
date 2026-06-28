@@ -129,6 +129,13 @@ class QueuePanel(QWidget):
         graph_actions_row.addWidget(self.apply_graph_to_queue_button)
         layout.addLayout(graph_actions_row)
 
+        self.graph_apply_preflight_label = QLabel(
+            "Graph template пока не задан. Откройте набор в Graph, чтобы увидеть какие наборы очереди подойдут."
+        )
+        self.graph_apply_preflight_label.setObjectName("SummaryText")
+        self.graph_apply_preflight_label.setWordWrap(True)
+        layout.addWidget(self.graph_apply_preflight_label)
+
         self.drop_hint = QLabel("Перетащите сюда файлы или папки с текстурами.")
         self.drop_hint.setObjectName("DropHint")
         self.drop_hint.setWordWrap(True)
@@ -199,6 +206,9 @@ class QueuePanel(QWidget):
     def set_controls_enabled(self, enabled: bool) -> None:
         for widget in self._interactive_widgets:
             widget.setEnabled(enabled)
+
+    def set_graph_apply_preflight_summary(self, text: str) -> None:
+        self.graph_apply_preflight_label.setText(text)
 
     def minimumSizeHint(self) -> QSize:
         return QSize(240, 180)

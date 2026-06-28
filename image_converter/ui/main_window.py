@@ -54,6 +54,7 @@ from image_converter.domain.models import (
     QueueStatus,
     TextureMapType,
 )
+from image_converter.domain.node_graph import NodeType
 from image_converter.domain.errors import ValidationError
 from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.colorspace import (
@@ -193,6 +194,7 @@ class MainWindow(QMainWindow):
         self.graph_workspace.status_message.connect(self.set_status)
         self.graph_workspace.status_message.connect(self.append_log)
         self.graph_workspace.assets_changed.connect(self._on_graph_assets_changed)
+        self.graph_workspace.template_changed.connect(self._refresh_graph_apply_preflight)
         self.graph_workspace.watched_paths_changed.connect(self._on_graph_watched_paths_changed)
         self.log_panel = LogPanel()
         self._graph_auto_export_timer = QTimer(self)
@@ -615,6 +617,7 @@ class MainWindow(QMainWindow):
         existing_assets.sort(key=lambda item: str(item.path).lower())
         self.graph_workspace.set_assets(existing_assets)
         self._render_asset_browser()
+        self._refresh_graph_apply_preflight()
 
         for message in scan_result.ignored_messages:
             self.append_log(message)
@@ -648,6 +651,7 @@ class MainWindow(QMainWindow):
         self.graph_workspace.set_assets(refreshed_graph_assets)
         self.graph_workspace.refresh_asset_paths(paths)
         self._render_asset_browser()
+        self._refresh_graph_apply_preflight()
         if preview_key in reloaded_keys:
             refreshed_item = next(
                 (
@@ -673,6 +677,7 @@ class MainWindow(QMainWindow):
         ]
         self.graph_workspace.set_assets(remaining)
         self._render_asset_browser()
+        self._refresh_graph_apply_preflight()
         self.set_status(f"Удалено ассетов из Graph: {len(selected_items)}")
 
     def _asset_thumbnail_icon(self, item: QueueItem) -> QIcon | None:
@@ -817,6 +822,7 @@ class MainWindow(QMainWindow):
         self._render_queue()
         self._render_asset_browser()
         self._refresh_packing_preflight()
+        self._refresh_graph_apply_preflight()
         self._sync_status_bar_with_selection()
         self._sync_workspace_selection()
 
@@ -842,6 +848,7 @@ class MainWindow(QMainWindow):
         self._render_queue()
         self._render_asset_browser()
         self._refresh_packing_preflight()
+        self._refresh_graph_apply_preflight()
         self.set_status("Очередь очищена")
 
     def reset_queue_statuses_for_run(self) -> None:
@@ -1188,6 +1195,7 @@ class MainWindow(QMainWindow):
         self._render_queue()
         self._render_asset_browser()
         self._refresh_packing_preflight()
+        self._refresh_graph_apply_preflight()
         self._sync_workspace_selection()
 
     def _reload_presets(self) -> None:
@@ -1238,6 +1246,92 @@ class MainWindow(QMainWindow):
         else:
             summary = "Режим: сначала обычные PNG, затем packed texture.\n" + summary
         self.settings_panel.set_packing_preflight_summary(summary)
+
+    def _refresh_graph_apply_preflight(self) -> None:
+        template_map_types = self._graph_template_map_types()
+        if not template_map_types:
+            self.queue_panel.set_graph_apply_preflight_summary(
+                "Graph template пока не задан. Откройте набор в Graph, чтобы увидеть какие наборы очереди подойдут."
+            )
+            return
+
+        if not self._queue_items:
+            self.queue_panel.set_graph_apply_preflight_summary(
+                "Graph template готов, но очередь пуста. Добавьте файлы или папки для batch-обработки."
+            )
+            return
+
+        preflight = self._graph_queue_preflight(template_map_types)
+        lines = [
+            f"Graph template: {self._map_type_list_text(template_map_types)}",
+            f"Подойдут наборы: {preflight['compatible_count']}",
+            f"Будут пропущены: {preflight['skipped_count']}",
+        ]
+        skipped_groups = preflight["skipped_groups"]
+        if skipped_groups:
+            lines.append("Чего не хватает:")
+            preview_limit = 3
+            for group_label, missing_map_types in skipped_groups[:preview_limit]:
+                lines.append(f"- {group_label}: нет {self._map_type_list_text(missing_map_types)}")
+            remainder = len(skipped_groups) - preview_limit
+            if remainder > 0:
+                lines.append(f"- ... и еще {remainder} набор(ов)")
+        else:
+            lines.append("Все найденные наборы содержат нужные карты.")
+        self.queue_panel.set_graph_apply_preflight_summary("\n".join(lines))
+
+    def _graph_template_map_types(self) -> set[TextureMapType]:
+        graph_assets = {
+            self._queue_key(item.path): item.effective_map_type
+            for item in self.graph_workspace.assets()
+        }
+        map_types: set[TextureMapType] = set()
+        for node in self.graph_workspace.project.graph.nodes:
+            if node.node_type is not NodeType.TEXTURE_INPUT:
+                continue
+            raw_path = str(node.properties.get("path", "")).strip()
+            if not raw_path:
+                continue
+            map_type = graph_assets.get(self._queue_key(Path(raw_path)), TextureMapType.UNKNOWN)
+            if map_type is TextureMapType.UNKNOWN:
+                continue
+            map_types.add(map_type)
+        return map_types
+
+    def _graph_queue_preflight(
+        self,
+        template_map_types: set[TextureMapType],
+    ) -> dict[str, object]:
+        groups: OrderedDict[str, list[QueueItem]] = OrderedDict()
+        for item in self._queue_items:
+            groups.setdefault(self._queue_group_key(item), []).append(item)
+
+        compatible_count = 0
+        skipped_groups: list[tuple[str, list[TextureMapType]]] = []
+        ordered_template = self._ordered_map_types(template_map_types)
+        for items in groups.values():
+            available_map_types = {
+                item.effective_map_type
+                for item in items
+                if item.effective_map_type is not TextureMapType.UNKNOWN
+            }
+            missing_map_types = [
+                map_type
+                for map_type in ordered_template
+                if map_type not in available_map_types
+            ]
+            if missing_map_types:
+                skipped_groups.append(
+                    (self._queue_group_label(items[0]).replace("Папка: ", ""), missing_map_types)
+                )
+                continue
+            compatible_count += 1
+
+        return {
+            "compatible_count": compatible_count,
+            "skipped_count": len(skipped_groups),
+            "skipped_groups": skipped_groups,
+        }
 
     def _refresh_output_bundle_summary(self) -> None:
         self.settings_panel.set_output_bundle_summary(
@@ -1514,6 +1608,7 @@ class MainWindow(QMainWindow):
         item.output_path = self._build_output_path(item.batch_source)
         self._render_queue()
         self._refresh_packing_preflight()
+        self._refresh_graph_apply_preflight()
         self._sync_workspace_selection()
         self._sync_status_bar_with_selection()
 
@@ -1606,6 +1701,7 @@ class MainWindow(QMainWindow):
             return
         self.append_log(f"Auto Watch -> changed: {', '.join(path.name for path in paths[:4])}")
         self._reload_assets_for_paths(paths, source_label="Auto Watch")
+        self._refresh_graph_apply_preflight()
         if self._graph_auto_export_enabled:
             self._graph_auto_export_paths = paths
             self._graph_auto_export_scheduled = True
@@ -1644,6 +1740,7 @@ class MainWindow(QMainWindow):
             self._render_queue()
             self._render_asset_browser()
             self._refresh_packing_preflight()
+            self._refresh_graph_apply_preflight()
             self._sync_status_bar_with_selection()
             selected_item = self._selected_queue_item()
             self.metadata_panel.set_queue_item(selected_item)
@@ -1680,6 +1777,7 @@ class MainWindow(QMainWindow):
             return
         self.graph_workspace.set_assets(items)
         self._render_asset_browser()
+        self._refresh_graph_apply_preflight()
         self._set_workspace_mode(WORKSPACE_GRAPH)
         self.set_status(f"Открыт набор в Graph: {len(items)} файл(ов)")
 
@@ -1690,6 +1788,7 @@ class MainWindow(QMainWindow):
             return
         self.graph_workspace.set_assets(items)
         self._render_asset_browser()
+        self._refresh_graph_apply_preflight()
         self._set_workspace_mode(WORKSPACE_GRAPH)
         self.set_status(f"Открыто файлов в Graph: {len(items)}")
 
@@ -1717,15 +1816,11 @@ class MainWindow(QMainWindow):
             self.show_error("Применить граф к очереди", str(exc))
             return
 
-        template_map_types = {
-            item.effective_map_type
-            for item in graph_assets
-            if item.effective_map_type is not TextureMapType.UNKNOWN
-        }
+        template_map_types = self._graph_template_map_types()
         if not template_map_types:
             self.show_error(
                 "Применить граф к очереди",
-                "В graph-assets не удалось определить типы карт. Откройте корректный набор.",
+                "В texture input нодах графа не удалось определить типы карт. Откройте корректный набор в Graph.",
             )
             return
 
@@ -1919,6 +2014,7 @@ class MainWindow(QMainWindow):
         self._render_queue()
         self._render_asset_browser()
         self._refresh_packing_preflight()
+        self._refresh_graph_apply_preflight()
         self._sync_workspace_selection()
         return removed_count
 

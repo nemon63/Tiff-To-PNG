@@ -1013,6 +1013,114 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window.deleteLater()
             self.app.processEvents()
 
+    def test_graph_apply_preflight_reports_when_template_is_not_ready(self) -> None:
+        window = MainWindow()
+        try:
+            text = window.queue_panel.graph_apply_preflight_label.text()
+            self.assertIn("Graph template пока не задан", text)
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_graph_apply_preflight_lists_compatible_and_skipped_sets(self) -> None:
+        window = MainWindow()
+        try:
+            color_metadata = AssetMetadata("PNG", 4, 4, "RGBA", True, 64, TextureMapType.BASECOLOR)
+            normal_metadata = AssetMetadata("PNG", 4, 4, "RGB", False, 64, TextureMapType.NORMAL)
+            items = [
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetA/a_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR),
+                    AssetKind.IMAGE,
+                    color_metadata,
+                ),
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetA/a_normal.png"), Path("D:/textures"), TextureMapType.NORMAL),
+                    AssetKind.IMAGE,
+                    normal_metadata,
+                ),
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetB/b_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR),
+                    AssetKind.IMAGE,
+                    color_metadata,
+                ),
+            ]
+            window.add_queue_items(items)
+            window.graph_workspace.set_assets(items)
+
+            texture_color = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": "D:/textures/SetA/a_basecolor.png"},
+            )
+            texture_normal = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": "D:/textures/SetA/a_normal.png"},
+            )
+            output = create_graph_node(NodeType.OUTPUT_RGBA)
+            window.graph_workspace.project = NodeGraphProject(
+                graph=NodeGraph(nodes=[texture_color, texture_normal, output])
+            )
+            window._refresh_graph_apply_preflight()
+
+            text = window.queue_panel.graph_apply_preflight_label.text()
+            self.assertIn("Graph template: BaseColor, Normal", text)
+            self.assertIn("Подойдут наборы: 1", text)
+            self.assertIn("Будут пропущены: 1", text)
+            self.assertIn("textures/SetB: нет Normal", text)
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_graph_template_map_types_ignore_extra_graph_assets_not_used_by_nodes(self) -> None:
+        window = MainWindow()
+        try:
+            color_metadata = AssetMetadata("PNG", 4, 4, "RGBA", True, 64, TextureMapType.BASECOLOR)
+            normal_metadata = AssetMetadata("PNG", 4, 4, "RGB", False, 64, TextureMapType.NORMAL)
+            roughness_metadata = AssetMetadata("PNG", 4, 4, "L", False, 64, TextureMapType.ROUGHNESS)
+            graph_assets = [
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetA/a_basecolor.png"), Path("D:/textures"), TextureMapType.BASECOLOR),
+                    AssetKind.IMAGE,
+                    color_metadata,
+                ),
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetA/a_normal.png"), Path("D:/textures"), TextureMapType.NORMAL),
+                    AssetKind.IMAGE,
+                    normal_metadata,
+                ),
+                QueueItem(
+                    BatchSource(Path("D:/textures/SetA/a_roughness.png"), Path("D:/textures"), TextureMapType.ROUGHNESS),
+                    AssetKind.IMAGE,
+                    roughness_metadata,
+                ),
+            ]
+            window.graph_workspace.set_assets(graph_assets)
+            window.graph_workspace.project = NodeGraphProject(
+                graph=NodeGraph(
+                    nodes=[
+                        create_graph_node(
+                            NodeType.TEXTURE_INPUT,
+                            properties={"path": "D:/textures/SetA/a_basecolor.png"},
+                        ),
+                        create_graph_node(
+                            NodeType.TEXTURE_INPUT,
+                            properties={"path": "D:/textures/SetA/a_normal.png"},
+                        ),
+                        create_graph_node(NodeType.OUTPUT_RGBA),
+                    ]
+                )
+            )
+
+            self.assertEqual(
+                {TextureMapType.BASECOLOR, TextureMapType.NORMAL},
+                window._graph_template_map_types(),
+            )
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
     def test_graph_output_path_keeps_explicit_non_png_suffix(self) -> None:
         output = create_graph_node(
             NodeType.OUTPUT_RGBA,

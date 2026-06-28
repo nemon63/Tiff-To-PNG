@@ -2001,6 +2001,7 @@ class GraphWorkspace(QWidget):
     status_message = pyqtSignal(str)
     watched_paths_changed = pyqtSignal(tuple)
     assets_changed = pyqtSignal(tuple)
+    template_changed = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -2820,6 +2821,7 @@ class GraphWorkspace(QWidget):
         self._schedule_autosave()
         if needs_rebuild:
             self._rebuild_asset_watchers()
+        self.template_changed.emit()
 
     def _delete_selection(self) -> None:
         self._scene.delete_selected()
