@@ -71,44 +71,47 @@ class SettingsPanel(QWidget):
         title_label.setObjectName("PanelTitle")
         root_layout.addWidget(title_label)
 
-        subtitle_label = QLabel("Настройки batch-конвертации, packing и формата экспорта.")
+        subtitle_label = QLabel("Сценарий обработки, папка результата и правила экспорта.")
         subtitle_label.setObjectName("PanelSubtitle")
         subtitle_label.setWordWrap(True)
         root_layout.addWidget(subtitle_label)
 
         self.settings_tabs = QTabWidget()
-        self.settings_tabs.addTab(
+        scenario_index = self.settings_tabs.addTab(
             self._build_tab(
                 self._build_presets_group(),
                 self._build_paths_group(),
             ),
-            "Source",
+            "Сценарий",
         )
-        self.settings_tabs.addTab(
+        naming_index = self.settings_tabs.addTab(
             self._build_tab(
                 self._build_naming_group(),
                 self._build_packing_group(),
             ),
-            "Output",
+            "Имена и каналы",
         )
-        self.settings_tabs.addTab(
+        format_index = self.settings_tabs.addTab(
             self._build_tab(
                 self._build_basic_group(),
                 self._build_png_group(),
                 self._build_resize_group(),
             ),
-            "PNG",
+            "Формат и размер",
         )
+        self.settings_tabs.setTabToolTip(scenario_index, "Готовый сценарий и папка результата.")
+        self.settings_tabs.setTabToolTip(naming_index, "Правила именования файлов и упаковка каналов.")
+        self.settings_tabs.setTabToolTip(format_index, "Формат PNG, сжатие, перезапись и размер текстур.")
         root_layout.addWidget(self.settings_tabs, 1)
 
         controls_row = QHBoxLayout()
-        self.convert_button = QPushButton("Конвертировать")
+        self.convert_button = QPushButton("Запустить обработку")
         self.convert_button.setObjectName("PrimaryButton")
         self.convert_button.setMinimumHeight(42)
         self.convert_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.convert_button.setDefault(True)
         self.convert_button.clicked.connect(self.convert_requested.emit)
-        self.convert_button.setToolTip("Запустить пакетную конвертацию в PNG.")
+        self.convert_button.setToolTip("Запустить пакетную обработку по выбранному сценарию.")
         controls_row.addWidget(self.convert_button)
         root_layout.addLayout(controls_row)
         self._register_interactive(self.convert_button)
@@ -124,7 +127,7 @@ class SettingsPanel(QWidget):
         return tab
 
     def _build_presets_group(self) -> QGroupBox:
-        group = QGroupBox("Workflow Presets")
+        group = QGroupBox("Готовые сценарии")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
@@ -165,23 +168,23 @@ class SettingsPanel(QWidget):
         return group
 
     def _build_paths_group(self) -> QGroupBox:
-        group = QGroupBox("Batch Output")
+        group = QGroupBox("Папка результата")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
         info_label = QLabel(
-            "Входные файлы и папки добавляются в очередь справа.\n"
-            "Здесь указывается только общая папка вывода для batch-конвертации."
+            "Вход всегда берется из очереди справа.\n"
+            "Здесь указывается только общая папка, куда будут сохранены PNG и packed texture."
         )
         info_label.setObjectName("SummaryText")
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
         self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Папка назначения")
+        self.output_edit.setPlaceholderText("Общая папка результата")
         self.output_edit.textChanged.connect(self.output_path_changed.emit)
         self.output_edit.setToolTip(
-            "Папка для PNG. Если оставить пустой, файлы будут сохранены рядом с исходниками."
+            "Базовая папка результата. Если оставить пустой, PNG и packed texture будут сохранены рядом с исходниками."
         )
 
         output_row = QHBoxLayout()
@@ -195,7 +198,7 @@ class SettingsPanel(QWidget):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-        form.addRow("Выход:", output_wrapper)
+        form.addRow("Папка:", output_wrapper)
         layout.addLayout(form)
 
         self._register_interactive(
@@ -205,7 +208,7 @@ class SettingsPanel(QWidget):
         return group
 
     def _build_naming_group(self) -> QGroupBox:
-        group = QGroupBox("Naming Rules")
+        group = QGroupBox("Имена файлов")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
@@ -237,7 +240,7 @@ class SettingsPanel(QWidget):
         return group
 
     def _build_packing_group(self) -> QGroupBox:
-        group = QGroupBox("Packed Texture")
+        group = QGroupBox("Упаковка каналов")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
@@ -246,7 +249,7 @@ class SettingsPanel(QWidget):
         layout.addWidget(self.pack_enable_checkbox)
 
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Mode:"))
+        mode_row.addWidget(QLabel("Режим:"))
         self.pack_mode_combo = QComboBox()
         for packing_mode in ChannelPackingMode:
             self.pack_mode_combo.addItem(packing_mode.label, packing_mode)
@@ -255,7 +258,7 @@ class SettingsPanel(QWidget):
         layout.addLayout(mode_row)
 
         layout_row = QHBoxLayout()
-        layout_row.addWidget(QLabel("Target Pack:"))
+        layout_row.addWidget(QLabel("Схема:"))
         self.pack_layout_combo = QComboBox()
         for pack_layout in ChannelPackLayout:
             self.pack_layout_combo.addItem(pack_layout.label, pack_layout)
@@ -555,10 +558,10 @@ class SettingsPanel(QWidget):
         self._presets_by_id = {preset.preset_id: preset for preset in presets}
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
-        self.preset_combo.addItem("Текущие ручные настройки", CURRENT_PRESET_DATA)
+        self.preset_combo.addItem("Ручной режим", CURRENT_PRESET_DATA)
 
         for preset in presets:
-            source_label = "Built-in" if preset.is_system else "Custom"
+            source_label = "Системный" if preset.is_system else "Пользовательский"
             self.preset_combo.addItem(f"{preset.name} [{source_label}]", preset.preset_id)
 
         self.preset_combo.blockSignals(False)
@@ -607,7 +610,8 @@ class SettingsPanel(QWidget):
 
         if preset is None:
             self.preset_summary_label.setText(
-                "Текущие ручные настройки. Preset не применен."
+                "Ручной режим. Параметры ниже применяются напрямую.\n"
+                + self._preset_export_summary(self.build_conversion_options())
             )
             self.preset_packing_summary_label.setText(
                 self._preset_packing_summary(self.build_conversion_options())
@@ -617,7 +621,8 @@ class SettingsPanel(QWidget):
         source_label = "Системный" if preset.is_system else "Пользовательский"
         description = preset.description or "Без описания."
         self.preset_summary_label.setText(
-            f"{source_label} preset. {description}"
+            f"{source_label} сценарий. {description}\n"
+            + self._preset_export_summary(preset.options)
         )
         self.preset_packing_summary_label.setText(
             self._preset_packing_summary(preset.options)
@@ -654,7 +659,7 @@ class SettingsPanel(QWidget):
 
         if not packing_options.enabled:
             self.packing_queue_label.setText(
-                "Packed texture выключен. Будут сохранены обычные PNG по каждому исходнику."
+                "Упаковка каналов выключена. Для каждого исходника будет сохранен отдельный PNG."
             )
             return
 
@@ -672,17 +677,69 @@ class SettingsPanel(QWidget):
 
     def _packing_mode_description(self, packing_options: ChannelPackingOptions) -> str:
         if not packing_options.enabled:
-            return "Режим packing выключен."
+            return "Режим упаковки каналов выключен."
         if packing_options.mode is ChannelPackingMode.PACK_ONLY:
-            return "Pack Only: приложение соберет только итоговый packed texture и не будет сохранять обычные PNG по каждому исходнику."
-        return "Convert + Pack: сначала сохраняются обычные PNG по каждому исходнику, затем поверх них собирается packed texture."
+            return "Только Packed: приложение соберет только итоговый packed texture и не будет сохранять отдельные PNG по каждому исходнику."
+        return "Сначала PNG, потом Packed: приложение сохранит отдельные PNG по каждому исходнику и затем соберет итоговую packed texture."
+
+    def _preset_export_summary(self, options: ConversionOptions) -> str:
+        return "\n".join(
+            (
+                "Что получится",
+                f"Формат: {self._format_summary(options)}",
+                f"Размер: {self._resize_summary(options)}",
+                f"Сжатие: {self._compression_summary(options)}",
+                f"Имена: {self._naming_rules_summary(options.naming)}",
+                f"Файлы: {self._file_behavior_summary(options)}",
+            )
+        )
+
+    def _format_summary(self, options: ConversionOptions) -> str:
+        if options.png8:
+            dither_text = ", dithering" if options.dither else ""
+            return f"PNG-8, {options.png8_colors} цветов{dither_text}"
+        if options.force_rgba:
+            return "PNG, принудительный RGBA"
+        return "PNG, без принудительного RGBA"
+
+    def _resize_summary(self, options: ConversionOptions) -> str:
+        if options.resize_mode is ResizeMode.PERCENT:
+            return f"{options.resize_percent}% от оригинала"
+        if options.resize_mode is ResizeMode.MAX_SIDE:
+            return f"длинная сторона до {options.max_side} px"
+        return "без изменения размера"
+
+    def _compression_summary(self, options: ConversionOptions) -> str:
+        optimize_text = "optimize включен" if options.optimize else "optimize выключен"
+        return f"уровень {options.compress_level}, {optimize_text}"
+
+    def _naming_rules_summary(self, naming_rules: NamingRules) -> str:
+        rules: list[str] = []
+        if naming_rules.lowercase:
+            rules.append("lowercase")
+        if naming_rules.replace_spaces:
+            rules.append("пробелы -> _")
+        if naming_rules.normalize_map_suffix:
+            rules.append("suffix по типу карты")
+        if not rules:
+            return "без изменений"
+        return ", ".join(rules)
+
+    def _file_behavior_summary(self, options: ConversionOptions) -> str:
+        overwrite_text = "перезапись включена" if options.overwrite else "перезапись выключена"
+        source_text = (
+            "исходники удаляются после успешной конвертации"
+            if options.delete_source
+            else "исходники сохраняются"
+        )
+        return f"{overwrite_text}; {source_text}"
 
     def _preset_packing_summary(self, options: ConversionOptions) -> str:
         packing = options.packing
         if not packing.enabled:
             return (
-                "Packed Texture\n"
-                "Сборка packed texture выключена.\n"
+                "Упаковка каналов\n"
+                "Выключена.\n"
                 "Будут сохранены обычные PNG по каждому исходнику."
             )
 
@@ -690,9 +747,9 @@ class SettingsPanel(QWidget):
         mapping_text = channel_pack_mapping_text(packing.layout)
         mode_description = self._packing_mode_description(packing)
         return (
-            "Packed Texture\n"
-            f"Mode: {mode_label}\n"
-            f"Target Pack: {packing.layout.label}\n"
+            "Упаковка каналов\n"
+            f"Режим: {mode_label}\n"
+            f"Схема: {packing.layout.label}\n"
             f"{mapping_text}\n"
             f"{mode_description}"
         )

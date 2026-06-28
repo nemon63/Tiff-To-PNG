@@ -1433,7 +1433,7 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window._refresh_packing_preflight()
 
             text = window.settings_panel.packing_queue_label.text()
-            self.assertIn("Mode: Convert + Pack.", text)
+            self.assertIn("Режим: сначала обычные PNG, затем packed texture.", text)
             self.assertIn("Packing plan (ORM): ready 1, incomplete 0.", text)
             self.assertIn("- Sword/sword -> Sword/sword_orm.png", text)
             self.assertIn("R=sword_ao.png", text)
@@ -1477,9 +1477,9 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window._update_queue_output_paths()
 
             preflight_text = window.settings_panel.packing_queue_label.text()
-            self.assertIn("Mode: Pack Only.", preflight_text)
+            self.assertIn("Режим: только packed texture.", preflight_text)
             self.assertIn("Packing plan (ORM): ready 1, incomplete 0.", preflight_text)
-            self.assertEqual("Packed output only", window.queue_panel.table.item(0, 5).text())
+            self.assertEqual("В составе packed texture", window.queue_panel.table.item(0, 5).text())
             self.assertIn("sword_orm.png", window.queue_panel.table.item(0, 5).toolTip())
             self.assertIn(
                 "соберет только итоговый packed texture",
@@ -1509,8 +1509,10 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertFalse(options.packing.enabled)
             self.assertEqual("UI RGBA Clean", window.settings_panel.preset_combo.currentText().split(" [")[0])
             self.assertIn("иконок и UI-элементов", window.settings_panel.preset_summary_label.text())
-            self.assertIn("Packed Texture", window.settings_panel.preset_packing_summary_label.text())
-            self.assertIn("Сборка packed texture выключена", window.settings_panel.preset_packing_summary_label.text())
+            self.assertIn("Что получится", window.settings_panel.preset_summary_label.text())
+            self.assertIn("Формат: PNG, принудительный RGBA", window.settings_panel.preset_summary_label.text())
+            self.assertIn("Упаковка каналов", window.settings_panel.preset_packing_summary_label.text())
+            self.assertIn("Выключена", window.settings_panel.preset_packing_summary_label.text())
         finally:
             window.close()
             window.deleteLater()
@@ -1531,10 +1533,12 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.app.processEvents()
 
             summary_text = window.settings_panel.preset_packing_summary_label.text()
-            self.assertIn("Packed Texture", summary_text)
-            self.assertIn("Mode: Только Packed", summary_text)
-            self.assertIn("Target Pack: ORM", summary_text)
+            preset_text = window.settings_panel.preset_summary_label.text()
+            self.assertIn("Упаковка каналов", summary_text)
+            self.assertIn("Режим: Только Packed", summary_text)
+            self.assertIn("Схема: ORM", summary_text)
             self.assertIn("ORM: R=AO, G=Roughness, B=Metallic", summary_text)
+            self.assertIn("Файлы: перезапись выключена; исходники сохраняются", preset_text)
         finally:
             window.close()
             window.deleteLater()
@@ -1563,6 +1567,19 @@ class GraphEditorFoundationTests(unittest.TestCase):
             window.deleteLater()
             self.app.processEvents()
 
+    def test_batch_tabs_use_clearer_workflow_labels(self) -> None:
+        window = MainWindow()
+        try:
+            tabs = window.settings_panel.settings_tabs
+
+            self.assertEqual("Сценарий", tabs.tabText(0))
+            self.assertEqual("Имена и каналы", tabs.tabText(1))
+            self.assertEqual("Формат и размер", tabs.tabText(2))
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
     def test_source_tab_explains_that_input_comes_from_queue(self) -> None:
         window = MainWindow()
         try:
@@ -1570,8 +1587,9 @@ class GraphEditorFoundationTests(unittest.TestCase):
             labels = source_tab.findChildren(QLabel)
             texts = "\n".join(label.text() for label in labels)
 
-            self.assertIn("Входные файлы и папки добавляются в очередь справа.", texts)
-            self.assertIn("общая папка вывода", texts)
+            self.assertIn("Вход всегда берется из очереди справа.", texts)
+            self.assertIn("общая папка", texts)
+            self.assertIn("куда будут сохранены PNG и packed texture", texts)
             self.assertNotIn("Вход:", texts)
         finally:
             window.close()

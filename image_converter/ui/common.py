@@ -11,7 +11,7 @@ from image_converter.domain.models import (
 )
 from image_converter.services.colorspace import item_warning_count
 
-QUEUE_HEADERS = ("Имя", "Карта", "Размер", "Разрешение", "Статус", "Выходной путь")
+QUEUE_HEADERS = ("Имя", "Карта", "Размер", "Разрешение", "Статус", "Результат")
 AUTO_MAP_TYPE_DATA = "__auto__"
 CURRENT_PRESET_DATA = "__current_preset__"
 

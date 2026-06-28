@@ -65,42 +65,48 @@ class QueuePanel(QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        title_label = QLabel("Очередь конвертации")
+        title_label = QLabel("Очередь обработки")
         title_label.setObjectName("PanelTitle")
         layout.addWidget(title_label)
 
-        subtitle_label = QLabel("Drop textures or folders, then run the batch export.")
+        subtitle_label = QLabel(
+            "Добавьте текстуры или папки в очередь. Именно очередь задает вход для Batch Converter."
+        )
         subtitle_label.setObjectName("PanelSubtitle")
         subtitle_label.setWordWrap(True)
         layout.addWidget(subtitle_label)
 
         controls_row = QHBoxLayout()
         controls_row.setSpacing(6)
-        self.add_files_button = QPushButton("+ Files")
+        self.add_files_button = QPushButton("+ Файлы")
+        self.add_files_button.setToolTip("Добавить отдельные изображения в очередь.")
         self.add_files_button.clicked.connect(self._pick_files)
         controls_row.addWidget(self.add_files_button)
 
-        self.add_folder_button = QPushButton("+ Folder")
+        self.add_folder_button = QPushButton("+ Папка")
+        self.add_folder_button.setToolTip("Добавить папку и просканировать найденные в ней текстуры.")
         self.add_folder_button.clicked.connect(self._pick_folder)
         controls_row.addWidget(self.add_folder_button)
 
-        self.remove_selected_button = QPushButton("Remove")
+        self.remove_selected_button = QPushButton("Убрать")
+        self.remove_selected_button.setToolTip("Убрать выбранные элементы из очереди.")
         self.remove_selected_button.clicked.connect(self.remove_requested.emit)
         controls_row.addWidget(self.remove_selected_button)
 
-        self.clear_button = QPushButton("Clear")
+        self.clear_button = QPushButton("Очистить")
         self.clear_button.setObjectName("DangerButton")
+        self.clear_button.setToolTip("Полностью очистить очередь.")
         self.clear_button.clicked.connect(self.clear_requested.emit)
         controls_row.addWidget(self.clear_button)
         controls_row.addStretch(1)
         layout.addLayout(controls_row)
 
-        self.drop_hint = QLabel("Drop files or folders here.")
+        self.drop_hint = QLabel("Перетащите сюда файлы или папки с текстурами.")
         self.drop_hint.setObjectName("DropHint")
         self.drop_hint.setWordWrap(True)
         layout.addWidget(self.drop_hint)
 
-        self.summary_label = QLabel("Очередь пуста")
+        self.summary_label = QLabel("Очередь пуста. Добавьте файлы или папки.")
         self.summary_label.setObjectName("SummaryText")
         layout.addWidget(self.summary_label)
 
@@ -114,6 +120,18 @@ class QueuePanel(QWidget):
         self.table.setShowGrid(False)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table.verticalHeader().setVisible(False)
+        header_tooltips = (
+            "Имя исходного файла.",
+            "Определенный тип карты.",
+            "Размер файла на диске.",
+            "Разрешение исходной текстуры.",
+            "Готовность элемента к обработке.",
+            "Ожидаемый результат. В режиме 'Только Packed' показывает итоговую packed texture, в которую войдет карта.",
+        )
+        for column, tooltip in enumerate(header_tooltips):
+            header_item = self.table.horizontalHeaderItem(column)
+            if header_item is not None:
+                header_item.setToolTip(tooltip)
         header = self.table.horizontalHeader()
         header.setMinimumSectionSize(48)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -155,4 +173,4 @@ class QueuePanel(QWidget):
         return QSize(240, 180)
 
     def sizeHint(self) -> QSize:
-        return QSize(720, 360)
+        return QSize(480, 360)

@@ -263,8 +263,10 @@ class MainWindow(QMainWindow):
         title = QLabel("Batch Converter")
         title.setObjectName("PanelTitle")
         header.addWidget(title)
-        subtitle = QLabel("Потоковая конвертация TIFF/texture assets в PNG.")
+        subtitle = QLabel("Очередь справа задает вход, а сценарий слева определяет итоговый результат.")
         subtitle.setObjectName("SummaryText")
+        subtitle.setWordWrap(True)
+        subtitle.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         header.addWidget(subtitle)
         header.addStretch(1)
         layout.addLayout(header)
@@ -371,7 +373,7 @@ class MainWindow(QMainWindow):
 
         primary_row.addStretch(1)
 
-        self.toolbar_status_label = QLabel("Ready")
+        self.toolbar_status_label = QLabel("Готово")
         self.toolbar_status_label.setObjectName("StatusPill")
         self.toolbar_status_label.setMinimumWidth(0)
         self.toolbar_status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -520,7 +522,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.node_properties_dock.hide()
 
-        self.set_status("Batch Converter mode" if is_batch else "Graph Workbench mode")
+        self.set_status("Режим Batch Converter" if is_batch else "Режим Graph Workbench")
 
     def _sync_active_workspace_label(self, *_args: object) -> None:
         self._set_workspace_mode(self._workspace_mode)
@@ -902,7 +904,7 @@ class MainWindow(QMainWindow):
         for row, item in enumerate(self._queue_items):
             metadata = item.metadata
             if options.packing.enabled and options.packing.mode is ChannelPackingMode.PACK_ONLY:
-                output_text = "Packed output only"
+                output_text = "В составе packed texture"
                 output_tooltip = (
                     str(item.output_path)
                     if item.output_path is not None
@@ -1067,7 +1069,7 @@ class MainWindow(QMainWindow):
         options = self.settings_panel.build_conversion_options()
         if not options.packing.enabled:
             self.settings_panel.set_packing_preflight_summary(
-                "Packing выключен. Включите его, если нужно собрать ORM/RMA/MRA или Unity-packed карты прямо из набора текстур."
+                "Упаковка каналов выключена. Включите ее, если нужно собрать ORM/RMA/MRA или Unity-packed карты прямо из набора текстур."
             )
             return
 
@@ -1075,9 +1077,9 @@ class MainWindow(QMainWindow):
         jobs = build_channel_pack_jobs(sources, None, options)
         summary = summarize_channel_pack_jobs(jobs)
         if options.packing.mode is ChannelPackingMode.PACK_ONLY:
-            summary = "Mode: Pack Only. Будет создан только packed texture.\n" + summary
+            summary = "Режим: только packed texture. Будет создан только итоговый packed texture.\n" + summary
         else:
-            summary = "Mode: Convert + Pack. Сначала обычные PNG, затем packed texture.\n" + summary
+            summary = "Режим: сначала обычные PNG, затем packed texture.\n" + summary
         self.settings_panel.set_packing_preflight_summary(summary)
 
     def _apply_preset(self, preset_id: str) -> None:
@@ -1087,7 +1089,7 @@ class MainWindow(QMainWindow):
 
         self.settings_panel.apply_conversion_options(preset.options)
         self.settings_panel.set_selected_preset_id(preset.preset_id)
-        self.set_status(f"Применен workflow preset: {preset.name}")
+        self.set_status(f"Применен сценарий: {preset.name}")
 
     def _save_current_preset(self) -> None:
         if self._preset_repository is None:
@@ -1144,7 +1146,7 @@ class MainWindow(QMainWindow):
 
         self._reload_presets()
         self.settings_panel.set_selected_preset_id(preset.preset_id)
-        self.set_status(f"Сохранен workflow preset: {preset.name}")
+        self.set_status(f"Сохранен сценарий: {preset.name}")
 
     def _delete_preset(self, preset_id: str) -> None:
         if self._preset_repository is None:
@@ -1174,7 +1176,7 @@ class MainWindow(QMainWindow):
             return
 
         self._reload_presets()
-        self.set_status(f"Удален workflow preset: {preset.name}")
+        self.set_status(f"Удален сценарий: {preset.name}")
 
     def _sync_status_bar_with_selection(self) -> None:
         item = self._selected_queue_item()
