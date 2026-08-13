@@ -29,6 +29,11 @@ def image_has_alpha(image: Image.Image) -> bool:
     return "A" in image.getbands() or (image.mode == "P" and "transparency" in image.info)
 
 
+def prepare_image_header_preserving_alpha(image: Image.Image) -> None:
+    """Apply TIFF alpha metadata fixes without decoding or copying image pixels."""
+    _promote_tiff_extra_sample_alpha(image)
+
+
 def _promote_tiff_extra_sample_alpha(image: Image.Image) -> None:
     if image.format != "TIFF":
         return

@@ -198,6 +198,7 @@ class AssetMetadata:
     map_type: TextureMapType = TextureMapType.UNKNOWN
     frame_count: int = 1
     warnings: tuple[str, ...] = ()
+    alpha_fully_opaque: bool | None = None
 
     @property
     def resolution_text(self) -> str:

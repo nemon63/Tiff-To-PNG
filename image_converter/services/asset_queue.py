@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image
 
 from image_converter.domain.constants import SUPPORTED_SOURCE_EXTENSIONS
 from image_converter.domain.models import AssetKind, AssetMetadata, BatchSource, QueueItem, QueueStatus
-from image_converter.services.image_loading import copy_first_frame_preserving_alpha, image_has_alpha
+from image_converter.services.image_loading import (
+    copy_first_frame_preserving_alpha,
+    image_has_alpha,
+    prepare_image_header_preserving_alpha,
+)
 from image_converter.services.map_types import detect_texture_map_type
 
 
@@ -19,55 +23,80 @@ class AssetScanResult:
 
 
 class AssetScanner:
-    def scan_paths(self, paths: Iterable[Path], *, recursive: bool) -> AssetScanResult:
+    def scan_paths(
+        self,
+        paths: Iterable[Path],
+        *,
+        recursive: bool,
+        item_callback: Callable[[QueueItem], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> AssetScanResult:
         items: list[QueueItem] = []
         ignored_messages: list[str] = []
         seen_paths: set[Path] = set()
 
         for path in paths:
-            expanded_sources, ignored = self._expand_path(path, recursive=recursive)
-            ignored_messages.extend(ignored)
-
-            for source in expanded_sources:
+            for source in self._iter_sources(
+                path,
+                recursive=recursive,
+                ignored_messages=ignored_messages,
+                cancelled=cancelled,
+            ):
+                if cancelled is not None and cancelled():
+                    break
                 resolved_path = source.path.resolve()
                 if resolved_path in seen_paths:
                     continue
                 seen_paths.add(resolved_path)
-                items.append(self._build_queue_item(source))
+                item = self._build_queue_item(source)
+                items.append(item)
+                if item_callback is not None:
+                    item_callback(item)
+            if cancelled is not None and cancelled():
+                break
 
         items.sort(key=lambda item: str(item.path).lower())
         return AssetScanResult(items=tuple(items), ignored_messages=tuple(ignored_messages))
 
-    def _expand_path(self, path: Path, *, recursive: bool) -> tuple[list[BatchSource], list[str]]:
+    def _iter_sources(
+        self,
+        path: Path,
+        *,
+        recursive: bool,
+        ignored_messages: list[str],
+        cancelled: Callable[[], bool] | None,
+    ) -> Iterator[BatchSource]:
         if not path.exists():
-            return [], [f"Путь не найден: {path}"]
+            ignored_messages.append(f"Путь не найден: {path}")
+            return
 
         if path.is_file():
             if path.suffix.lower() not in SUPPORTED_SOURCE_EXTENSIONS:
-                return [], [f"Пропуск неподдерживаемого файла: {path.name}"]
-            return [BatchSource(path=path, root=path.parent)], []
+                ignored_messages.append(f"Пропуск неподдерживаемого файла: {path.name}")
+                return
+            yield BatchSource(path=path, root=path.parent)
+            return
 
         iterator = path.rglob("*") if recursive else path.glob("*")
-        sources: list[BatchSource] = []
-        ignored: list[str] = []
+        supported_count = 0
         unsupported_count = 0
-
         for file_path in iterator:
+            if cancelled is not None and cancelled():
+                return
             if not file_path.is_file():
                 continue
             if file_path.suffix.lower() in SUPPORTED_SOURCE_EXTENSIONS:
-                sources.append(BatchSource(path=file_path, root=path))
+                supported_count += 1
+                yield BatchSource(path=file_path, root=path)
             else:
                 unsupported_count += 1
 
-        if sources:
-            if unsupported_count:
-                ignored.append(
-                    f"В папке {path.name} пропущено неподдерживаемых файлов: {unsupported_count}"
-                )
-            return sources, ignored
-
-        return [], [f"В папке не найдено поддерживаемых файлов: {path}"]
+        if unsupported_count:
+            ignored_messages.append(
+                f"В папке {path.name} пропущено неподдерживаемых файлов: {unsupported_count}"
+            )
+        if supported_count == 0:
+            ignored_messages.append(f"В папке не найдено поддерживаемых файлов: {path}")
 
     def _build_queue_item(self, source: BatchSource) -> QueueItem:
         try:
@@ -93,16 +122,12 @@ class AssetScanner:
         file_size = path.stat().st_size
         map_type = detect_texture_map_type(path)
         with Image.open(path) as image:
-            working_image = copy_first_frame_preserving_alpha(image)
-            width, height = working_image.size
-            mode = working_image.mode
+            prepare_image_header_preserving_alpha(image)
+            width, height = image.size
+            mode = image.mode
             frame_count = getattr(image, "n_frames", 1)
-            has_alpha = image_has_alpha(working_image)
+            has_alpha = image_has_alpha(image)
             format_name = (image.format or path.suffix.removeprefix(".")).upper()
-            alpha_fully_opaque = False
-            if has_alpha and "A" in working_image.getbands():
-                alpha_min, alpha_max = working_image.getchannel("A").getextrema()
-                alpha_fully_opaque = alpha_min == 255 and alpha_max == 255
 
         warnings: list[str] = []
         if width <= 0 or height <= 0:
@@ -115,8 +140,6 @@ class AssetScanner:
             warnings.append("CMYK требует проверки перед экспортом")
         if frame_count > 1:
             warnings.append("Будет использован только первый кадр/слой")
-        if alpha_fully_opaque:
-            warnings.append("Альфа-канал есть, но полностью непрозрачный")
         if file_size > 128 * 1024 * 1024:
             warnings.append("Очень большой файл")
         if file_size <= 0:
@@ -132,6 +155,27 @@ class AssetScanner:
             map_type=map_type,
             frame_count=frame_count,
             warnings=tuple(warnings),
+            alpha_fully_opaque=None if has_alpha else False,
+        )
+
+    def analyze_alpha(self, path: Path, metadata: AssetMetadata) -> AssetMetadata:
+        if metadata.alpha_fully_opaque is not None:
+            return metadata
+        fully_opaque = False
+        with Image.open(path) as image:
+            working_image = copy_first_frame_preserving_alpha(image)
+            if image_has_alpha(working_image):
+                alpha = working_image.convert("RGBA").getchannel("A")
+                alpha_min, alpha_max = alpha.getextrema()
+                fully_opaque = alpha_min == 255 and alpha_max == 255
+        warning = "Альфа-канал есть, но полностью непрозрачный"
+        warnings = tuple(item for item in metadata.warnings if item != warning)
+        if fully_opaque:
+            warnings = (*warnings, warning)
+        return replace(
+            metadata,
+            warnings=warnings,
+            alpha_fully_opaque=fully_opaque,
         )
 
     @staticmethod

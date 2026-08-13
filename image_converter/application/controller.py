@@ -7,7 +7,6 @@ from PyQt6.QtCore import QObject, QThread
 from image_converter.application.worker import BatchConversionWorker
 from image_converter.domain.errors import ValidationError
 from image_converter.domain.models import BatchSummary, ConversionStatus, QueueStatus
-from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.validation import validate_request
 from image_converter.ui.main_window import MainWindow
@@ -18,31 +17,16 @@ class ConversionController(QObject):
         super().__init__(window)
         self._window = window
         self._service = service
-        self._scanner = AssetScanner()
         self._thread: QThread | None = None
         self._worker: BatchConversionWorker | None = None
 
         self._window.convert_requested.connect(self.start_conversion)
-        self._window.queue_paths_received.connect(self.add_paths_to_queue)
 
     def add_paths_to_queue(self, raw_paths: list[str]) -> None:
-        paths = [Path(raw_path) for raw_path in raw_paths]
-        scan_result = self._scanner.scan_paths(
-            paths,
-            recursive=self._window.queue_recursive_enabled(),
-        )
-        self._window.add_queue_items(list(scan_result.items))
-
-        for message in scan_result.ignored_messages:
-            self._window.append_log(message)
-
-        if scan_result.items:
-            self._window.set_status(f"Добавлено в очередь: {len(scan_result.items)}")
-        elif scan_result.ignored_messages:
-            self._window.set_status("Поддерживаемые файлы не найдены")
+        self._window._request_queue_scan(raw_paths)
 
     def start_conversion(self) -> None:
-        if self._thread is not None:
+        if self._thread is not None or self._window.is_running():
             return
 
         request = self._window.build_request()
@@ -53,6 +37,9 @@ class ConversionController(QObject):
             return
 
         if request.options.delete_source and not self._window.confirm_delete_sources():
+            return
+        if not self._window.job_coordinator.try_acquire_exclusive(self):
+            self._window.set_status("Другая операция экспорта или конвертации ещё выполняется.")
             return
 
         self._window.clear_log()
@@ -109,5 +96,6 @@ class ConversionController(QObject):
         )
 
     def _reset_worker_state(self) -> None:
+        self._window.job_coordinator.release_exclusive(self)
         self._thread = None
         self._worker = None

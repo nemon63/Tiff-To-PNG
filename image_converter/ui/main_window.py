@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QItemSelectionModel, QMimeData, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QByteArray, QItemSelectionModel, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
     QColor,
-    QDrag,
     QDragEnterEvent,
     QDropEvent,
     QFont,
@@ -22,6 +22,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDockWidget,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -54,7 +55,7 @@ from image_converter.domain.models import (
     QueueStatus,
     TextureMapType,
 )
-from image_converter.domain.node_graph import NodeType
+from image_converter.domain.node_graph import GraphNode, NodeType
 from image_converter.domain.errors import ValidationError
 from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.colorspace import (
@@ -65,6 +66,22 @@ from image_converter.services.colorspace import (
 )
 from image_converter.services.conversion import BatchConversionService
 from image_converter.services.node_graph_executor import NodeGraphExecutor
+from image_converter.application.graph_export import (
+    GraphBatchExportRequest,
+    GraphBatchExportResult,
+    GraphBatchExportTask,
+    GraphExportController,
+    GraphExportRequest,
+)
+from image_converter.application.asset_scan import (
+    AlphaAnalysisController,
+    AlphaAnalysisRequest,
+    AssetScanController,
+    AssetScanRequest,
+    file_revision,
+)
+from image_converter.application.thumbnail import ThumbnailController
+from image_converter.application.job_coordinator import ApplicationJobCoordinator
 from image_converter.services.packing import (
     build_channel_pack_jobs,
     packed_source_map_types,
@@ -79,45 +96,15 @@ from image_converter.ui.common import (
     _map_type_label,
     _queue_status_display,
     _status_colors,
+    _qimage_from_pil,
 )
+from image_converter.ui.asset_browser import AssetTableWidget
 from image_converter.ui.inspector import MetadataPanel
 from image_converter.ui.log_panel import LogPanel
 from image_converter.ui.node_editor import GraphWorkspace
 from image_converter.ui.preview import DetachedPreviewWindow, PreviewPanel
 from image_converter.ui.queue_panel import QueuePanel
 from image_converter.ui.settings_panel import SettingsPanel
-
-
-class AssetTableWidget(QTableWidget):
-    asset_dropped = pyqtSignal(str)
-    remove_requested = pyqtSignal()
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setDragEnabled(True)
-        self.setAcceptDrops(False)
-
-    def startDrag(self, supported_actions: Qt.DropAction) -> None:
-        item = self.currentItem()
-        if item is None:
-            return
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if not path:
-            return
-        mime_data = QMimeData()
-        mime_data.setData("application/x-texture-path", str(path).encode("utf-8"))
-        mime_data.setText(str(path))
-        mime_data.setUrls([QUrl.fromLocalFile(str(path))])
-        drag = QDrag(self)
-        drag.setMimeData(mime_data)
-        drag.exec(Qt.DropAction.CopyAction)
-
-    def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Delete:
-            self.remove_requested.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -128,6 +115,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._is_running = False
         self._queue_items: list[QueueItem] = []
+        self._path_key_cache: OrderedDict[str, str] = OrderedDict()
         self._queue_row_items: list[QueueItem | None] = []
         self._asset_rows: list[QueueItem] = []
         self._preset_repository: PresetRepository | None = None
@@ -142,11 +130,25 @@ class MainWindow(QMainWindow):
         self._graph_batch_export_in_progress = False
         self._graph_auto_watch_status = "Auto Watch Off"
         self._asset_scanner = AssetScanner()
+        self.job_coordinator = ApplicationJobCoordinator(self)
+        self._graph_export_controller = GraphExportController(self)
+        self._asset_scan_controller = AssetScanController(self)
+        self._alpha_analysis_controller = AlphaAnalysisController(self)
+        self._thumbnail_controller = ThumbnailController(self)
+        self._scan_progress_counts: dict[tuple[str, tuple[str, ...]], int] = {}
+        self._pending_scan_items: dict[
+            tuple[str, tuple[str, ...]], tuple[AssetScanRequest, list[QueueItem]]
+        ] = {}
+        self._scan_flush_timer = QTimer(self)
+        self._scan_flush_timer.setSingleShot(True)
+        self._scan_flush_timer.setInterval(50)
+        self._scan_flush_timer.timeout.connect(self._flush_asset_scan_items)
         self.setWindowTitle("Texture Pipeline Workbench")
         self.resize(1280, 820)
         self.setMinimumSize(720, 480)
         self.setAcceptDrops(True)
         self._build_ui()
+        self.queue_paths_received.connect(self._request_queue_scan)
         self.statusBar().showMessage("Готово")
 
     def _build_ui(self) -> None:
@@ -190,6 +192,7 @@ class MainWindow(QMainWindow):
         self.metadata_panel.map_type_override_changed.connect(self._apply_selected_map_type_override)
         self.graph_workspace = GraphWorkspace()
         self.graph_workspace.export_requested.connect(self._export_graph)
+        self.graph_workspace.output_export_requested.connect(self._export_graph_output)
         self.graph_workspace.preview_image_requested.connect(self._show_graph_preview)
         self.graph_workspace.status_message.connect(self.set_status)
         self.graph_workspace.status_message.connect(self.append_log)
@@ -483,6 +486,9 @@ class MainWindow(QMainWindow):
         self.asset_table.setIconSize(QSize(42, 42))
         self.asset_table.itemDoubleClicked.connect(self._preview_selected_asset)
         self.asset_table.remove_requested.connect(self._remove_selected_assets)
+        self.asset_table.verticalScrollBar().valueChanged.connect(
+            self._request_visible_asset_thumbnails
+        )
         layout.addWidget(self.asset_table, 1)
 
         hint = QLabel("Drag an asset into Graph. Double-click opens Preview.")
@@ -569,12 +575,29 @@ class MainWindow(QMainWindow):
                 table_item = QTableWidgetItem(value)
                 table_item.setToolTip(str(item.path))
                 table_item.setData(Qt.ItemDataRole.UserRole, self._queue_key(item.path))
-                if column == 0:
-                    icon = self._asset_thumbnail_icon(item)
-                    if icon is not None:
-                        table_item.setIcon(icon)
                 table.setItem(row, column, table_item)
         self._restore_asset_selection(selected_keys)
+        QTimer.singleShot(0, self._request_visible_asset_thumbnails)
+
+    def _request_visible_asset_thumbnails(self, *_args: object) -> None:
+        table = self.asset_table
+        if not self._asset_rows:
+            return
+        first_row = table.rowAt(0)
+        if first_row < 0:
+            first_row = 0
+        last_row = table.rowAt(max(0, table.viewport().height() - 1))
+        if last_row < 0:
+            last_row = min(len(self._asset_rows) - 1, first_row + 50)
+        first_row = max(0, first_row - 8)
+        last_row = min(len(self._asset_rows) - 1, last_row + 8)
+        for row in range(first_row, last_row + 1):
+            table_item = table.item(row, 0)
+            if table_item is None or not table_item.icon().isNull():
+                continue
+            icon = self._asset_thumbnail_icon(self._asset_rows[row])
+            if icon is not None:
+                table_item.setIcon(icon)
 
     def _add_selected_asset_to_graph(self, *_args: object) -> None:
         item = self._selected_asset_item()
@@ -586,6 +609,7 @@ class MainWindow(QMainWindow):
         item = self._selected_asset_item()
         if item is None:
             return
+        self._request_lazy_alpha_analysis(item)
         self.preview_panel.set_queue_item(item)
         self.preview_dock.show()
         self.preview_dock.raise_()
@@ -601,69 +625,122 @@ class MainWindow(QMainWindow):
             self._add_graph_assets_from_paths([path])
 
     def _add_graph_assets_from_paths(self, raw_paths: list[str]) -> None:
-        paths = [Path(raw_path) for raw_path in raw_paths]
-        scan_result = self._asset_scanner.scan_paths(
-            paths,
-            recursive=self.queue_recursive_enabled(),
+        self._asset_scan_controller.submit(
+            AssetScanRequest(
+                target="graph",
+                paths=tuple(Path(raw_path) for raw_path in raw_paths),
+                recursive=self.queue_recursive_enabled(),
+            )
         )
-        existing_assets = list(self.graph_workspace.assets())
-        existing_index = {self._queue_key(item.path): index for index, item in enumerate(existing_assets)}
-        for item in scan_result.items:
-            key = self._queue_key(item.path)
-            if key in existing_index:
-                existing_assets[existing_index[key]] = item
-            else:
-                existing_assets.append(item)
-        existing_assets.sort(key=lambda item: str(item.path).lower())
-        self.graph_workspace.set_assets(existing_assets)
-        self._render_asset_browser()
-        self._refresh_graph_apply_preflight()
 
-        for message in scan_result.ignored_messages:
+    def _request_queue_scan(self, raw_paths: list[str]) -> None:
+        self._asset_scan_controller.submit(
+            AssetScanRequest(
+                target="queue",
+                paths=tuple(Path(raw_path) for raw_path in raw_paths),
+                recursive=self.queue_recursive_enabled(),
+            )
+        )
+
+    def on_asset_scan_item(self, request: AssetScanRequest, item: QueueItem) -> None:
+        self.on_asset_scan_items(request, (item,))
+
+    def on_asset_scan_items(
+        self,
+        request: AssetScanRequest,
+        items: object,
+    ) -> None:
+        batch = [item for item in items if isinstance(item, QueueItem)]
+        if not batch:
+            return
+        key = request.coalesce_key
+        self._scan_progress_counts[key] = self._scan_progress_counts.get(key, 0) + len(batch)
+        pending = self._pending_scan_items.get(key)
+        if pending is None:
+            self._pending_scan_items[key] = (request, batch)
+        else:
+            pending[1].extend(batch)
+        if not self._scan_flush_timer.isActive():
+            self._scan_flush_timer.start()
+        self.set_status(f"Сканирование: найдено {self._scan_progress_counts[key]}")
+
+    def _flush_asset_scan_items(self) -> None:
+        pending_items = tuple(self._pending_scan_items.values())
+        self._pending_scan_items.clear()
+        for request, items in pending_items:
+            if request.target == "queue":
+                self.add_queue_items(items)
+            elif request.target == "graph":
+                assets = list(self.graph_workspace.assets())
+                index = {
+                    self._queue_key(asset.path): offset
+                    for offset, asset in enumerate(assets)
+                }
+                for item in items:
+                    item_key = self._queue_key(item.path)
+                    if item_key in index:
+                        assets[index[item_key]] = item
+                    else:
+                        index[item_key] = len(assets)
+                        assets.append(item)
+                assets.sort(key=lambda asset: str(asset.path).lower())
+                self.graph_workspace.set_assets(assets)
+                self._render_asset_browser()
+                self._refresh_graph_apply_preflight()
+            elif request.target == "reload":
+                for item in items:
+                    self._apply_reloaded_asset(item)
+
+    def on_asset_scan_finished(self, request: AssetScanRequest, result: object) -> None:
+        self._flush_asset_scan_items()
+        count = self._scan_progress_counts.pop(request.coalesce_key, 0)
+        for message in getattr(result, "ignored_messages", ()):
             self.append_log(message)
+        if request.target == "reload":
+            self.graph_workspace.refresh_asset_paths(request.paths)
+            self._render_queue()
+            self._render_asset_browser()
+            self._sync_workspace_selection()
+            self._refresh_graph_apply_preflight()
+        if count:
+            label = "Graph Assets" if request.target == "graph" else "очередь"
+            self.set_status(f"Добавлено/обновлено в {label}: {count}")
+        else:
+            self.set_status("Поддерживаемые файлы не найдены")
 
-        if scan_result.items:
-            self.set_status(f"Добавлено в Graph Assets: {len(scan_result.items)}")
-        elif scan_result.ignored_messages:
-            self.set_status("Поддерживаемые файлы для Graph не найдены")
+    def on_asset_scan_failed(self, request: AssetScanRequest, message: str) -> None:
+        self._flush_asset_scan_items()
+        self._scan_progress_counts.pop(request.coalesce_key, None)
+        self.append_log(f"Scan error: {message}")
+        self.set_status("Ошибка сканирования")
+
+    def _apply_reloaded_asset(self, refreshed: QueueItem) -> None:
+        queue_item = self._find_queue_item(refreshed.path)
+        if queue_item is not None:
+            refreshed.source = queue_item.source
+            refreshed.output_path = self._build_output_path(refreshed.batch_source)
+            queue_item.asset_kind = refreshed.asset_kind
+            queue_item.metadata = refreshed.metadata
+            queue_item.status = refreshed.status
+            queue_item.message = refreshed.message
+            queue_item.output_path = refreshed.output_path
+        assets = list(self.graph_workspace.assets())
+        for index, asset in enumerate(assets):
+            if self._queue_key(asset.path) != self._queue_key(refreshed.path):
+                continue
+            if queue_item is not None:
+                assets[index] = queue_item
+            else:
+                refreshed.source = asset.source
+                assets[index] = refreshed
+        self.graph_workspace.set_assets(assets)
 
     def _reload_selected_asset(self) -> None:
         items = self._selected_asset_items()
         if not items:
             return
         paths = [item.path for item in items]
-        preview_item = self.preview_panel.current_queue_item()
-        preview_key = self._queue_key(preview_item.path) if preview_item is not None else None
-        reloaded_keys = {self._queue_key(path) for path in paths}
         self._reload_assets_for_paths(tuple(paths), source_label="Reload")
-        graph_assets = list(self.graph_workspace.assets())
-        refreshed_graph_assets: list[QueueItem] = []
-        for asset in graph_assets:
-            key = self._queue_key(asset.path)
-            if key not in reloaded_keys:
-                refreshed_graph_assets.append(asset)
-                continue
-            queue_item = self._find_queue_item(asset.path)
-            if queue_item is not None:
-                refreshed_graph_assets.append(queue_item)
-                continue
-            refreshed_graph_assets.append(self._scan_single_queue_item(asset.path, asset.batch_source))
-        self.graph_workspace.set_assets(refreshed_graph_assets)
-        self.graph_workspace.refresh_asset_paths(paths)
-        self._render_asset_browser()
-        self._refresh_graph_apply_preflight()
-        if preview_key in reloaded_keys:
-            refreshed_item = next(
-                (
-                    asset
-                    for asset in self.graph_workspace.assets()
-                    if self._queue_key(asset.path) == preview_key
-                ),
-                None,
-            )
-            if refreshed_item is not None:
-                self.preview_panel.set_queue_item(refreshed_item)
-        self.set_status(f"Reloaded assets: {len(paths)}")
 
     def _remove_selected_assets(self) -> None:
         selected_items = self._selected_asset_items()
@@ -681,19 +758,22 @@ class MainWindow(QMainWindow):
         self.set_status(f"Удалено ассетов из Graph: {len(selected_items)}")
 
     def _asset_thumbnail_icon(self, item: QueueItem) -> QIcon | None:
-        if not item.path.exists():
+        image = self._thumbnail_controller.request(item.path)
+        if image is None:
             return None
-        pixmap = QPixmap(str(item.path))
-        if pixmap.isNull():
-            return None
-        return QIcon(
-            pixmap.scaled(
-                42,
-                42,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        return QIcon(QPixmap.fromImage(_qimage_from_pil(image)))
+
+    def on_asset_thumbnail_ready(self, path: Path, image: object) -> None:
+        if not hasattr(image, "tobytes"):
+            return
+        key = self._queue_key(path)
+        icon = QIcon(QPixmap.fromImage(_qimage_from_pil(image)))
+        for row, item in enumerate(self._asset_rows):
+            if self._queue_key(item.path) != key:
+                continue
+            table_item = self.asset_table.item(row, 0)
+            if table_item is not None:
+                table_item.setIcon(icon)
 
     def _show_graph_preview(self, image, title: str, meta: str, node_id: str) -> None:
         preserve_zoom = self.preview_panel.current_graph_preview_node_id() == node_id
@@ -787,10 +867,16 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event: QDropEvent) -> None:
         paths = _extract_local_paths(event)
         if paths:
-            self.queue_paths_received.emit(paths)
+            self._route_dropped_paths(paths)
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+    def _route_dropped_paths(self, paths: list[str]) -> None:
+        if self._workspace_mode == WORKSPACE_GRAPH:
+            self._add_graph_assets_from_paths(paths)
+            return
+        self.queue_paths_received.emit(paths)
 
     def build_request(self) -> BatchRequest:
         request = self.settings_panel.build_request()
@@ -899,6 +985,60 @@ class MainWindow(QMainWindow):
         if hasattr(self, "auto_export_button"):
             self.auto_export_button.setEnabled(not running)
 
+    def is_running(self) -> bool:
+        return self._is_running
+
+    def set_graph_job_running(self, running: bool) -> None:
+        self._graph_export_in_progress = running
+        self._graph_batch_export_in_progress = running
+        self.set_running(running)
+        self.graph_workspace.set_graph_editing_enabled(not running)
+
+    def on_graph_job_finished(self, request: object, result: object) -> None:
+        if isinstance(request, GraphExportRequest) and hasattr(result, "as_text"):
+            summary_text = result.as_text()
+            self.append_log(summary_text)
+            self.set_status(summary_text)
+            if request.show_dialogs:
+                if result.failed:
+                    self.show_error(request.label, summary_text)
+                elif result.succeeded:
+                    self.show_info(request.label, summary_text)
+            else:
+                self._update_graph_watch_status(summary_text)
+            return
+        if isinstance(request, GraphBatchExportRequest) and isinstance(result, GraphBatchExportResult):
+            for paths, summary in result.groups:
+                if summary.failed:
+                    status = QueueStatus.ERROR
+                elif summary.skipped and not summary.succeeded:
+                    status = QueueStatus.SKIPPED
+                else:
+                    status = QueueStatus.DONE
+                for path in paths:
+                    item = self._find_queue_item(path)
+                    if item is not None:
+                        item.status = status
+                        item.message = summary.as_text()
+            self._render_queue()
+            self._sync_workspace_selection()
+            summary_text = result.as_text()
+            self.append_log(summary_text)
+            self.set_status(summary_text)
+            if result.failed:
+                self.show_error(request.label, summary_text)
+            else:
+                self.show_info(request.label, summary_text)
+
+    def on_graph_job_failed(self, request: object, message: str) -> None:
+        label = getattr(request, "label", "Graph export")
+        self.append_log(f"ERROR: {message}")
+        self.set_status(f"{label}: error")
+        if isinstance(request, GraphExportRequest) and not request.show_dialogs:
+            self._update_graph_watch_status(f"Auto Export error: {message}")
+        else:
+            self.show_error(label, message)
+
     def append_log(self, line: str) -> None:
         self.log_panel.append_line(line)
 
@@ -994,6 +1134,22 @@ class MainWindow(QMainWindow):
                 if self.graph_workspace.has_unsaved_changes():
                     event.ignore()
                     return
+        background_jobs_stopped = all(
+            (
+                self._asset_scan_controller.shutdown(wait_ms=100),
+                self._alpha_analysis_controller.shutdown(wait_ms=100),
+                self._thumbnail_controller.shutdown(wait_ms=100),
+                self.preview_panel.shutdown_background_jobs(wait_ms=100),
+                self.preview_window.shutdown_background_jobs(wait_ms=100),
+                self.graph_workspace.shutdown_background_jobs(wait_ms=100),
+            )
+        )
+        if not background_jobs_stopped:
+            self.set_status(
+                "Завершение фоновых операций... Закройте окно после их завершения."
+            )
+            event.ignore()
+            return
         self.preview_window.hide()
         super().closeEvent(event)
 
@@ -1158,10 +1314,19 @@ class MainWindow(QMainWindow):
         return None
 
     def _queue_key(self, path: Path) -> str:
+        raw_path = str(path)
+        cached = self._path_key_cache.get(raw_path)
+        if cached is not None:
+            self._path_key_cache.move_to_end(raw_path)
+            return cached
         try:
-            return str(path.resolve()).lower()
+            key = str(path.resolve(strict=False)).casefold()
         except OSError:
-            return str(path).lower()
+            key = raw_path.casefold()
+        self._path_key_cache[raw_path] = key
+        while len(self._path_key_cache) > 4096:
+            self._path_key_cache.popitem(last=False)
+        return key
 
     def _build_output_path(self, source: BatchSource) -> Path:
         options = self.settings_panel.build_conversion_options()
@@ -1580,10 +1745,47 @@ class MainWindow(QMainWindow):
 
     def _sync_workspace_selection(self) -> None:
         item = self._selected_queue_item()
+        self._request_lazy_alpha_analysis(item)
         self.metadata_panel.set_queue_item(item)
         self.preview_panel.set_queue_item(item)
         if self.preview_window.isVisible():
             self.preview_window.set_queue_item(item)
+
+    def _request_lazy_alpha_analysis(self, item: QueueItem | None) -> None:
+        if item is None or item.metadata is None:
+            return
+        if item.metadata.alpha_fully_opaque is not None:
+            return
+        self._alpha_analysis_controller.submit(
+            AlphaAnalysisRequest(item.path, item.metadata)
+        )
+
+    def on_alpha_analysis_finished(
+        self,
+        request: AlphaAnalysisRequest,
+        metadata: object,
+    ) -> None:
+        if not hasattr(metadata, "alpha_fully_opaque"):
+            return
+        if request.revision != file_revision(request.path):
+            return
+        affected: list[QueueItem] = []
+        for item in (*self._queue_items, *self.graph_workspace.assets()):
+            if self._queue_key(item.path) != self._queue_key(request.path):
+                continue
+            item.metadata = metadata
+            item.message = "; ".join(metadata.warnings)
+            affected.append(item)
+        if affected:
+            self._render_queue()
+            self._render_asset_browser()
+            self._refresh_packing_preflight()
+            self._refresh_graph_apply_preflight()
+            selected = self._selected_queue_item()
+            self.metadata_panel.set_queue_item(selected)
+
+    def on_alpha_analysis_failed(self, request: AlphaAnalysisRequest, message: str) -> None:
+        self.append_log(f"Alpha analysis failed for {request.path.name}: {message}")
 
     def _open_selected_preview_window(self, *_args: object) -> None:
         item = self._selected_queue_item()
@@ -1615,8 +1817,18 @@ class MainWindow(QMainWindow):
     def _export_graph(self) -> None:
         self._export_graph_with_feedback(show_dialogs=True)
 
-    def _export_graph_with_feedback(self, *, show_dialogs: bool) -> None:
-        if self._graph_export_in_progress:
+    def _export_graph_output(self, output_node: GraphNode) -> None:
+        self._export_graph_with_feedback(show_dialogs=True, output_node=output_node)
+
+    def _export_graph_with_feedback(
+        self,
+        *,
+        show_dialogs: bool,
+        output_node: GraphNode | None = None,
+    ) -> None:
+        if self._is_running and not self._graph_export_controller.is_running:
+            return
+        if self._graph_export_controller.is_running and show_dialogs:
             return
         request = self.settings_panel.build_request()
         output_root = request.output_root
@@ -1626,11 +1838,26 @@ class MainWindow(QMainWindow):
             else:
                 output_root = Path.cwd() / "graph_exports"
         export_options = request.options
-        existing_paths = [
-            path
-            for path in self.graph_workspace.export_destinations(output_root)
-            if path.exists()
-        ]
+        executor = NodeGraphExecutor()
+        if output_node is None:
+            plan = executor.plan_enabled_outputs(self.graph_workspace.project.graph, output_root)
+        else:
+            plan = executor.plan_outputs(
+                self.graph_workspace.project.graph,
+                (output_node,),
+                output_root,
+            )
+        if not plan.is_valid:
+            message = plan.collision_message()
+            self.append_log(f"ERROR: {message}")
+            self.set_status("Graph export blocked: output path collision.")
+            if show_dialogs:
+                self.show_error("Graph export", message)
+            else:
+                self._update_graph_watch_status("Auto Export blocked: path collision")
+            return
+        destinations = [item.destination for item in plan.items]
+        existing_paths = [path for path in destinations if path.exists()]
         if show_dialogs and existing_paths and not request.options.overwrite:
             preview_lines = "\n".join(f"- {path.name}" for path in existing_paths[:5])
             if len(existing_paths) > 5:
@@ -1653,25 +1880,20 @@ class MainWindow(QMainWindow):
         elif not show_dialogs and not request.options.overwrite:
             export_options = replace(request.options, overwrite=True)
 
-        self.append_log("---- Graph export ----")
-        self._graph_export_in_progress = True
-        try:
-            summary = self.graph_workspace.export_graph(
-                output_root,
-                export_options,
-                self.append_log,
+        export_label = "Graph export" if output_node is None else f"Output export: {output_node.title}"
+        self.append_log(f"---- {export_label} ----")
+        snapshot = deepcopy(self.graph_workspace.project)
+        self._graph_export_controller.submit(
+            GraphExportRequest(
+                project=snapshot,
+                output_root=Path(output_root),
+                options=export_options,
+                output_node_id=output_node.node_id if output_node is not None else None,
+                label=export_label,
+                show_dialogs=show_dialogs,
+                auto_export=not show_dialogs,
             )
-        finally:
-            self._graph_export_in_progress = False
-        self.append_log(summary.as_text())
-        self.set_status(summary.as_text())
-        if show_dialogs:
-            if summary.failed:
-                self.show_error("Graph export", summary.as_text())
-            elif summary.succeeded:
-                self.show_info("Graph export", summary.as_text())
-        else:
-            self._update_graph_watch_status(summary.as_text())
+        )
 
     def _toggle_graph_auto_watch(self, checked: bool) -> None:
         self._set_graph_auto_watch_enabled(bool(checked))
@@ -1713,51 +1935,16 @@ class MainWindow(QMainWindow):
         normalized_paths = [Path(path) for path in paths if str(path).strip()]
         if not normalized_paths:
             return
-        changed_keys = {self._queue_key(path) for path in normalized_paths}
-        preview_item = self.preview_panel.current_queue_item()
-        preview_key = self._queue_key(preview_item.path) if preview_item is not None else None
-        updated = False
         for path in normalized_paths:
-            queue_item = self._find_queue_item(path)
-            if queue_item is None:
-                continue
-            try:
-                refreshed = self._scan_single_queue_item(path, queue_item.batch_source)
-            except Exception as exc:
-                queue_item.status = QueueStatus.ERROR
-                queue_item.metadata = None
-                queue_item.message = str(exc)
-            else:
-                refreshed.output_path = self._build_output_path(refreshed.batch_source)
-                queue_item.asset_kind = refreshed.asset_kind
-                queue_item.metadata = refreshed.metadata
-                queue_item.status = refreshed.status
-                queue_item.message = refreshed.message
-            updated = True
-
-        self.graph_workspace.refresh_asset_paths(normalized_paths)
-        if updated:
-            self._render_queue()
-            self._render_asset_browser()
-            self._refresh_packing_preflight()
-            self._refresh_graph_apply_preflight()
-            self._sync_status_bar_with_selection()
-            selected_item = self._selected_queue_item()
-            self.metadata_panel.set_queue_item(selected_item)
-            if self.preview_window.isVisible():
-                self.preview_window.set_queue_item(selected_item)
-        if preview_key in changed_keys:
-            refreshed_item = next(
-                (
-                    queue_item
-                    for queue_item in self._queue_items
-                    if self._queue_key(queue_item.path) == preview_key
-                ),
-                None,
+            self._thumbnail_controller.invalidate(path)
+        self.set_status(f"{source_label}: scanning {len(normalized_paths)} asset(s)...")
+        self._asset_scan_controller.submit(
+            AssetScanRequest(
+                target="reload",
+                paths=tuple(normalized_paths),
+                recursive=False,
             )
-            if refreshed_item is not None:
-                self.preview_panel.set_queue_item(refreshed_item)
-        self.set_status(f"{source_label}: reloaded assets {len(normalized_paths)}")
+        )
 
     def _scan_single_queue_item(self, path: Path, batch_source: BatchSource) -> QueueItem:
         return self._asset_scanner._build_queue_item(batch_source)
@@ -1832,74 +2019,38 @@ class MainWindow(QMainWindow):
             )
             return
 
+        tasks: list[GraphBatchExportTask] = []
+        for group_items in grouped_items.values():
+            mapping = {
+                item.effective_map_type: item.path
+                for item in group_items
+                if item.effective_map_type is not TextureMapType.UNKNOWN
+            }
+            output_prefix = self._graph_export_prefix_for_group(group_items)
+            export_root = self._graph_export_root_for_group(group_items, request.output_root)
+            tasks.append(
+                GraphBatchExportTask(
+                    output_root=Path(export_root),
+                    source_paths=tuple(item.path for item in group_items),
+                    label=output_prefix,
+                    texture_mapping=tuple(mapping.items()),
+                    output_prefix=output_prefix,
+                )
+            )
+
         self.clear_log()
         self.append_log("---- Применение графа к очереди ----")
         self.set_status("Применение graph template к очереди...")
-        self.set_running(True)
         self.reset_queue_statuses_for_run()
-        self._graph_batch_export_in_progress = True
         self.log_dock.show()
-
-        executor = NodeGraphExecutor()
-        total_outputs = 0
-        succeeded = 0
-        skipped = 0
-        failed = 0
-
-        try:
-            for group_items in grouped_items.values():
-                mapping = {
-                    item.effective_map_type: item.path
-                    for item in group_items
-                    if item.effective_map_type is not TextureMapType.UNKNOWN
-                }
-                output_prefix = self._graph_export_prefix_for_group(group_items)
-                export_root = self._graph_export_root_for_group(group_items, request.output_root)
-                project = self.graph_workspace.clone_project_with_texture_mapping(
-                    mapping,
-                    output_prefix=output_prefix,
-                )
-                self.append_log(f"-- Набор: {output_prefix} ({len(group_items)} файлов)")
-                summary = executor.export_enabled_outputs(
-                    project,
-                    export_root,
-                    request.options,
-                    logger=self.append_log,
-                )
-                total_outputs += summary.total
-                succeeded += summary.succeeded
-                skipped += summary.skipped
-                failed += summary.failed
-
-                if summary.failed:
-                    group_status = QueueStatus.ERROR
-                elif summary.skipped and not summary.succeeded:
-                    group_status = QueueStatus.SKIPPED
-                else:
-                    group_status = QueueStatus.DONE
-                group_message = summary.as_text()
-                for item in group_items:
-                    item.status = group_status
-                    item.message = group_message
-
-                self._render_queue()
-                self._sync_workspace_selection()
-                self.repaint()
-        finally:
-            self._graph_batch_export_in_progress = False
-            self.set_running(False)
-
-        summary_text = (
-            f"Graph batch export: наборов={len(grouped_items)}, "
-            f"outputs={total_outputs}, успешно={succeeded}, "
-            f"пропущено={skipped}, ошибок={failed}"
+        self._graph_export_controller.submit(
+            GraphBatchExportRequest(
+                project=deepcopy(self.graph_workspace.project),
+                tasks=tuple(tasks),
+                options=request.options,
+                label="Применить граф к очереди",
+            )
         )
-        self.append_log(summary_text)
-        self.set_status(summary_text)
-        if failed:
-            self.show_error("Применить граф к очереди", summary_text)
-        else:
-            self.show_info("Применить граф к очереди", summary_text)
 
     def _group_queue_items_for_batch_graph(
         self,

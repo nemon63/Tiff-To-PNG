@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
 
 from image_converter.domain.models import PreviewChannel, QueueItem, QueueStatus
 from image_converter.services.colorspace import recommended_colorspace_for_map_type
-from image_converter.services.preview import TexturePreviewService
+from image_converter.application.preview_render import TexturePreviewController
 from image_converter.ui.common import (
     _colorspace_label,
     _map_type_label,
@@ -297,7 +297,10 @@ class PreviewCanvas(QFrame):
 class PreviewPanel(QWidget):
     def __init__(self, parent: QWidget | None = None, *, allow_detach: bool = True):
         super().__init__(parent)
-        self._preview_service = TexturePreviewService()
+        self._preview_controller = TexturePreviewController(self)
+        self._preview_controller.ready.connect(self._on_preview_ready)
+        self._preview_controller.failed.connect(self._on_preview_failed)
+        self._preview_generation = 0
         self._current_item: QueueItem | None = None
         self._graph_preview_image: Image.Image | None = None
         self._graph_preview_title = ""
@@ -425,6 +428,7 @@ class PreviewPanel(QWidget):
         node_id: str = "",
         preserve_zoom: bool = False,
     ) -> None:
+        self._preview_controller.invalidate()
         same_node = bool(node_id) and node_id == self._graph_preview_node_id
         self._current_item = None
         self._graph_preview_image = image.convert("RGBA").copy()
@@ -485,35 +489,51 @@ class PreviewPanel(QWidget):
     def _refresh_preview(self) -> None:
         item = self._current_item
         if item is None:
+            self._preview_controller.invalidate()
             self.preview_canvas.clear_preview()
             self._update_footer(item)
             self._sync_control_state(False)
             return
 
         if item.status is QueueStatus.ERROR:
+            self._preview_controller.invalidate()
             self.preview_canvas.clear_preview("Предпросмотр недоступен для поврежденного или неподдерживаемого файла.")
             self._update_footer(item)
             self._sync_control_state(False)
             return
 
         if not self._available_channels(item):
+            self._preview_controller.invalidate()
             self.preview_canvas.clear_preview("Нет доступных каналов для предпросмотра.")
             self._update_footer(item)
             self._sync_control_state(False)
             return
 
-        try:
-            preview_image = self._preview_service.render(item.path, self._selected_channel)
-            preview_pixmap = QPixmap.fromImage(_qimage_from_pil(preview_image))
-            self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=True)
-        except Exception as exc:
-            self.preview_canvas.clear_preview(f"Ошибка предпросмотра: {exc}")
-            self._sync_control_state(False)
-            self._update_footer(item)
-            return
-
-        self._sync_control_state(True)
+        self.preview_canvas.clear_preview("Загрузка preview...")
+        self._preview_generation = self._preview_controller.request(
+            item.path,
+            self._selected_channel,
+            max_size=512,
+        )
+        self._sync_control_state(False)
         self._update_footer(item)
+
+    def _on_preview_ready(self, generation: int, image: object) -> None:
+        if (
+            generation != self._preview_generation
+            or generation != self._preview_controller.generation
+            or not isinstance(image, Image.Image)
+        ):
+            return
+        preview_pixmap = QPixmap.fromImage(_qimage_from_pil(image))
+        self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=True)
+        self._sync_control_state(True)
+
+    def _on_preview_failed(self, generation: int, message: str) -> None:
+        if generation != self._preview_generation or generation != self._preview_controller.generation:
+            return
+        self.preview_canvas.clear_preview(f"Ошибка предпросмотра: {message}")
+        self._sync_control_state(False)
 
     def _update_footer(self, item: QueueItem | None) -> None:
         if item is None:
@@ -659,6 +679,22 @@ class PreviewPanel(QWidget):
     def sizeHint(self) -> QSize:
         return QSize(360, 520)
 
+    def background_job_running(self) -> bool:
+        detached_running = (
+            self._detached_window is not None
+            and self._detached_window.background_job_running()
+        )
+        return self._preview_controller.is_running or detached_running
+
+    def shutdown_background_jobs(self, *, wait_ms: int = 0) -> bool:
+        stopped = self._preview_controller.shutdown(wait_ms=wait_ms)
+        if self._detached_window is not None:
+            stopped = (
+                self._detached_window.shutdown_background_jobs(wait_ms=wait_ms)
+                and stopped
+            )
+        return stopped
+
 
 class DetachedPreviewWindow(QWidget):
     def __init__(self, parent: QWidget | None = None):
@@ -670,7 +706,10 @@ class DetachedPreviewWindow(QWidget):
         self.setMinimumSize(720, 560)
         self._current_item: QueueItem | None = None
         self._selected_channel = PreviewChannel.COMPOSITE
-        self._preview_service = TexturePreviewService()
+        self._preview_controller = TexturePreviewController(self)
+        self._preview_controller.ready.connect(self._on_preview_ready)
+        self._preview_controller.failed.connect(self._on_preview_failed)
+        self._preview_generation = 0
         self._channel_buttons: dict[PreviewChannel, QToolButton] = {}
         self._build_ui()
 
@@ -814,6 +853,7 @@ class DetachedPreviewWindow(QWidget):
     def _refresh_preview(self) -> None:
         item = self._current_item
         if item is None:
+            self._preview_controller.invalidate()
             self.setWindowTitle("Texture Preview")
             self.asset_name_label.setText("Texture Preview")
             self.asset_meta_label.setText(
@@ -825,28 +865,25 @@ class DetachedPreviewWindow(QWidget):
 
         self.setWindowTitle(f"Texture Preview - {item.path.name}")
         if item.status is QueueStatus.ERROR:
+            self._preview_controller.invalidate()
             self.asset_name_label.setText(item.path.name)
             self.asset_meta_label.setText(item.message or "Файл поврежден или не читается.")
             self.preview_canvas.clear_preview("Предпросмотр недоступен для поврежденного или неподдерживаемого файла.")
             self._sync_control_state(False)
             return
 
-        try:
-            preview_image = self._preview_service.render(item.path, self._selected_channel, max_size=None)
-            preview_pixmap = QPixmap.fromImage(_qimage_from_pil(preview_image))
-            self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=True)
-        except Exception as exc:
-            self.asset_name_label.setText(item.path.name)
-            self.asset_meta_label.setText(f"Не удалось отрисовать preview: {exc}")
-            self.preview_canvas.clear_preview(f"Ошибка предпросмотра: {exc}")
-            self._sync_control_state(False)
-            return
+        self.preview_canvas.clear_preview("Загрузка preview...")
+        self._preview_generation = self._preview_controller.request(
+            item.path,
+            self._selected_channel,
+            max_size=max(1024, min(4096, max(self.width(), self.height()) * 2)),
+        )
 
         metadata = item.metadata
         if metadata is None:
             self.asset_name_label.setText(item.path.name)
             self.asset_meta_label.setText("Метаданные недоступны.")
-            self._sync_control_state(True)
+            self._sync_control_state(False)
             return
 
         map_type_name = _map_type_label(item.effective_map_type)
@@ -857,7 +894,25 @@ class DetachedPreviewWindow(QWidget):
         self.asset_meta_label.setText(
             f"{map_type_name}  •  {colorspace_name}  •  {metadata.resolution_text}  •  {metadata.mode}  •  канал: {channel_name}  •  {alpha_state}"
         )
+        self._sync_control_state(False)
+
+    def _on_preview_ready(self, generation: int, image: object) -> None:
+        if (
+            generation != self._preview_generation
+            or generation != self._preview_controller.generation
+            or not isinstance(image, Image.Image)
+        ):
+            return
+        preview_pixmap = QPixmap.fromImage(_qimage_from_pil(image))
+        self.preview_canvas.set_preview_pixmap(preview_pixmap, preserve_zoom=True)
         self._sync_control_state(True)
+
+    def _on_preview_failed(self, generation: int, message: str) -> None:
+        if generation != self._preview_generation or generation != self._preview_controller.generation:
+            return
+        self.asset_meta_label.setText(f"Не удалось отрисовать preview: {message}")
+        self.preview_canvas.clear_preview(f"Ошибка предпросмотра: {message}")
+        self._sync_control_state(False)
 
     def _sync_channel_buttons(self, channels: list[PreviewChannel]) -> None:
         for channel, button in self._channel_buttons.items():
@@ -910,3 +965,9 @@ class DetachedPreviewWindow(QWidget):
     def closeEvent(self, event: QCloseEvent) -> None:
         self.hide()
         event.ignore()
+
+    def background_job_running(self) -> bool:
+        return self._preview_controller.is_running
+
+    def shutdown_background_jobs(self, *, wait_ms: int = 0) -> bool:
+        return self._preview_controller.shutdown(wait_ms=wait_ms)

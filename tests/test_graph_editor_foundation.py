@@ -5,13 +5,14 @@ import json
 import os
 import struct
 import sys
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
 from PIL import Image, ImageFilter
-from PyQt6.QtCore import QEventLoop, QTimer, Qt
+from PyQt6.QtCore import QEventLoop, QObject, QTimer, Qt
 from PyQt6.QtCore import QItemSelectionModel
 from PyQt6.QtWidgets import QApplication, QLabel
 
@@ -39,20 +40,35 @@ from image_converter.domain.node_graph import (
     OutputProfile,
     create_graph_node,
     make_connection_id,
+    socket_definitions,
 )
 from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.conversion import BatchConversionService, ImageConverter
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.map_types import detect_texture_map_type
-from image_converter.services.node_graph_executor import NodeGraphExecutor
+from image_converter.services.node_graph_executor import (
+    GraphExecutionError,
+    NodeGraphExecutor,
+    NodeGraphPreviewCache,
+)
 from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
 from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
 from image_converter.services.presets import SYSTEM_PRESETS
 from image_converter.services.settings import AppSettingsRepository
-from image_converter.ui.graph_commands import AddNodesCommand, ReplaceInputConnectionCommand
+from image_converter.application.graph_export import GraphExportRequest
+from image_converter.application.asset_scan import (
+    AlphaAnalysisRequest,
+    AssetScanRequest,
+    AssetScanWorker,
+    file_revision,
+)
+from image_converter.application.thumbnail import ThumbnailController
+from image_converter.ui.graph_commands import AddNodesCommand, MoveNodesCommand, ReplaceInputConnectionCommand
 from image_converter.ui.main_window import MainWindow
-from image_converter.ui.node_editor import GraphNodeItem, GraphWorkspace
-from image_converter.ui.node_editor import DRAFT_PREVIEW_MAX_SIDE, PREVIEW_MODE_DRAFT, PREVIEW_MODE_FULL, NodePropertiesPanel
+from image_converter.ui.graph_canvas import GraphNodeItem
+from image_converter.ui.node_editor import GraphWorkspace
+from image_converter.ui.node_editor import DRAFT_PREVIEW_MAX_SIDE, PREVIEW_MODE_DRAFT, PREVIEW_MODE_FULL
+from image_converter.ui.node_properties import NodePropertiesPanel
 from image_converter.ui.preview import PreviewPanel
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -146,6 +162,265 @@ class ImageLoadingTests(unittest.TestCase):
 
 
 class NodeGraphExecutorPerformanceTests(unittest.TestCase):
+    def test_output_cannot_overwrite_source_texture(self) -> None:
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.png"
+            Image.new("RGB", (4, 4), (12, 34, 56)).save(source)
+            original_bytes = source.read_bytes()
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(source)},
+            )
+            output = create_graph_node(
+                NodeType.OUTPUT_RGBA,
+                properties={"output_path": str(source)},
+            )
+            graph = NodeGraph(
+                nodes=[texture, output],
+                connections=[
+                    GraphConnection(
+                        make_connection_id(),
+                        texture.node_id,
+                        channel,
+                        output.node_id,
+                        channel,
+                    )
+                    for channel in ("r", "g", "b")
+                ],
+            )
+
+            with self.assertRaises(GraphExecutionError):
+                NodeGraphExecutor().export_enabled_outputs(
+                    NodeGraphProject(graph=graph),
+                    Path(tmp),
+                    ConversionOptions(overwrite=True),
+                )
+
+            self.assertEqual(original_bytes, source.read_bytes())
+
+    def test_failed_atomic_save_preserves_existing_destination(self) -> None:
+        with TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "result.png"
+            destination.write_bytes(b"original")
+
+            def fail_after_partial_write(_image, path, **_kwargs):
+                Path(path).write_bytes(b"partial")
+                raise OSError("simulated write failure")
+
+            with mock.patch.object(
+                Image.Image,
+                "save",
+                autospec=True,
+                side_effect=fail_after_partial_write,
+            ):
+                with self.assertRaises(OSError):
+                    NodeGraphExecutor()._save_output_image(
+                        Image.new("RGBA", (4, 4)),
+                        destination,
+                        ConversionOptions(overwrite=True),
+                    )
+
+            self.assertEqual(b"original", destination.read_bytes())
+            self.assertEqual([], list(destination.parent.glob(f".{destination.name}.*.tmp")))
+
+    def test_asset_scan_worker_emits_bounded_batches(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index in range(130):
+                Image.new("RGB", (1, 1)).save(root / f"asset_{index:03d}.png")
+            request = AssetScanRequest(target="queue", paths=(root,), recursive=False)
+            worker = AssetScanWorker(request)
+            batch_sizes: list[int] = []
+            completed: list[bool] = []
+            worker.items_found.connect(
+                lambda _request, items: batch_sizes.append(len(items))
+            )
+            worker.finished.connect(lambda _request, _result: completed.append(True))
+
+            worker.run()
+
+            self.assertEqual([64, 64, 2], batch_sizes)
+            self.assertEqual([True], completed)
+
+    def test_stale_thumbnail_and_alpha_results_are_discarded(self) -> None:
+        class ThumbnailReceiver(QObject):
+            def __init__(self):
+                super().__init__()
+                self.received: list[Path] = []
+
+            def on_asset_thumbnail_ready(self, path: Path, _image: object) -> None:
+                self.received.append(path)
+
+        with TemporaryDirectory() as tmp:
+            app = _app()
+            source = Path(tmp) / "source.png"
+            Image.new("RGBA", (2, 2), (1, 2, 3, 255)).save(source)
+            receiver = ThumbnailReceiver()
+            thumbnails = ThumbnailController(receiver)
+            stale_key = thumbnails.cache_key(source)
+            self.assertIsNotNone(stale_key)
+            thumbnails._in_flight.add(stale_key)
+            thumbnails._active_key = stale_key
+            old_revision = file_revision(source)
+            Image.new("RGBA", (3, 3), (4, 5, 6, 255)).save(source)
+
+            thumbnails._on_ready(source, stale_key, Image.new("RGBA", (2, 2)))
+
+            self.assertEqual([], receiver.received)
+
+            window = MainWindow()
+            scanned = AssetScanner().scan_paths([source], recursive=False).items[0]
+            window._queue_items = [scanned]
+            original_metadata = scanned.metadata
+            request = AlphaAnalysisRequest(
+                source,
+                original_metadata,
+                revision=old_revision,
+            )
+            analyzed = replace(original_metadata, alpha_fully_opaque=True)
+            try:
+                window.on_alpha_analysis_finished(request, analyzed)
+                self.assertIs(original_metadata, scanned.metadata)
+            finally:
+                window.close()
+                window.deleteLater()
+                app.processEvents()
+
+    def test_export_collision_blocks_all_writes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "source.png"
+            Image.new("RGB", (4, 4), (32, 64, 96)).save(texture_path)
+            texture = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(texture_path)})
+            export_root = Path(tmp) / "exports"
+            outputs = [
+                create_graph_node(
+                    NodeType.OUTPUT_RGBA,
+                    title="Output relative",
+                    properties={"output_path": "nested/../same.png"},
+                ),
+                create_graph_node(
+                    NodeType.OUTPUT_RGBA,
+                    title="Output absolute",
+                    properties={"output_path": str(export_root / "SAME.PNG")},
+                ),
+            ]
+            connections = [
+                GraphConnection(make_connection_id(), texture.node_id, channel, output.node_id, channel)
+                for output in outputs
+                for channel in ("r", "g", "b")
+            ]
+            project = NodeGraphProject(graph=NodeGraph(nodes=[texture, *outputs], connections=connections))
+
+            with self.assertRaises(GraphExecutionError):
+                NodeGraphExecutor().export_enabled_outputs(
+                    project,
+                    export_root,
+                    ConversionOptions(overwrite=True),
+                )
+
+            self.assertFalse((export_root / "same.png").exists())
+
+    def test_preview_cache_enforces_global_budget_and_skips_oversized_entries(self) -> None:
+        cache = NodeGraphPreviewCache(max_bytes=64)
+        first = Image.new("RGBA", (4, 4))
+        second = Image.new("L", (8, 8))
+        oversized = Image.new("RGBA", (5, 5))
+
+        cache.put_image("channel", ("first",), first)
+        cache.put_image("texture-channel", ("second",), second)
+        self.assertIsNone(cache.get_image("channel", ("first",)))
+        self.assertIsNotNone(cache.get_image("texture-channel", ("second",)))
+        self.assertLessEqual(cache.current_bytes, 64)
+
+        cache.put_image("texture-preview", ("oversized",), oversized)
+        self.assertIsNone(cache.get_image("texture-preview", ("oversized",)))
+        self.assertLessEqual(cache.current_bytes, 64)
+
+    def test_asset_header_scan_defers_alpha_extrema(self) -> None:
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "opaque.png"
+            Image.new("RGBA", (8, 8), (20, 40, 60, 255)).save(source)
+            scanner = AssetScanner()
+
+            item = scanner.scan_paths([source], recursive=False).items[0]
+            self.assertIsNone(item.metadata.alpha_fully_opaque)
+            self.assertNotIn("Альфа-канал есть, но полностью непрозрачный", item.metadata.warnings)
+
+            analyzed = scanner.analyze_alpha(source, item.metadata)
+            self.assertTrue(analyzed.alpha_fully_opaque)
+            self.assertIn("Альфа-канал есть, но полностью непрозрачный", analyzed.warnings)
+
+    def test_color_node_exports_solid_rgba_image_at_configured_size(self) -> None:
+        with TemporaryDirectory() as tmp:
+            color = create_graph_node(
+                NodeType.COLOR,
+                properties={
+                    "red": 12,
+                    "green": 34,
+                    "blue": 56,
+                    "alpha": 78,
+                    "width": 3,
+                    "height": 2,
+                },
+            )
+            output = create_graph_node(
+                NodeType.OUTPUT_RGBA,
+                properties={"filename": "solid.png"},
+            )
+            graph = NodeGraph(
+                nodes=[color, output],
+                connections=[
+                    GraphConnection(
+                        make_connection_id(),
+                        color.node_id,
+                        channel,
+                        output.node_id,
+                        channel,
+                    )
+                    for channel in ("r", "g", "b", "a")
+                ],
+            )
+
+            summary = NodeGraphExecutor().export_output(
+                NodeGraphProject(graph=graph),
+                output,
+                Path(tmp),
+                ConversionOptions(overwrite=True),
+            )
+
+            self.assertEqual(1, summary.succeeded)
+            with Image.open(Path(tmp) / "solid.png") as exported:
+                self.assertEqual((3, 2), exported.size)
+                self.assertEqual("RGBA", exported.mode)
+                self.assertEqual((12, 34, 56, 78), exported.getpixel((0, 0)))
+
+    def test_texture_size_takes_priority_over_color_node_size(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "source.png"
+            Image.new("RGB", (5, 4), (10, 20, 30)).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path)},
+            )
+            color = create_graph_node(
+                NodeType.COLOR,
+                properties={"red": 200, "width": 2, "height": 2},
+            )
+            output = create_graph_node(NodeType.OUTPUT_RGBA)
+            graph = NodeGraph(
+                nodes=[texture, color, output],
+                connections=[
+                    GraphConnection(make_connection_id(), color.node_id, "r", output.node_id, "r"),
+                    GraphConnection(make_connection_id(), texture.node_id, "g", output.node_id, "g"),
+                    GraphConnection(make_connection_id(), texture.node_id, "b", output.node_id, "b"),
+                ],
+            )
+
+            image = NodeGraphExecutor().render_output_node(graph, output)
+
+            self.assertEqual((5, 4), image.size)
+            self.assertEqual((200, 20, 30, 255), image.getpixel((0, 0)))
+
     def test_render_output_node_reuses_cached_texture_image_for_multiple_channels(self) -> None:
         with TemporaryDirectory() as tmp:
             texture_path = Path(tmp) / "shared.png"
@@ -244,6 +519,50 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
             self.assertEqual(1, levels_apply.call_count)
             self.assertTrue((Path(tmp) / "packed_a.png").exists())
             self.assertTrue((Path(tmp) / "packed_b.png").exists())
+
+    def test_export_output_exports_only_requested_node_even_when_disabled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "source.png"
+            Image.new("RGB", (4, 4), (32, 96, 160)).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path)},
+            )
+            requested = create_graph_node(
+                NodeType.OUTPUT_RGBA,
+                properties={"filename": "requested.png", "enabled": False},
+            )
+            other = create_graph_node(
+                NodeType.OUTPUT_RGBA,
+                properties={"filename": "other.png", "enabled": True},
+            )
+            connections = []
+            for output in (requested, other):
+                for channel in ("r", "g", "b"):
+                    connections.append(
+                        GraphConnection(
+                            make_connection_id(),
+                            texture.node_id,
+                            channel,
+                            output.node_id,
+                            channel,
+                        )
+                    )
+            project = NodeGraphProject(
+                graph=NodeGraph(nodes=[texture, requested, other], connections=connections)
+            )
+
+            summary = NodeGraphExecutor().export_output(
+                project,
+                requested,
+                Path(tmp),
+                ConversionOptions(overwrite=True),
+            )
+
+            self.assertEqual(1, summary.total)
+            self.assertEqual(1, summary.succeeded)
+            self.assertTrue((Path(tmp) / "requested.png").exists())
+            self.assertFalse((Path(tmp) / "other.png").exists())
 
     def test_channel_operations_keep_expected_values(self) -> None:
         executor = NodeGraphExecutor()
@@ -397,6 +716,64 @@ class NodePropertiesPanelTests(unittest.TestCase):
 
         self.panel.set_node(create_graph_node(NodeType.ERODE_CHANNEL))
         self.assertFalse(self.panel.erode_radius_host.isHidden())
+
+    def test_output_export_button_requests_current_output(self) -> None:
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"enabled": False},
+        )
+        requested = []
+        self.panel.output_export_requested.connect(requested.append)
+
+        self.panel.set_node(output)
+        self.panel.export_output_button.click()
+
+        self.assertEqual([output], requested)
+        self.assertFalse(self.panel.export_output_button.isHidden())
+
+        self.panel.set_node(create_graph_node(NodeType.CONSTANT_CHANNEL))
+        self.assertTrue(self.panel.export_output_button.isHidden())
+
+    def test_color_node_shows_rgba_and_resolution_controls(self) -> None:
+        color = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 10,
+                "green": 20,
+                "blue": 30,
+                "alpha": 40,
+                "width": 512,
+                "height": 256,
+            },
+        )
+        changes = []
+        self.panel.node_changed.connect(
+            lambda _node, _title, properties, _needs_rebuild, _preview_mode: changes.append(properties)
+        )
+
+        self.panel.set_node(color)
+
+        self.assertFalse(self.panel.color_button.isHidden())
+        self.assertFalse(self.panel.color_components_host.isHidden())
+        self.assertFalse(self.panel.color_resolution_host.isHidden())
+        self.assertEqual("#0A141E28", self.panel.color_button.text())
+        self.assertEqual(512, self.panel.color_width_spin.value())
+        self.assertEqual(256, self.panel.color_height_spin.value())
+
+        self.panel.color_red_spin.setValue(99)
+        self.panel._flush_numeric_preview()
+
+        self.assertEqual(99, changes[-1]["red"])
+
+    def test_color_node_has_rgba_outputs_and_defaults(self) -> None:
+        color = create_graph_node(NodeType.COLOR)
+
+        self.assertEqual(
+            ["r", "g", "b", "a"],
+            [socket.socket_id for socket in socket_definitions(color.node_type)],
+        )
+        self.assertEqual(255, color.properties["red"])
+        self.assertEqual(1024, color.properties["width"])
 
 
 class ChannelPackingPlanTests(unittest.TestCase):
@@ -554,11 +931,190 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.workspace = GraphWorkspace()
 
     def tearDown(self) -> None:
+        self.workspace.shutdown_background_jobs(wait_ms=100)
         self.workspace.setParent(None)
         self.workspace.deleteLater()
         self.app.processEvents()
         del self.workspace
         gc.collect()
+
+    def test_move_undo_redo_keeps_scene_items_without_rebuild(self) -> None:
+        node = create_graph_node(NodeType.CONSTANT_CHANNEL, position=(10.0, 20.0))
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [node],
+            ),
+            select_node_ids=[node.node_id],
+        )
+        original_item = self.workspace._scene.node_items[node.node_id]
+
+        with mock.patch.object(self.workspace._scene, "rebuild", wraps=self.workspace._scene.rebuild) as rebuild:
+            self.workspace._push_graph_command(
+                MoveNodesCommand(
+                    self.workspace.project.graph,
+                    self.workspace._on_graph_command_changed,
+                    {node.node_id: (10.0, 20.0)},
+                    {node.node_id: (120.0, 80.0)},
+                ),
+                select_node_ids=[node.node_id],
+            )
+            self.workspace.undo_stack.undo()
+            self.workspace.undo_stack.redo()
+
+        self.assertEqual(0, rebuild.call_count)
+        self.assertIs(original_item, self.workspace._scene.node_items[node.node_id])
+        self.assertEqual((120.0, 80.0), node.position)
+        self.assertTrue(original_item.isSelected())
+
+    def test_graph_export_worker_keeps_gui_event_loop_responsive(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            texture_path = root / "source.png"
+            Image.new("RGB", (1024, 1024), (24, 96, 180)).save(texture_path)
+            texture = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(texture_path)})
+            output = create_graph_node(NodeType.OUTPUT_RGBA, properties={"filename": "result.png"})
+            project = NodeGraphProject(
+                graph=NodeGraph(
+                    nodes=[texture, output],
+                    connections=[
+                        GraphConnection(make_connection_id(), texture.node_id, channel, output.node_id, channel)
+                        for channel in ("r", "g", "b")
+                    ],
+                )
+            )
+            window = MainWindow()
+            loop = QEventLoop()
+            heartbeats: list[int] = []
+            heartbeat = QTimer()
+            heartbeat.setInterval(1)
+            heartbeat.timeout.connect(lambda: heartbeats.append(1))
+            poll = QTimer()
+            poll.setInterval(5)
+            poll.timeout.connect(
+                lambda: loop.quit() if not window._graph_export_controller.is_running else None
+            )
+            try:
+                heartbeat.start()
+                poll.start()
+                window._graph_export_controller.submit(
+                    GraphExportRequest(
+                        project=project,
+                        output_root=root / "exports",
+                        options=ConversionOptions(overwrite=True),
+                        show_dialogs=False,
+                    )
+                )
+                QTimer.singleShot(5000, loop.quit)
+                loop.exec()
+                self.app.processEvents()
+
+                self.assertFalse(window._graph_export_controller.is_running)
+                self.assertTrue((root / "exports" / "result.png").exists())
+                self.assertGreater(len(heartbeats), 0)
+            finally:
+                heartbeat.stop()
+                poll.stop()
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+
+    def test_latest_levels_edit_does_not_reuse_stale_preview_cache(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "source.png"
+            Image.new("RGB", (8, 8), (128, 128, 128)).save(texture_path)
+            texture = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(texture_path)})
+            levels = create_graph_node(
+                NodeType.LEVELS_CHANNEL,
+                properties={
+                    "display": True,
+                    "black": 0,
+                    "white": 255,
+                    "gamma": 1.0,
+                    "out_min": 0,
+                    "out_max": 255,
+                },
+            )
+            connection = GraphConnection(
+                make_connection_id(),
+                texture.node_id,
+                "r",
+                levels.node_id,
+                "in",
+            )
+            self.workspace._push_graph_command(
+                AddNodesCommand(
+                    self.workspace.project.graph,
+                    self.workspace._on_graph_command_changed,
+                    [texture, levels],
+                    [connection],
+                ),
+                select_node_ids=[levels.node_id],
+            )
+
+            latest_images: list[Image.Image] = []
+            loop = QEventLoop()
+            self.workspace.preview_image_requested.connect(
+                lambda image, _title, _meta, _node_id: (latest_images.append(image), loop.quit())
+            )
+            first = dict(levels.properties)
+            first["black"] = 32
+            self.workspace._on_node_properties_changed(
+                levels,
+                levels.title,
+                first,
+                False,
+                PREVIEW_MODE_DRAFT,
+            )
+            latest = dict(first)
+            latest["black"] = 200
+            self.workspace._on_node_properties_changed(
+                levels,
+                levels.title,
+                latest,
+                False,
+                PREVIEW_MODE_DRAFT,
+            )
+
+            QTimer.singleShot(5000, loop.quit)
+            loop.exec()
+
+            self.assertTrue(latest_images)
+            self.assertEqual((0, 0, 0, 255), latest_images[-1].getpixel((0, 0)))
+
+    def test_workspace_keeps_slider_drag_active_across_live_edits(self) -> None:
+        levels = create_graph_node(NodeType.LEVELS_CHANNEL)
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [levels],
+            ),
+            select_node_ids=[levels.node_id],
+        )
+        panel = self.workspace.properties_panel
+        changed_modes: list[str] = []
+        refresh_modes: list[str] = []
+        panel.node_changed.connect(
+            lambda _node, _title, _properties, _rebuild, mode: changed_modes.append(mode)
+        )
+        panel.preview_refresh_requested.connect(
+            lambda _node, mode: refresh_modes.append(mode)
+        )
+
+        panel.level_black_slider.sliderPressed.emit()
+        panel.level_black_slider.setValue(20)
+        self.app.processEvents()
+        self.assertTrue(panel._slider_drag_active)
+        panel.level_black_slider.setValue(40)
+        self.app.processEvents()
+        self.assertTrue(panel._slider_drag_active)
+        panel.level_black_slider.sliderReleased.emit()
+        self.app.processEvents()
+
+        self.assertGreaterEqual(changed_modes.count(PREVIEW_MODE_DRAFT), 2)
+        self.assertEqual(PREVIEW_MODE_FULL, refresh_modes[-1])
 
     def test_undo_redo_add_and_connect(self) -> None:
         constant = create_graph_node(NodeType.CONSTANT_CHANNEL)
@@ -674,11 +1230,24 @@ class GraphEditorFoundationTests(unittest.TestCase):
                 select_node_ids=[texture.node_id],
             )
             item = self.workspace._scene.node_items[texture.node_id]
+            first_ready = QEventLoop()
+            self.workspace._scene.texture_visual_cache.visual_ready.connect(
+                lambda _path: first_ready.quit()
+            )
+            if item.thumbnail_item.pixmap().isNull():
+                QTimer.singleShot(3000, first_ready.quit)
+                first_ready.exec()
             thumbnail_before = item.thumbnail_item.pixmap().toImage()
             self.assertEqual(255, thumbnail_before.pixelColor(0, 0).red())
 
             Image.new("RGBA", (8, 8), (0, 255, 0, 255)).save(texture_path)
+            second_ready = QEventLoop()
+            self.workspace._scene.texture_visual_cache.visual_ready.connect(
+                lambda _path: second_ready.quit()
+            )
             self.workspace.refresh_asset_paths([texture_path])
+            QTimer.singleShot(3000, second_ready.quit)
+            second_ready.exec()
 
             thumbnail_after = item.thumbnail_item.pixmap().toImage()
             self.assertEqual(0, thumbnail_after.pixelColor(0, 0).red())
@@ -866,6 +1435,25 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertTrue(window.node_properties_dock.isHidden())
             self.assertTrue(window.inspector_dock.isHidden())
             self.assertFalse(window.graph_workspace.export_button.isHidden())
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_file_drop_routes_to_active_workspace(self) -> None:
+        window = MainWindow()
+        queue_drops: list[list[str]] = []
+        window.queue_paths_received.connect(queue_drops.append)
+        try:
+            with mock.patch.object(window, "_add_graph_assets_from_paths") as add_assets:
+                window._set_workspace_mode("graph")
+                window._route_dropped_paths(["graph_texture.png"])
+                add_assets.assert_called_once_with(["graph_texture.png"])
+                self.assertEqual([], queue_drops)
+
+                window._set_workspace_mode("batch")
+                window._route_dropped_paths(["batch_texture.png"])
+                self.assertEqual([["batch_texture.png"]], queue_drops)
         finally:
             window.setParent(None)
             window.deleteLater()
@@ -1649,11 +2237,17 @@ class GraphEditorFoundationTests(unittest.TestCase):
             select_node_ids=[texture.node_id],
         )
 
+        properties_selection_events: list[GraphNode | None] = []
         selection_events: list[GraphNode | None] = []
+        self.workspace._scene.node_properties_selection_changed.connect(
+            properties_selection_events.append
+        )
         self.workspace._scene.node_selection_changed.connect(selection_events.append)
 
         self.workspace._scene.begin_node_move(texture.node_id)
         self.workspace._scene._emit_selection()
+        self.assertEqual(1, len(properties_selection_events))
+        self.assertEqual(texture.node_id, properties_selection_events[0].node_id)
         self.assertEqual([], selection_events)
 
         self.workspace._scene.finish_node_move()

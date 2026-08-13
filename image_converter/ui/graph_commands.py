@@ -354,7 +354,7 @@ class MoveNodesCommand(GraphCommand):
         before_positions: dict[str, tuple[float, float]],
         after_positions: dict[str, tuple[float, float]],
     ):
-        super().__init__(graph, on_changed, "Move nodes", needs_rebuild=True)
+        super().__init__(graph, on_changed, "Move nodes", needs_rebuild=False)
         self.before_positions = dict(before_positions)
         self.after_positions = dict(after_positions)
 
@@ -368,4 +368,4 @@ class MoveNodesCommand(GraphCommand):
         for node in self.graph.nodes:
             if node.node_id in positions:
                 node.position = positions[node.node_id]
-        self._emit_changed()
+        self._on_changed("positions")  # type: ignore[arg-type]

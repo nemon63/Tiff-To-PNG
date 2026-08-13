@@ -8,6 +8,7 @@ from uuid import uuid4
 
 class NodeType(str, Enum):
     TEXTURE_INPUT = "texture_input"
+    COLOR = "color"
     CONSTANT_CHANNEL = "constant_channel"
     INVERT_CHANNEL = "invert_channel"
     LEVELS_CHANNEL = "levels_channel"
@@ -138,6 +139,7 @@ def make_connection_id() -> str:
 def node_type_label(node_type: NodeType) -> str:
     mapping = {
         NodeType.TEXTURE_INPUT: "Texture",
+        NodeType.COLOR: "Color",
         NodeType.CONSTANT_CHANNEL: "Constant",
         NodeType.INVERT_CHANNEL: "Invert",
         NodeType.LEVELS_CHANNEL: "Levels",
@@ -165,6 +167,15 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
             "path": "",
             "color_space": TextureNodeColorSpace.AUTO.value,
             "data_role": TextureDataRole.DATA.value,
+        }
+    if node_type is NodeType.COLOR:
+        return {
+            "red": 255,
+            "green": 255,
+            "blue": 255,
+            "alpha": 255,
+            "width": 1024,
+            "height": 1024,
         }
     if node_type is NodeType.CONSTANT_CHANNEL:
         return {"value": 255}
@@ -216,6 +227,7 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
 
 def resettable_node_property_keys(node_type: NodeType) -> tuple[str, ...]:
     mapping = {
+        NodeType.COLOR: ("red", "green", "blue", "alpha", "width", "height"),
         NodeType.CONSTANT_CHANNEL: ("value",),
         NodeType.LEVELS_CHANNEL: ("black", "white", "gamma", "out_min", "out_max"),
         NodeType.REMAP_CHANNEL: ("in_min", "in_max", "out_min", "out_max"),
@@ -266,6 +278,13 @@ def create_graph_node(
 
 def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
     if node_type is NodeType.TEXTURE_INPUT:
+        return (
+            GraphSocket("r", "R", SocketDirection.OUTPUT, SocketType.CHANNEL),
+            GraphSocket("g", "G", SocketDirection.OUTPUT, SocketType.CHANNEL),
+            GraphSocket("b", "B", SocketDirection.OUTPUT, SocketType.CHANNEL),
+            GraphSocket("a", "A", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.COLOR:
         return (
             GraphSocket("r", "R", SocketDirection.OUTPUT, SocketType.CHANNEL),
             GraphSocket("g", "G", SocketDirection.OUTPUT, SocketType.CHANNEL),
