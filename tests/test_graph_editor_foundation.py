@@ -67,6 +67,7 @@ from image_converter.application.asset_scan import (
 from image_converter.application.thumbnail import ThumbnailController
 from image_converter.ui.graph_commands import AddNodesCommand, MoveNodesCommand, ReplaceInputConnectionCommand
 from image_converter.ui.main_window import MainWindow
+from image_converter.ui.asset_browser import GraphAssetsPanel
 from image_converter.ui.graph_canvas import GraphNodeItem
 from image_converter.ui.node_editor import GraphWorkspace
 from image_converter.ui.node_editor import DRAFT_PREVIEW_MAX_SIDE, PREVIEW_MODE_DRAFT, PREVIEW_MODE_FULL
@@ -1208,6 +1209,52 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
             list(morphology_source.filter(ImageFilter.MinFilter(3)).getdata()),
             list(erode_image.getdata()),
         )
+
+
+class GraphAssetsPanelTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = _app()
+        self.panel = GraphAssetsPanel()
+
+    def tearDown(self) -> None:
+        self.panel.setParent(None)
+        self.panel.deleteLater()
+        self.app.processEvents()
+        del self.panel
+        gc.collect()
+
+    def test_filter_and_selection_are_owned_by_assets_panel(self) -> None:
+        metadata = AssetMetadata(
+            format_name="PNG",
+            width=4,
+            height=4,
+            mode="RGBA",
+            has_alpha=True,
+            file_size_bytes=64,
+            map_type=TextureMapType.BASECOLOR,
+        )
+        albedo = QueueItem(
+            BatchSource(Path("albedo.png"), map_type=TextureMapType.BASECOLOR),
+            AssetKind.IMAGE,
+            metadata,
+        )
+        normal = QueueItem(
+            BatchSource(Path("normal.png"), map_type=TextureMapType.NORMAL),
+            AssetKind.IMAGE,
+            metadata,
+        )
+        remove_requests: list[bool] = []
+        self.panel.remove_requested.connect(lambda: remove_requests.append(True))
+
+        self.panel.set_assets([albedo, normal])
+        self.panel.table.selectRow(1)
+        self.panel.filter_edit.setText("normal")
+        self.app.processEvents()
+
+        self.assertEqual((normal,), self.panel.rows)
+        self.assertEqual([normal], self.panel.selected_items())
+        self.panel.remove_button.click()
+        self.assertEqual([True], remove_requests)
 
 
 class NodePropertiesPanelTests(unittest.TestCase):

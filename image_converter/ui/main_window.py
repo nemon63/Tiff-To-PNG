@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QItemSelectionModel, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QByteArray, QItemSelectionModel, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -14,17 +14,13 @@ from PyQt6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
-    QIcon,
     QKeySequence,
-    QPixmap,
     QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QAbstractItemView,
     QDockWidget,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -36,7 +32,6 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -96,9 +91,8 @@ from image_converter.ui.common import (
     _map_type_label,
     _queue_status_display,
     _status_colors,
-    _qimage_from_pil,
 )
-from image_converter.ui.asset_browser import AssetTableWidget
+from image_converter.ui.asset_browser import GraphAssetsPanel
 from image_converter.ui.inspector import MetadataPanel
 from image_converter.ui.log_panel import LogPanel
 from image_converter.ui.node_editor import GraphWorkspace
@@ -117,7 +111,6 @@ class MainWindow(QMainWindow):
         self._queue_items: list[QueueItem] = []
         self._path_key_cache: OrderedDict[str, str] = OrderedDict()
         self._queue_row_items: list[QueueItem | None] = []
-        self._asset_rows: list[QueueItem] = []
         self._preset_repository: PresetRepository | None = None
         self._presets_by_id: dict[str, ConversionPreset] = {}
         self._workspace_mode = WORKSPACE_GRAPH
@@ -219,7 +212,16 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(self.workspace_stack, 1)
         self.setCentralWidget(central)
 
-        self.assets_panel = self._build_assets_panel()
+        self.assets_panel = GraphAssetsPanel()
+        self.assets_panel.files_requested.connect(self._pick_graph_asset_files)
+        self.assets_panel.folder_requested.connect(self._pick_graph_asset_folder)
+        self.assets_panel.reload_requested.connect(self._reload_selected_asset)
+        self.assets_panel.remove_requested.connect(self._remove_selected_assets)
+        self.assets_panel.preview_requested.connect(self._preview_selected_asset)
+        self.assets_panel.thumbnail_requested.connect(self._request_asset_thumbnail)
+        self.asset_table = self.assets_panel.table
+        self.asset_filter_edit = self.assets_panel.filter_edit
+        self.remove_asset_button = self.assets_panel.remove_button
         self.assets_dock = self._create_dock("Assets", self.assets_panel, "AssetsDock")
         self.node_properties_dock = self._create_dock(
             "Node Properties",
@@ -442,62 +444,6 @@ class MainWindow(QMainWindow):
         button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         button.setMinimumWidth(button.fontMetrics().horizontalAdvance(text) + 28)
 
-    def _build_assets_panel(self) -> QFrame:
-        panel = QFrame()
-        panel.setObjectName("SidebarPanel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        title = QLabel("Assets")
-        title.setObjectName("PanelTitle")
-        layout.addWidget(title)
-
-        buttons = QGridLayout()
-        buttons.setHorizontalSpacing(8)
-        buttons.setVerticalSpacing(8)
-        add_files = QPushButton("+ Files")
-        add_files.clicked.connect(self._pick_graph_asset_files)
-        buttons.addWidget(add_files, 0, 0)
-        add_folder = QPushButton("+ Folder")
-        add_folder.clicked.connect(self._pick_graph_asset_folder)
-        buttons.addWidget(add_folder, 0, 1)
-        reload_asset = QPushButton("Reload")
-        reload_asset.clicked.connect(self._reload_selected_asset)
-        buttons.addWidget(reload_asset, 1, 0)
-        self.remove_asset_button = QPushButton("Remove")
-        self.remove_asset_button.setObjectName("DangerButton")
-        self.remove_asset_button.clicked.connect(self._remove_selected_assets)
-        buttons.addWidget(self.remove_asset_button, 1, 1)
-        layout.addLayout(buttons)
-
-        self.asset_filter_edit = QLineEdit()
-        self.asset_filter_edit.setPlaceholderText("Filter assets")
-        self.asset_filter_edit.textChanged.connect(self._render_asset_browser)
-        layout.addWidget(self.asset_filter_edit)
-
-        self.asset_table = AssetTableWidget()
-        self.asset_table.setColumnCount(4)
-        self.asset_table.setHorizontalHeaderLabels(("", "Name", "Type", "Res"))
-        self.asset_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.asset_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.asset_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.asset_table.verticalHeader().setVisible(False)
-        self.asset_table.horizontalHeader().setStretchLastSection(True)
-        self.asset_table.setIconSize(QSize(42, 42))
-        self.asset_table.itemDoubleClicked.connect(self._preview_selected_asset)
-        self.asset_table.remove_requested.connect(self._remove_selected_assets)
-        self.asset_table.verticalScrollBar().valueChanged.connect(
-            self._request_visible_asset_thumbnails
-        )
-        layout.addWidget(self.asset_table, 1)
-
-        hint = QLabel("Drag an asset into Graph. Double-click opens Preview.")
-        hint.setObjectName("SummaryText")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        return panel
-
     def _apply_top_output_path(self, text: str) -> None:
         if self.settings_panel.output_edit.text() != text:
             self.settings_panel.output_edit.setText(text)
@@ -552,53 +498,7 @@ class MainWindow(QMainWindow):
         self._set_workspace_mode(self._workspace_mode)
 
     def _render_asset_browser(self) -> None:
-        table = self.asset_table
-        selected_keys = set(self._selected_asset_keys())
-        filter_text = self.asset_filter_edit.text().strip().casefold() if hasattr(self, "asset_filter_edit") else ""
-        self._asset_rows = [
-            item
-            for item in self.graph_workspace.assets()
-            if not filter_text
-            or filter_text in item.path.name.casefold()
-            or filter_text in _map_type_label(item.effective_map_type).casefold()
-        ]
-        table.setRowCount(len(self._asset_rows))
-        for row, item in enumerate(self._asset_rows):
-            metadata = item.metadata
-            exists = item.path.exists()
-            values = (
-                "",
-                item.path.name,
-                _map_type_label(item.effective_map_type) if exists else "Missing",
-                metadata.resolution_text if metadata else "-",
-            )
-            for column, value in enumerate(values):
-                table_item = QTableWidgetItem(value)
-                table_item.setToolTip(str(item.path))
-                table_item.setData(Qt.ItemDataRole.UserRole, self._queue_key(item.path))
-                table.setItem(row, column, table_item)
-        self._restore_asset_selection(selected_keys)
-        QTimer.singleShot(0, self._request_visible_asset_thumbnails)
-
-    def _request_visible_asset_thumbnails(self, *_args: object) -> None:
-        table = self.asset_table
-        if not self._asset_rows:
-            return
-        first_row = table.rowAt(0)
-        if first_row < 0:
-            first_row = 0
-        last_row = table.rowAt(max(0, table.viewport().height() - 1))
-        if last_row < 0:
-            last_row = min(len(self._asset_rows) - 1, first_row + 50)
-        first_row = max(0, first_row - 8)
-        last_row = min(len(self._asset_rows) - 1, last_row + 8)
-        for row in range(first_row, last_row + 1):
-            table_item = table.item(row, 0)
-            if table_item is None or not table_item.icon().isNull():
-                continue
-            icon = self._asset_thumbnail_icon(self._asset_rows[row])
-            if icon is not None:
-                table_item.setIcon(icon)
+        self.assets_panel.set_assets(self.graph_workspace.assets())
 
     def _add_selected_asset_to_graph(self, *_args: object) -> None:
         item = self._selected_asset_item()
@@ -758,23 +658,13 @@ class MainWindow(QMainWindow):
         self._refresh_graph_apply_preflight()
         self.set_status(f"Удалено ассетов из Graph: {len(selected_items)}")
 
-    def _asset_thumbnail_icon(self, item: QueueItem) -> QIcon | None:
+    def _request_asset_thumbnail(self, item: QueueItem) -> None:
         image = self._thumbnail_controller.request(item.path)
-        if image is None:
-            return None
-        return QIcon(QPixmap.fromImage(_qimage_from_pil(image)))
+        if image is not None:
+            self.assets_panel.set_thumbnail(item.path, image)
 
     def on_asset_thumbnail_ready(self, path: Path, image: object) -> None:
-        if not hasattr(image, "tobytes"):
-            return
-        key = self._queue_key(path)
-        icon = QIcon(QPixmap.fromImage(_qimage_from_pil(image)))
-        for row, item in enumerate(self._asset_rows):
-            if self._queue_key(item.path) != key:
-                continue
-            table_item = self.asset_table.item(row, 0)
-            if table_item is not None:
-                table_item.setIcon(icon)
+        self.assets_panel.set_thumbnail(path, image)
 
     def _show_graph_preview(self, image, title: str, meta: str, node_id: str) -> None:
         preserve_zoom = self.preview_panel.current_graph_preview_node_id() == node_id
@@ -799,15 +689,7 @@ class MainWindow(QMainWindow):
             self._graph_node_properties_visible = visible
 
     def _selected_asset_items(self) -> list[QueueItem]:
-        selection_model = self.asset_table.selectionModel()
-        if selection_model is None:
-            return []
-        selected_rows = sorted({index.row() for index in selection_model.selectedRows()})
-        return [
-            self._asset_rows[row]
-            for row in selected_rows
-            if row < len(self._asset_rows)
-        ]
+        return self.assets_panel.selected_items()
 
     def _selected_asset_item(self) -> QueueItem | None:
         items = self._selected_asset_items()
@@ -835,28 +717,6 @@ class MainWindow(QMainWindow):
             seen.add(key)
             items.append(item)
         return items
-
-    def _restore_asset_selection(self, keys: set[str]) -> None:
-        if not keys:
-            return
-        selection_model = self.asset_table.selectionModel()
-        if selection_model is None:
-            return
-        first_row = None
-        selection_model.clearSelection()
-        for row, item in enumerate(self._asset_rows):
-            if self._queue_key(item.path) not in keys:
-                continue
-            model_index = self.asset_table.model().index(row, 0)
-            selection_model.select(
-                model_index,
-                QItemSelectionModel.SelectionFlag.Select
-                | QItemSelectionModel.SelectionFlag.Rows,
-            )
-            if first_row is None:
-                first_row = row
-        if first_row is not None:
-            self.asset_table.setCurrentCell(first_row, 0)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _extract_local_paths(event):
@@ -984,8 +844,7 @@ class MainWindow(QMainWindow):
         self.queue_panel.set_controls_enabled(not running)
         self.export_graph_button.setEnabled(not running)
         self.graph_workspace.export_button.setEnabled(not running)
-        self.asset_table.setEnabled(not running)
-        self.remove_asset_button.setEnabled(not running)
+        self.assets_panel.set_controls_enabled(not running)
         if hasattr(self, "auto_watch_button"):
             self.auto_watch_button.setEnabled(not running)
         if hasattr(self, "auto_export_button"):
