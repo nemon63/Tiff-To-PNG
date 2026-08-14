@@ -440,6 +440,28 @@ class PreviewPanel(QWidget):
         self._sync_channel_buttons(self._graph_preview_channels())
         self._refresh_graph_preview(preserve_zoom=preserve_zoom)
 
+    def set_graph_preview_error(
+        self,
+        title: str,
+        message: str,
+        *,
+        node_id: str = "",
+    ) -> None:
+        self._preview_controller.invalidate()
+        self._current_item = None
+        self._graph_preview_image = None
+        self._graph_preview_title = title
+        self._graph_preview_meta = message
+        self._graph_preview_node_id = node_id
+        self._selected_channel = PreviewChannel.COMPOSITE
+        self.preview_canvas.clear_preview(f"Graph preview error:\n{message}")
+        self.asset_label.setText(title)
+        self.asset_label.setToolTip(title)
+        self.asset_meta_label.setText(message)
+        self.asset_meta_label.setToolTip(message)
+        self._sync_channel_buttons([])
+        self._sync_control_state(False)
+
     def _refresh_graph_preview(self, *, preserve_zoom: bool = True) -> None:
         image = self._graph_preview_image
         if image is None:

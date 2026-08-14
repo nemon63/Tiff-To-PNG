@@ -25,6 +25,7 @@ from image_converter.domain.node_graph import (
     NodeGraphProject,
     NodeType,
     SocketDirection,
+    SocketType,
     TextureDataRole,
     incoming_connection,
     make_connection_id,
@@ -43,7 +44,7 @@ PORT_RADIUS = 6
 FLAG_SIZE = 14
 FLAG_TOP = 7
 FLAG_GAP = 6
-TEXTURE_BODY_HEIGHT = 108
+TEXTURE_BODY_HEIGHT = 122
 TEXTURE_THUMBNAIL_SIZE = 72
 TEXTURE_THUMBNAIL_X = 10
 TEXTURE_THUMBNAIL_Y = TITLE_HEIGHT + 14
@@ -64,7 +65,12 @@ class ConnectionItem(QGraphicsPathItem):
         self.target_port = target_port
         self.setZValue(-10)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        self.setPen(QPen(QColor("#5BA7FF"), 2.0))
+        wire_color = (
+            QColor("#B678FF")
+            if source_port.socket_type is SocketType.IMAGE
+            else QColor("#5BA7FF")
+        )
+        self.setPen(QPen(wire_color, 2.0))
         self.update_path()
 
     def update_path(self) -> None:
@@ -98,16 +104,28 @@ class ConnectionItem(QGraphicsPathItem):
 
 
 class PortItem(QGraphicsEllipseItem):
-    def __init__(self, node_item: "GraphNodeItem", socket_id: str, label: str, direction: SocketDirection):
+    def __init__(
+        self,
+        node_item: "GraphNodeItem",
+        socket_id: str,
+        label: str,
+        direction: SocketDirection,
+        socket_type: SocketType,
+    ):
         super().__init__(-PORT_RADIUS, -PORT_RADIUS, PORT_RADIUS * 2, PORT_RADIUS * 2, node_item)
         self.node_item = node_item
         self.socket_id = socket_id
         self.direction = direction
-        self.setBrush(QColor("#6EA8FE") if direction is SocketDirection.OUTPUT else QColor("#D9964A"))
+        self.socket_type = socket_type
+        if socket_type is SocketType.IMAGE:
+            color = QColor("#B678FF")
+        else:
+            color = QColor("#6EA8FE") if direction is SocketDirection.OUTPUT else QColor("#D9964A")
+        self.setBrush(color)
         self.setPen(QPen(QColor("#111820"), 1.0))
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setToolTip(f"{node_item.node.title}.{label}")
+        self.setToolTip(f"{node_item.node.title}.{label} ({socket_type.value})")
 
     def scene_center(self) -> QPointF:
         return self.mapToScene(self.rect().center())
@@ -249,7 +267,13 @@ class GraphNodeItem(QGraphicsRectItem):
         outputs = [socket for socket in socket_definitions(self.node.node_type) if socket.direction is SocketDirection.OUTPUT]
         for index, socket in enumerate(inputs):
             y = y_offset + index * ROW_HEIGHT
-            port = PortItem(self, socket.socket_id, socket.name, socket.direction)
+            port = PortItem(
+                self,
+                socket.socket_id,
+                socket.name,
+                socket.direction,
+                socket.socket_type,
+            )
             port.setPos(0, y + 10)
             self.port_items[socket.socket_id] = port
             label = QGraphicsSimpleTextItem(socket.name, self)
@@ -260,17 +284,24 @@ class GraphNodeItem(QGraphicsRectItem):
         for index, socket in enumerate(outputs):
             spacing = TEXTURE_PORT_SPACING if self.node.node_type is NodeType.TEXTURE_INPUT else ROW_HEIGHT
             y = y_offset + index * spacing
-            port = PortItem(self, socket.socket_id, socket.name, socket.direction)
+            port = PortItem(
+                self,
+                socket.socket_id,
+                socket.name,
+                socket.direction,
+                socket.socket_type,
+            )
             port.setPos(self.node_width, y + 10)
             self.port_items[socket.socket_id] = port
             label = QGraphicsSimpleTextItem(socket.name, self)
             label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             label.setBrush(self._socket_label_color(socket.socket_id))
-            label_x = (
-                self.node_width - TEXTURE_PORT_LABEL_X_PAD
-                if self.node.node_type is NodeType.TEXTURE_INPUT
-                else self.node_width - 28
-            )
+            if self.node.node_type is NodeType.TEXTURE_INPUT:
+                label_x = self.node_width - (
+                    54 if socket.socket_type is SocketType.IMAGE else TEXTURE_PORT_LABEL_X_PAD
+                )
+            else:
+                label_x = self.node_width - (54 if socket.socket_type is SocketType.IMAGE else 28)
             label.setPos(label_x, y)
             self.port_label_items[socket.socket_id] = label
 
@@ -451,6 +482,27 @@ class GraphNodeItem(QGraphicsRectItem):
                 self.subtitle_item.setText(self.node.node_type.value)
 
         self.refresh_flags()
+        self.update()
+
+    def set_color_preview(self, properties: dict) -> None:
+        if self.node.node_type is not NodeType.COLOR:
+            return
+
+        def component(name: str) -> int:
+            try:
+                value = int(properties.get(name, 255))
+            except (TypeError, ValueError):
+                value = 255
+            return max(0, min(value, 255))
+
+        red = component("red")
+        green = component("green")
+        blue = component("blue")
+        alpha = component("alpha")
+        if self.color_swatch_item is not None:
+            self.color_swatch_item.setBrush(QColor(red, green, blue, alpha))
+        if self.subtitle_item is not None:
+            self.subtitle_item.setText(f"#{red:02X}{green:02X}{blue:02X}{alpha:02X}")
         self.update()
 
     def _position_thumbnail_item(self) -> None:
@@ -808,6 +860,11 @@ class GraphScene(QGraphicsScene):
             return None, None
         if self.drag_port.direction is target_port.direction:
             return None, None
+        if self.drag_port.socket_type is not target_port.socket_type:
+            self.status_message.emit(
+                f"Cannot connect {self.drag_port.socket_type.value} to {target_port.socket_type.value}."
+            )
+            return None, None
         if self.drag_port.direction is SocketDirection.OUTPUT:
             return self.drag_port, target_port
         return target_port, self.drag_port
@@ -1119,8 +1176,15 @@ class GraphView(QGraphicsView):
         self._add_node_menu_action(channel_menu, "Erode", NodeType.ERODE_CHANNEL, scene_position, wire_port)
         self._add_node_menu_action(channel_menu, "Luminance", NodeType.LUMINANCE, scene_position, wire_port)
 
+        image_menu = menu.addMenu("Image")
+        self._add_node_menu_action(image_menu, "Mix Image", NodeType.MIX_IMAGE, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Blend Image", NodeType.BLEND_IMAGE, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Split RGBA", NodeType.SPLIT_RGBA, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Combine RGBA", NodeType.COMBINE_RGBA, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Apply Mask", NodeType.SET_ALPHA, scene_position, wire_port)
+
         math_menu = menu.addMenu("Math")
-        self._add_node_menu_action(math_menu, "Blend", NodeType.BLEND_CHANNEL, scene_position, wire_port)
+        self._add_node_menu_action(math_menu, "Blend Channel", NodeType.BLEND_CHANNEL, scene_position, wire_port)
 
         if wire_port is None or wire_port.direction is SocketDirection.OUTPUT:
             utility_menu = menu.addMenu("Utility")

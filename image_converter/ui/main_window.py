@@ -194,6 +194,7 @@ class MainWindow(QMainWindow):
         self.graph_workspace.export_requested.connect(self._export_graph)
         self.graph_workspace.output_export_requested.connect(self._export_graph_output)
         self.graph_workspace.preview_image_requested.connect(self._show_graph_preview)
+        self.graph_workspace.preview_failed.connect(self._show_graph_preview_error)
         self.graph_workspace.status_message.connect(self.set_status)
         self.graph_workspace.status_message.connect(self.append_log)
         self.graph_workspace.assets_changed.connect(self._on_graph_assets_changed)
@@ -778,6 +779,11 @@ class MainWindow(QMainWindow):
     def _show_graph_preview(self, image, title: str, meta: str, node_id: str) -> None:
         preserve_zoom = self.preview_panel.current_graph_preview_node_id() == node_id
         self.preview_panel.set_graph_preview(image, title, meta, node_id=node_id, preserve_zoom=preserve_zoom)
+        self.preview_dock.show()
+        self.preview_dock.raise_()
+
+    def _show_graph_preview_error(self, title: str, message: str, node_id: str) -> None:
+        self.preview_panel.set_graph_preview_error(title, message, node_id=node_id)
         self.preview_dock.show()
         self.preview_dock.raise_()
 

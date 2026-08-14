@@ -14,6 +14,7 @@ from unittest import mock
 from PIL import Image, ImageFilter
 from PyQt6.QtCore import QEventLoop, QObject, QTimer, Qt
 from PyQt6.QtCore import QItemSelectionModel
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QApplication, QLabel
 
 from image_converter.domain.models import (
@@ -38,6 +39,7 @@ from image_converter.domain.node_graph import (
     NodeType,
     OutputMode,
     OutputProfile,
+    SocketType,
     create_graph_node,
     make_connection_id,
     socket_definitions,
@@ -162,6 +164,571 @@ class ImageLoadingTests(unittest.TestCase):
 
 
 class NodeGraphExecutorPerformanceTests(unittest.TestCase):
+    def test_mix_image_uses_alpha_mask_and_output_channel_overrides(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mask_path = Path(tmp) / "mask.png"
+            mask = Image.new("RGBA", (2, 1), (0, 0, 0, 0))
+            mask.putpixel((1, 0), (0, 0, 0, 255))
+            mask.save(mask_path)
+
+            red = create_graph_node(
+                NodeType.COLOR,
+                properties={"red": 255, "green": 0, "blue": 0, "width": 2, "height": 1},
+            )
+            blue = create_graph_node(
+                NodeType.COLOR,
+                properties={"red": 0, "green": 0, "blue": 255, "width": 2, "height": 1},
+            )
+            mask_texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(mask_path)},
+            )
+            mix = create_graph_node(NodeType.MIX_IMAGE)
+            green_override = create_graph_node(
+                NodeType.CONSTANT_CHANNEL,
+                properties={"value": 64},
+            )
+            output = create_graph_node(NodeType.OUTPUT_RGBA)
+            view = create_graph_node(NodeType.VIEW)
+            graph = NodeGraph(
+                nodes=[red, blue, mask_texture, mix, green_override, output, view],
+                connections=[
+                    GraphConnection(make_connection_id(), red.node_id, "image", mix.node_id, "a"),
+                    GraphConnection(make_connection_id(), blue.node_id, "image", mix.node_id, "b"),
+                    GraphConnection(make_connection_id(), mask_texture.node_id, "a", mix.node_id, "mask"),
+                    GraphConnection(make_connection_id(), mix.node_id, "image", output.node_id, "image"),
+                    GraphConnection(make_connection_id(), green_override.node_id, "out", output.node_id, "g"),
+                    GraphConnection(make_connection_id(), mix.node_id, "image", view.node_id, "image"),
+                ],
+            )
+
+            executor = NodeGraphExecutor()
+            output_image = executor.render_output_node(graph, output)
+            view_image = executor.render_view_node(graph, view, fallback_size=(2, 1), max_side=0)
+
+            self.assertEqual(
+                [(255, 64, 0, 255), (0, 64, 255, 255)],
+                [output_image.getpixel((x, 0)) for x in range(2)],
+            )
+            self.assertEqual(
+                [(255, 0, 0, 255), (0, 0, 255, 255)],
+                [view_image.getpixel((x, 0)) for x in range(2)],
+            )
+
+    def test_output_channel_override_is_reported_in_validation_and_preview_meta(self) -> None:
+        image = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 64,
+                "green": 96,
+                "blue": 128,
+                "alpha": 32,
+                "width": 1,
+                "height": 1,
+            },
+        )
+        alpha_override = create_graph_node(
+            NodeType.CONSTANT_CHANNEL,
+            properties={"value": 255},
+        )
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"alpha_input_mode": "replace"},
+        )
+        project = NodeGraphProject(
+            graph=NodeGraph(
+                nodes=[image, alpha_override, output],
+                connections=[
+                    GraphConnection(
+                        make_connection_id(),
+                        image.node_id,
+                        "image",
+                        output.node_id,
+                        "image",
+                    ),
+                    GraphConnection(
+                        make_connection_id(),
+                        alpha_override.node_id,
+                        "out",
+                        output.node_id,
+                        "a",
+                    ),
+                ],
+            )
+        )
+        executor = NodeGraphExecutor()
+
+        issues = executor.validate_issues(project)
+        rendered, meta = executor.render_display_node(project.graph, output)
+
+        self.assertTrue(
+            any(
+                issue.node_id == output.node_id
+                and "A input overrides the same channel from Image" in issue.message
+                for issue in issues
+            )
+        )
+        self.assertIn("channel overrides: A", meta)
+        self.assertEqual((64, 96, 128, 255), rendered.getpixel((0, 0)))
+
+    def test_output_alpha_input_multiplies_existing_image_alpha_by_default(self) -> None:
+        color = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 64,
+                "green": 96,
+                "blue": 128,
+                "alpha": 255,
+                "width": 1,
+                "height": 1,
+            },
+        )
+        first_mask = create_graph_node(
+            NodeType.CONSTANT_CHANNEL,
+            properties={"value": 128},
+        )
+        apply_mask = create_graph_node(NodeType.SET_ALPHA)
+        output_alpha = create_graph_node(
+            NodeType.CONSTANT_CHANNEL,
+            properties={"value": 128},
+        )
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        graph = NodeGraph(
+            nodes=[color, first_mask, apply_mask, output_alpha, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(),
+                    color.node_id,
+                    "image",
+                    apply_mask.node_id,
+                    "image",
+                ),
+                GraphConnection(
+                    make_connection_id(),
+                    first_mask.node_id,
+                    "out",
+                    apply_mask.node_id,
+                    "alpha",
+                ),
+                GraphConnection(
+                    make_connection_id(),
+                    apply_mask.node_id,
+                    "out",
+                    output.node_id,
+                    "image",
+                ),
+                GraphConnection(
+                    make_connection_id(),
+                    output_alpha.node_id,
+                    "out",
+                    output.node_id,
+                    "a",
+                ),
+            ],
+        )
+        executor = NodeGraphExecutor()
+
+        rendered, meta = executor.render_display_node(graph, output)
+
+        self.assertEqual((64, 96, 128, 64), rendered.getpixel((0, 0)))
+        self.assertIn("alpha: Image × A", meta)
+        self.assertNotIn("channel overrides: A", meta)
+
+    def test_mix_image_uses_factor_without_mask(self) -> None:
+        red = create_graph_node(
+            NodeType.COLOR,
+            properties={"red": 255, "green": 0, "blue": 0, "width": 1, "height": 1},
+        )
+        blue = create_graph_node(
+            NodeType.COLOR,
+            properties={"red": 0, "green": 0, "blue": 255, "width": 1, "height": 1},
+        )
+        mix = create_graph_node(NodeType.MIX_IMAGE, properties={"factor": 50})
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        graph = NodeGraph(
+            nodes=[red, blue, mix, output],
+            connections=[
+                GraphConnection(make_connection_id(), red.node_id, "image", mix.node_id, "a"),
+                GraphConnection(make_connection_id(), blue.node_id, "image", mix.node_id, "b"),
+                GraphConnection(make_connection_id(), mix.node_id, "image", output.node_id, "image"),
+            ],
+        )
+
+        image = NodeGraphExecutor().render_output_node(graph, output)
+
+        self.assertEqual((127, 0, 127, 255), image.getpixel((0, 0)))
+
+    def test_split_combine_and_set_alpha_round_trip_rgba(self) -> None:
+        color = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 10,
+                "green": 20,
+                "blue": 30,
+                "alpha": 40,
+                "width": 1,
+                "height": 1,
+            },
+        )
+        split = create_graph_node(NodeType.SPLIT_RGBA)
+        combine = create_graph_node(NodeType.COMBINE_RGBA)
+        replacement_alpha = create_graph_node(
+            NodeType.CONSTANT_CHANNEL,
+            properties={"value": 99},
+        )
+        set_alpha = create_graph_node(NodeType.SET_ALPHA)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        graph = NodeGraph(
+            nodes=[color, split, combine, replacement_alpha, set_alpha, output],
+            connections=[
+                GraphConnection(make_connection_id(), color.node_id, "image", split.node_id, "image"),
+                *[
+                    GraphConnection(make_connection_id(), split.node_id, channel, combine.node_id, channel)
+                    for channel in ("r", "g", "b", "a")
+                ],
+                GraphConnection(make_connection_id(), combine.node_id, "image", set_alpha.node_id, "image"),
+                GraphConnection(make_connection_id(), replacement_alpha.node_id, "out", set_alpha.node_id, "alpha"),
+                GraphConnection(make_connection_id(), set_alpha.node_id, "out", output.node_id, "image"),
+            ],
+        )
+
+        image = NodeGraphExecutor().render_output_node(graph, output)
+
+        self.assertEqual((10, 20, 30, 99), image.getpixel((0, 0)))
+
+    def test_set_alpha_without_alpha_input_preserves_original_alpha(self) -> None:
+        color = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 10,
+                "green": 20,
+                "blue": 30,
+                "alpha": 40,
+                "width": 1,
+                "height": 1,
+            },
+        )
+        set_alpha = create_graph_node(NodeType.SET_ALPHA)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        graph = NodeGraph(
+            nodes=[color, set_alpha, output],
+            connections=[
+                GraphConnection(make_connection_id(), color.node_id, "image", set_alpha.node_id, "image"),
+                GraphConnection(make_connection_id(), set_alpha.node_id, "out", output.node_id, "image"),
+            ],
+        )
+
+        executor = NodeGraphExecutor()
+        image = executor.render_output_node(graph, output)
+        issues = executor.validate_issues(NodeGraphProject(graph=graph))
+
+        self.assertEqual((10, 20, 30, 40), image.getpixel((0, 0)))
+        self.assertFalse(any(issue.node_id == set_alpha.node_id for issue in issues))
+
+    def test_apply_mask_multiply_rgb_matches_three_blend_channel_nodes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mask_path = Path(tmp) / "mask.png"
+            mask = Image.new("RGBA", (3, 1))
+            for x, value in enumerate((0, 128, 255)):
+                mask.putpixel((x, 0), (0, 0, 0, value))
+            mask.save(mask_path)
+
+            color = create_graph_node(
+                NodeType.COLOR,
+                properties={
+                    "red": 120,
+                    "green": 80,
+                    "blue": 40,
+                    "alpha": 200,
+                    "width": 3,
+                    "height": 1,
+                },
+            )
+            mask_texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(mask_path)},
+            )
+
+            old_blends = [
+                create_graph_node(
+                    NodeType.BLEND_CHANNEL,
+                    properties={"mode": "multiply", "opacity": 100},
+                )
+                for _channel in ("r", "g", "b")
+            ]
+            old_output = create_graph_node(NodeType.OUTPUT_RGBA)
+            old_connections = []
+            for channel, blend in zip(("r", "g", "b"), old_blends, strict=True):
+                old_connections.extend(
+                    (
+                        GraphConnection(make_connection_id(), mask_texture.node_id, "a", blend.node_id, "a"),
+                        GraphConnection(make_connection_id(), color.node_id, channel, blend.node_id, "b"),
+                        GraphConnection(make_connection_id(), blend.node_id, "out", old_output.node_id, channel),
+                    )
+                )
+            old_connections.append(
+                GraphConnection(make_connection_id(), color.node_id, "a", old_output.node_id, "a")
+            )
+            old_graph = NodeGraph(
+                nodes=[color, mask_texture, *old_blends, old_output],
+                connections=old_connections,
+            )
+
+            apply_mask = create_graph_node(
+                NodeType.SET_ALPHA,
+                properties={"mask_mode": "multiply_rgb"},
+            )
+            new_output = create_graph_node(NodeType.OUTPUT_RGBA)
+            new_graph = NodeGraph(
+                nodes=[color, mask_texture, apply_mask, new_output],
+                connections=[
+                    GraphConnection(make_connection_id(), color.node_id, "image", apply_mask.node_id, "image"),
+                    GraphConnection(make_connection_id(), mask_texture.node_id, "a", apply_mask.node_id, "alpha"),
+                    GraphConnection(make_connection_id(), apply_mask.node_id, "out", new_output.node_id, "image"),
+                ],
+            )
+
+            old_image = NodeGraphExecutor().render_output_node(old_graph, old_output)
+            new_image = NodeGraphExecutor().render_output_node(new_graph, new_output)
+
+            self.assertEqual(old_image.size, new_image.size)
+            self.assertEqual(old_image.tobytes(), new_image.tobytes())
+
+    def test_image_and_output_resolution_sources_are_explicit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            a_path = Path(tmp) / "a.png"
+            b_path = Path(tmp) / "b.png"
+            Image.new("RGBA", (2, 2), (255, 0, 0, 255)).save(a_path)
+            Image.new("RGBA", (4, 3), (0, 0, 255, 255)).save(b_path)
+            a = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(a_path)})
+            b = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(b_path)})
+            mix = create_graph_node(
+                NodeType.MIX_IMAGE,
+                properties={"resolution_source": "b", "factor": 50},
+            )
+            output = create_graph_node(NodeType.OUTPUT_RGBA)
+            graph = NodeGraph(
+                nodes=[a, b, mix, output],
+                connections=[
+                    GraphConnection(make_connection_id(), a.node_id, "image", mix.node_id, "a"),
+                    GraphConnection(make_connection_id(), b.node_id, "image", mix.node_id, "b"),
+                    GraphConnection(make_connection_id(), mix.node_id, "image", output.node_id, "image"),
+                ],
+            )
+
+            executor = NodeGraphExecutor()
+            self.assertEqual((4, 3), executor.render_output_node(graph, output).size)
+
+            output.properties.update(
+                {
+                    "resolution_source": "custom",
+                    "resolution_width": 5,
+                    "resolution_height": 2,
+                }
+            )
+            self.assertEqual((5, 2), executor.render_output_node(graph, output).size)
+
+            output.properties["resolution_source"] = "auto"
+            mix.properties.update(
+                {
+                    "resolution_source": "custom",
+                    "resolution_width": 6,
+                    "resolution_height": 4,
+                }
+            )
+            self.assertEqual((6, 4), executor.render_output_node(graph, output).size)
+
+    def test_apply_mask_filter_controls_mask_resampling(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mask_path = Path(tmp) / "mask.png"
+            mask = Image.new("RGBA", (2, 1), (0, 0, 0, 0))
+            mask.putpixel((1, 0), (0, 0, 0, 255))
+            mask.save(mask_path)
+            color = create_graph_node(
+                NodeType.COLOR,
+                properties={"red": 255, "green": 255, "blue": 255, "width": 3, "height": 1},
+            )
+            mask_texture = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(mask_path)})
+            apply_mask = create_graph_node(
+                NodeType.SET_ALPHA,
+                properties={"mask_mode": "replace_alpha", "mask_filter": "nearest"},
+            )
+            output = create_graph_node(NodeType.OUTPUT_RGBA)
+            graph = NodeGraph(
+                nodes=[color, mask_texture, apply_mask, output],
+                connections=[
+                    GraphConnection(make_connection_id(), color.node_id, "image", apply_mask.node_id, "image"),
+                    GraphConnection(make_connection_id(), mask_texture.node_id, "a", apply_mask.node_id, "alpha"),
+                    GraphConnection(make_connection_id(), apply_mask.node_id, "out", output.node_id, "image"),
+                ],
+            )
+
+            nearest = NodeGraphExecutor().render_output_node(graph, output).getchannel("A")
+            apply_mask.properties["mask_filter"] = "bilinear"
+            bilinear = NodeGraphExecutor().render_output_node(graph, output).getchannel("A")
+
+            self.assertNotEqual(nearest.getpixel((1, 0)), bilinear.getpixel((1, 0)))
+            self.assertIn(nearest.getpixel((1, 0)), (0, 255))
+            self.assertGreater(bilinear.getpixel((1, 0)), 0)
+            self.assertLess(bilinear.getpixel((1, 0)), 255)
+
+    def test_validation_warns_about_size_and_aspect_mismatch(self) -> None:
+        with TemporaryDirectory() as tmp:
+            a_path = Path(tmp) / "a.png"
+            b_path = Path(tmp) / "b.png"
+            Image.new("RGBA", (4, 4)).save(a_path)
+            Image.new("RGBA", (8, 4)).save(b_path)
+            a = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(a_path)})
+            b = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(b_path)})
+            mix = create_graph_node(NodeType.MIX_IMAGE)
+            output = create_graph_node(NodeType.OUTPUT_RGBA)
+            graph = NodeGraph(
+                nodes=[a, b, mix, output],
+                connections=[
+                    GraphConnection(make_connection_id(), a.node_id, "image", mix.node_id, "a"),
+                    GraphConnection(make_connection_id(), b.node_id, "image", mix.node_id, "b"),
+                    GraphConnection(make_connection_id(), mix.node_id, "image", output.node_id, "image"),
+                ],
+            )
+
+            issues = NodeGraphExecutor().validate_issues(NodeGraphProject(graph=graph))
+
+            mismatch = next(issue for issue in issues if issue.node_id == mix.node_id and issue.socket_id == "resolution")
+            self.assertIn("input sizes differ", mismatch.message)
+            self.assertIn("Aspect ratios differ", mismatch.message)
+
+    def test_all_new_image_nodes_can_render_from_display_flag(self) -> None:
+        a = create_graph_node(
+            NodeType.COLOR,
+            properties={"red": 10, "green": 20, "blue": 30, "alpha": 40},
+        )
+        b = create_graph_node(
+            NodeType.COLOR,
+            properties={"red": 100, "green": 110, "blue": 120, "alpha": 130},
+        )
+        mix = create_graph_node(NodeType.MIX_IMAGE)
+        blend = create_graph_node(NodeType.BLEND_IMAGE)
+        split = create_graph_node(NodeType.SPLIT_RGBA)
+        combine = create_graph_node(NodeType.COMBINE_RGBA)
+        set_alpha = create_graph_node(NodeType.SET_ALPHA)
+        graph = NodeGraph(
+            nodes=[a, b, mix, blend, split, combine, set_alpha],
+            connections=[
+                GraphConnection(make_connection_id(), a.node_id, "image", mix.node_id, "a"),
+                GraphConnection(make_connection_id(), b.node_id, "image", mix.node_id, "b"),
+                GraphConnection(make_connection_id(), a.node_id, "image", blend.node_id, "a"),
+                GraphConnection(make_connection_id(), b.node_id, "image", blend.node_id, "b"),
+                GraphConnection(make_connection_id(), a.node_id, "image", split.node_id, "image"),
+                GraphConnection(make_connection_id(), a.node_id, "r", combine.node_id, "r"),
+                GraphConnection(make_connection_id(), a.node_id, "g", combine.node_id, "g"),
+                GraphConnection(make_connection_id(), a.node_id, "b", combine.node_id, "b"),
+                GraphConnection(make_connection_id(), a.node_id, "a", combine.node_id, "a"),
+                GraphConnection(make_connection_id(), a.node_id, "image", set_alpha.node_id, "image"),
+                GraphConnection(make_connection_id(), b.node_id, "a", set_alpha.node_id, "alpha"),
+            ],
+        )
+        executor = NodeGraphExecutor()
+
+        for node in (mix, blend, split, combine, set_alpha):
+            with self.subTest(node_type=node.node_type):
+                image, _meta = executor.render_display_node(
+                    graph,
+                    node,
+                    fallback_size=(2, 1),
+                    max_side=0,
+                )
+                self.assertEqual("RGBA", image.mode)
+                self.assertEqual((1024, 1024), image.size)
+
+    def test_blend_image_applies_mask_to_rgba_result(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mask_path = Path(tmp) / "blend_mask.png"
+            mask = Image.new("RGBA", (2, 1), (0, 0, 0, 0))
+            mask.putpixel((1, 0), (0, 0, 0, 255))
+            mask.save(mask_path)
+
+            a = create_graph_node(
+                NodeType.COLOR,
+                properties={"red": 100, "green": 50, "blue": 20, "alpha": 200, "width": 2, "height": 1},
+            )
+            b = create_graph_node(
+                NodeType.COLOR,
+                properties={"red": 20, "green": 30, "blue": 40, "alpha": 20, "width": 2, "height": 1},
+            )
+            mask_texture = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(mask_path)})
+            blend = create_graph_node(
+                NodeType.BLEND_IMAGE,
+                properties={"mode": "add", "opacity": 100},
+            )
+            output = create_graph_node(NodeType.OUTPUT_RGBA)
+            graph = NodeGraph(
+                nodes=[a, b, mask_texture, blend, output],
+                connections=[
+                    GraphConnection(make_connection_id(), a.node_id, "image", blend.node_id, "a"),
+                    GraphConnection(make_connection_id(), b.node_id, "image", blend.node_id, "b"),
+                    GraphConnection(make_connection_id(), mask_texture.node_id, "a", blend.node_id, "mask"),
+                    GraphConnection(make_connection_id(), blend.node_id, "image", output.node_id, "image"),
+                ],
+            )
+
+            image = NodeGraphExecutor().render_output_node(graph, output)
+
+            self.assertEqual((100, 50, 20, 200), image.getpixel((0, 0)))
+            self.assertEqual((120, 80, 60, 220), image.getpixel((1, 0)))
+
+    def test_validation_rejects_image_to_channel_connection(self) -> None:
+        color = create_graph_node(NodeType.COLOR)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        project = NodeGraphProject(
+            graph=NodeGraph(
+                nodes=[color, output],
+                connections=[
+                    GraphConnection(
+                        make_connection_id(),
+                        color.node_id,
+                        "image",
+                        output.node_id,
+                        "r",
+                    )
+                ],
+            )
+        )
+
+        issues = NodeGraphExecutor().validate_issues(project)
+
+        self.assertTrue(
+            any(
+                issue.node_id == output.node_id
+                and issue.socket_id == "r"
+                and SocketType.IMAGE.value in issue.message
+                and SocketType.CHANNEL.value in issue.message
+                for issue in issues
+            )
+        )
+
+    def test_validation_ignores_unfinished_image_nodes_outside_output_branches(self) -> None:
+        color = create_graph_node(NodeType.COLOR)
+        unfinished_mix = create_graph_node(NodeType.MIX_IMAGE)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        project = NodeGraphProject(
+            graph=NodeGraph(
+                nodes=[color, unfinished_mix, output],
+                connections=[
+                    GraphConnection(
+                        make_connection_id(),
+                        color.node_id,
+                        "image",
+                        output.node_id,
+                        "image",
+                    )
+                ],
+            )
+        )
+
+        issues = NodeGraphExecutor().validate_issues(project)
+
+        self.assertFalse(any(issue.node_id == unfinished_mix.node_id for issue in issues))
+
     def test_output_cannot_overwrite_source_texture(self) -> None:
         with TemporaryDirectory() as tmp:
             source = Path(tmp) / "source.png"
@@ -717,6 +1284,58 @@ class NodePropertiesPanelTests(unittest.TestCase):
         self.panel.set_node(create_graph_node(NodeType.ERODE_CHANNEL))
         self.assertFalse(self.panel.erode_radius_host.isHidden())
 
+    def test_image_nodes_show_mix_and_blend_controls(self) -> None:
+        mix = create_graph_node(NodeType.MIX_IMAGE, properties={"factor": 35})
+        changes: list[dict[str, object]] = []
+        self.panel.node_changed.connect(
+            lambda _node, _title, properties, _needs_rebuild, _preview_mode: changes.append(properties)
+        )
+
+        self.panel.set_node(mix)
+        self.assertFalse(self.panel.mix_factor_host.isHidden())
+        self.assertTrue(self.panel.blend_opacity_host.isHidden())
+        self.assertFalse(self.panel.image_resolution_source_combo.isHidden())
+        self.assertFalse(self.panel.mask_filter_combo.isHidden())
+        self.assertEqual(35, self.panel.mix_factor_spin.value())
+
+        self.panel.mix_factor_spin.setValue(70)
+        self.panel._flush_numeric_preview()
+        self.assertEqual(70, changes[-1]["factor"])
+
+        self.panel.set_node(create_graph_node(NodeType.BLEND_IMAGE))
+        self.assertTrue(self.panel.mix_factor_host.isHidden())
+        self.assertFalse(self.panel.blend_mode_combo.isHidden())
+        self.assertFalse(self.panel.blend_opacity_host.isHidden())
+
+        apply_mask = create_graph_node(
+            NodeType.SET_ALPHA,
+            properties={"mask_mode": "multiply_rgb", "mask_filter": "nearest"},
+        )
+        self.panel.set_node(apply_mask)
+        self.assertFalse(self.panel.mask_mode_combo.isHidden())
+        self.assertFalse(self.panel.mask_filter_combo.isHidden())
+        self.assertEqual("multiply_rgb", self.panel.mask_mode_combo.currentData())
+        self.assertEqual("nearest", self.panel.mask_filter_combo.currentData())
+
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={
+                "resolution_source": "custom",
+                "resolution_width": 2048,
+                "resolution_height": 1024,
+            },
+        )
+        self.panel.set_node(output)
+        self.assertFalse(self.panel.output_resolution_source_combo.isHidden())
+        self.assertFalse(self.panel.output_alpha_input_mode_combo.isHidden())
+        self.assertEqual("multiply", self.panel.output_alpha_input_mode_combo.currentData())
+        self.assertFalse(self.panel.custom_resolution_host.isHidden())
+        self.assertEqual(2048, self.panel.resolution_width_spin.value())
+        self.assertEqual(1024, self.panel.resolution_height_spin.value())
+
+        self.panel.output_alpha_input_mode_combo.setCurrentIndex(1)
+        self.assertEqual("replace", changes[-1]["alpha_input_mode"])
+
     def test_output_export_button_requests_current_output(self) -> None:
         output = create_graph_node(
             NodeType.OUTPUT_RGBA,
@@ -765,11 +1384,31 @@ class NodePropertiesPanelTests(unittest.TestCase):
 
         self.assertEqual(99, changes[-1]["red"])
 
+    def test_color_dialog_preview_is_transient_until_accepted(self) -> None:
+        color = create_graph_node(
+            NodeType.COLOR,
+            properties={"red": 10, "green": 20, "blue": 30, "alpha": 40},
+        )
+        previews: list[tuple[dict[str, object], str]] = []
+        self.panel.transient_preview_requested.connect(
+            lambda _node, properties, mode: previews.append((properties, mode))
+        )
+        self.panel.set_node(color)
+
+        self.panel._preview_selected_color(QColor(100, 110, 120, 130))
+
+        self.assertEqual(10, color.properties["red"])
+        self.assertEqual(100, self.panel.color_red_spin.value())
+        self.assertEqual(130, self.panel.color_alpha_spin.value())
+        self.assertEqual(100, previews[-1][0]["red"])
+        self.assertEqual(130, previews[-1][0]["alpha"])
+        self.assertEqual(PREVIEW_MODE_DRAFT, previews[-1][1])
+
     def test_color_node_has_rgba_outputs_and_defaults(self) -> None:
         color = create_graph_node(NodeType.COLOR)
 
         self.assertEqual(
-            ["r", "g", "b", "a"],
+            ["image", "r", "g", "b", "a"],
             [socket.socket_id for socket in socket_definitions(color.node_type)],
         )
         self.assertEqual(255, color.properties["red"])
@@ -1083,6 +1722,87 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertTrue(latest_images)
             self.assertEqual((0, 0, 0, 255), latest_images[-1].getpixel((0, 0)))
 
+    def test_levels_edit_refreshes_downstream_apply_mask_output_preview(self) -> None:
+        with TemporaryDirectory() as tmp:
+            texture_path = Path(tmp) / "mask.png"
+            Image.new("L", (8, 8), 128).save(texture_path)
+            texture = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(texture_path)},
+            )
+            levels = create_graph_node(NodeType.LEVELS_CHANNEL)
+            color = create_graph_node(
+                NodeType.COLOR,
+                properties={
+                    "red": 100,
+                    "green": 50,
+                    "blue": 25,
+                    "alpha": 255,
+                    "width": 8,
+                    "height": 8,
+                },
+            )
+            apply_mask = create_graph_node(NodeType.SET_ALPHA)
+            output = create_graph_node(
+                NodeType.OUTPUT_RGBA,
+                properties={"display": True, "resolution_source": "image"},
+            )
+            connections = [
+                GraphConnection(make_connection_id(), texture.node_id, "r", levels.node_id, "in"),
+                GraphConnection(make_connection_id(), levels.node_id, "out", apply_mask.node_id, "alpha"),
+                GraphConnection(make_connection_id(), color.node_id, "image", apply_mask.node_id, "image"),
+                GraphConnection(make_connection_id(), apply_mask.node_id, "out", output.node_id, "image"),
+            ]
+            latest_images: list[Image.Image] = []
+            self.workspace.preview_image_requested.connect(
+                lambda image, _title, _meta, _node_id: latest_images.append(image.copy())
+            )
+            self.workspace._push_graph_command(
+                AddNodesCommand(
+                    self.workspace.project.graph,
+                    self.workspace._on_graph_command_changed,
+                    [texture, levels, color, apply_mask, output],
+                    connections,
+                ),
+                select_node_ids=[levels.node_id],
+            )
+
+            initial_loop = QEventLoop()
+            poll_initial = QTimer()
+            poll_initial.timeout.connect(
+                lambda: initial_loop.quit() if latest_images else None
+            )
+            poll_initial.start(10)
+            QTimer.singleShot(3000, initial_loop.quit)
+            initial_loop.exec()
+            poll_initial.stop()
+            self.assertTrue(latest_images)
+            self.assertEqual(128, latest_images[-1].getpixel((0, 0))[3])
+
+            properties = dict(levels.properties)
+            properties["black"] = 200
+            self.workspace._on_node_properties_changed(
+                levels,
+                levels.title,
+                properties,
+                False,
+                PREVIEW_MODE_FULL,
+            )
+
+            updated_loop = QEventLoop()
+            poll_updated = QTimer()
+            poll_updated.timeout.connect(
+                lambda: updated_loop.quit()
+                if latest_images and latest_images[-1].getpixel((0, 0))[3] == 0
+                else None
+            )
+            poll_updated.start(10)
+            QTimer.singleShot(3000, updated_loop.quit)
+            updated_loop.exec()
+            poll_updated.stop()
+
+            self.assertEqual(0, latest_images[-1].getpixel((0, 0))[3])
+
     def test_workspace_keeps_slider_drag_active_across_live_edits(self) -> None:
         levels = create_graph_node(NodeType.LEVELS_CHANNEL)
         self.workspace._push_graph_command(
@@ -1150,6 +1870,201 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertEqual(0, len(self.workspace.project.graph.connections))
         self.workspace.undo_stack.redo()
         self.assertEqual(1, len(self.workspace.project.graph.connections))
+
+    def test_connecting_output_image_clears_old_channel_inputs_and_is_undoable(self) -> None:
+        image = create_graph_node(NodeType.COLOR)
+        red = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        green = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        blue = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        alpha = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        channel_connections = [
+            GraphConnection(make_connection_id(), source.node_id, "out", output.node_id, socket_id)
+            for source, socket_id in (
+                (red, "r"),
+                (green, "g"),
+                (blue, "b"),
+                (alpha, "a"),
+            )
+        ]
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [image, red, green, blue, alpha, output],
+                channel_connections,
+            ),
+        )
+        image_connection = GraphConnection(
+            make_connection_id(),
+            image.node_id,
+            "image",
+            output.node_id,
+            "image",
+        )
+
+        self.workspace._on_connection_requested(image_connection)
+
+        self.assertEqual([image_connection], self.workspace.project.graph.connections)
+        self.workspace.undo_stack.undo()
+        self.assertEqual(
+            {connection.connection_id for connection in channel_connections},
+            {
+                connection.connection_id
+                for connection in self.workspace.project.graph.connections
+            },
+        )
+        self.workspace.undo_stack.redo()
+        self.assertEqual([image_connection], self.workspace.project.graph.connections)
+
+        green_override = GraphConnection(
+            make_connection_id(),
+            green.node_id,
+            "out",
+            output.node_id,
+            "g",
+        )
+        self.workspace._on_connection_requested(green_override)
+        self.assertEqual(
+            {image_connection.connection_id, green_override.connection_id},
+            {
+                connection.connection_id
+                for connection in self.workspace.project.graph.connections
+            },
+        )
+
+    def test_delete_processing_node_dissolves_it_and_preserves_fanout(self) -> None:
+        source = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        levels = create_graph_node(NodeType.LEVELS_CHANNEL)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        view = create_graph_node(NodeType.VIEW)
+        original_connections = [
+            GraphConnection(make_connection_id(), source.node_id, "out", levels.node_id, "in"),
+            GraphConnection(make_connection_id(), levels.node_id, "out", output.node_id, "r"),
+            GraphConnection(make_connection_id(), levels.node_id, "out", view.node_id, "in"),
+        ]
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [source, levels, output, view],
+                original_connections,
+            ),
+            select_node_ids=[levels.node_id],
+        )
+
+        self.workspace._on_delete_items_requested(([levels.node_id], []))
+
+        self.assertNotIn(levels, self.workspace.project.graph.nodes)
+        self.assertEqual(
+            {
+                (source.node_id, "out", output.node_id, "r"),
+                (source.node_id, "out", view.node_id, "in"),
+            },
+            {
+                (
+                    connection.source_node_id,
+                    connection.source_socket_id,
+                    connection.target_node_id,
+                    connection.target_socket_id,
+                )
+                for connection in self.workspace.project.graph.connections
+            },
+        )
+
+        self.workspace.undo_stack.undo()
+        self.assertIn(levels, self.workspace.project.graph.nodes)
+        self.assertEqual(
+            {connection.connection_id for connection in original_connections},
+            {
+                connection.connection_id
+                for connection in self.workspace.project.graph.connections
+            },
+        )
+
+        self.workspace.undo_stack.redo()
+        self.assertNotIn(levels, self.workspace.project.graph.nodes)
+        self.assertEqual(2, len(self.workspace.project.graph.connections))
+
+    def test_delete_blend_node_bypasses_through_primary_a_input(self) -> None:
+        source_a = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        source_b = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        blend = create_graph_node(NodeType.BLEND_CHANNEL)
+        view = create_graph_node(NodeType.VIEW)
+        connections = [
+            GraphConnection(make_connection_id(), source_a.node_id, "out", blend.node_id, "a"),
+            GraphConnection(make_connection_id(), source_b.node_id, "out", blend.node_id, "b"),
+            GraphConnection(make_connection_id(), blend.node_id, "out", view.node_id, "in"),
+        ]
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [source_a, source_b, blend, view],
+                connections,
+            ),
+            select_node_ids=[blend.node_id],
+        )
+
+        self.workspace._on_delete_items_requested(([blend.node_id], []))
+
+        self.assertEqual(1, len(self.workspace.project.graph.connections))
+        replacement = self.workspace.project.graph.connections[0]
+        self.assertEqual(source_a.node_id, replacement.source_node_id)
+        self.assertEqual("out", replacement.source_socket_id)
+        self.assertEqual(view.node_id, replacement.target_node_id)
+        self.assertEqual("in", replacement.target_socket_id)
+
+    def test_delete_apply_mask_node_bypasses_its_image_input(self) -> None:
+        image = create_graph_node(NodeType.COLOR)
+        mask = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        apply_mask = create_graph_node(NodeType.SET_ALPHA)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        connections = [
+            GraphConnection(make_connection_id(), image.node_id, "image", apply_mask.node_id, "image"),
+            GraphConnection(make_connection_id(), mask.node_id, "out", apply_mask.node_id, "alpha"),
+            GraphConnection(make_connection_id(), apply_mask.node_id, "out", output.node_id, "image"),
+        ]
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [image, mask, apply_mask, output],
+                connections,
+            ),
+            select_node_ids=[apply_mask.node_id],
+        )
+
+        self.workspace._on_delete_items_requested(([apply_mask.node_id], []))
+
+        self.assertEqual(1, len(self.workspace.project.graph.connections))
+        replacement = self.workspace.project.graph.connections[0]
+        self.assertEqual(image.node_id, replacement.source_node_id)
+        self.assertEqual("image", replacement.source_socket_id)
+        self.assertEqual(output.node_id, replacement.target_node_id)
+        self.assertEqual("image", replacement.target_socket_id)
+
+    def test_delete_split_node_does_not_create_incompatible_connection(self) -> None:
+        image = create_graph_node(NodeType.COLOR)
+        split = create_graph_node(NodeType.SPLIT_RGBA)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        connections = [
+            GraphConnection(make_connection_id(), image.node_id, "image", split.node_id, "image"),
+            GraphConnection(make_connection_id(), split.node_id, "r", output.node_id, "r"),
+        ]
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [image, split, output],
+                connections,
+            ),
+            select_node_ids=[split.node_id],
+        )
+
+        self.workspace._on_delete_items_requested(([split.node_id], []))
+
+        self.assertEqual([], self.workspace.project.graph.connections)
 
     def test_copy_paste_preserves_internal_connections(self) -> None:
         constant = create_graph_node(NodeType.CONSTANT_CHANNEL)
@@ -1338,6 +2253,7 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertIn("color_space", texture.properties)
         self.assertIn("data_role", texture.properties)
         self.assertIn("profile", output.properties)
+        self.assertEqual("multiply", output.properties["alpha_input_mode"])
         self.assertIn("display", output.properties)
 
     def test_recent_graph_projects_round_trip_in_app_settings(self) -> None:
@@ -2202,6 +3118,156 @@ class GraphEditorFoundationTests(unittest.TestCase):
         loop.exec()
         self.assertTrue(received)
         self.assertEqual(constant.title, received[-1][1])
+
+    def test_display_flag_previews_set_alpha_node(self) -> None:
+        color = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 12,
+                "green": 34,
+                "blue": 56,
+                "alpha": 78,
+                "width": 2,
+                "height": 1,
+            },
+        )
+        set_alpha = create_graph_node(NodeType.SET_ALPHA)
+        connection = GraphConnection(
+            make_connection_id(),
+            color.node_id,
+            "image",
+            set_alpha.node_id,
+            "image",
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [color, set_alpha],
+                [connection],
+            ),
+            select_node_ids=[set_alpha.node_id],
+        )
+
+        received: list[tuple[Image.Image, str, str, str]] = []
+        loop = QEventLoop()
+        self.workspace.preview_image_requested.connect(
+            lambda image, title, meta, node_id: (
+                received.append((image, title, meta, node_id)),
+                loop.quit(),
+            )
+        )
+
+        self.workspace._on_display_flag_clicked(set_alpha)
+        QTimer.singleShot(3000, loop.quit)
+        loop.exec()
+
+        self.assertTrue(received)
+        self.assertEqual(set_alpha.node_id, received[-1][3])
+        self.assertEqual((12, 34, 56, 78), received[-1][0].getpixel((0, 0)))
+        self.assertTrue(set_alpha.properties["display"])
+
+    def test_transient_color_preview_updates_downstream_without_committing(self) -> None:
+        color = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 10,
+                "green": 20,
+                "blue": 30,
+                "alpha": 255,
+                "width": 2,
+                "height": 1,
+            },
+        )
+        set_alpha = create_graph_node(
+            NodeType.SET_ALPHA,
+            properties={"display": True},
+        )
+        connection = GraphConnection(
+            make_connection_id(),
+            color.node_id,
+            "image",
+            set_alpha.node_id,
+            "image",
+        )
+        self.workspace.project.graph.nodes.extend((color, set_alpha))
+        self.workspace.project.graph.connections.append(connection)
+        self.workspace._scene.rebuild()
+
+        received: list[Image.Image] = []
+        loop = QEventLoop()
+        self.workspace.preview_image_requested.connect(
+            lambda image, _title, _meta, _node_id: (received.append(image), loop.quit())
+        )
+        preview_properties = dict(color.properties)
+        preview_properties.update({"red": 100, "green": 110, "blue": 120})
+
+        self.workspace._on_transient_preview_requested(
+            color,
+            preview_properties,
+            PREVIEW_MODE_DRAFT,
+        )
+        QTimer.singleShot(3000, loop.quit)
+        loop.exec()
+
+        self.assertTrue(received)
+        self.assertEqual((100, 110, 120, 255), received[-1].getpixel((0, 0)))
+        self.assertEqual(10, color.properties["red"])
+        item = self.workspace._scene.node_items[color.node_id]
+        self.assertEqual("#646E78FF", item.subtitle_item.text())
+
+    def test_failed_display_preview_reports_error_instead_of_leaving_stale_image(self) -> None:
+        incomplete = create_graph_node(NodeType.COMBINE_RGBA)
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [incomplete],
+            ),
+            select_node_ids=[incomplete.node_id],
+        )
+
+        failures: list[tuple[str, str, str]] = []
+        loop = QEventLoop()
+        self.workspace.preview_failed.connect(
+            lambda title, message, node_id: (
+                failures.append((title, message, node_id)),
+                loop.quit(),
+            )
+        )
+
+        self.workspace._on_display_flag_clicked(incomplete)
+        QTimer.singleShot(3000, loop.quit)
+        loop.exec()
+
+        self.assertTrue(failures)
+        self.assertEqual(incomplete.node_id, failures[-1][2])
+        self.assertIn("input r is not connected", failures[-1][1])
+
+    def test_graph_preview_error_clears_previous_image(self) -> None:
+        panel = PreviewPanel(allow_detach=False)
+        try:
+            panel.set_graph_preview(
+                Image.new("RGBA", (2, 2), (255, 0, 0, 255)),
+                "Previous",
+                "ready",
+                node_id="old",
+            )
+            self.assertIsNotNone(panel.preview_canvas._source_pixmap)
+
+            panel.set_graph_preview_error(
+                "Combine RGBA",
+                "input R is not connected",
+                node_id="broken",
+            )
+
+            self.assertIsNone(panel.preview_canvas._source_pixmap)
+            self.assertEqual("broken", panel.current_graph_preview_node_id())
+            self.assertEqual("Combine RGBA", panel.asset_label.text())
+            self.assertEqual("input R is not connected", panel.asset_meta_label.text())
+        finally:
+            panel.deleteLater()
+            self.app.processEvents()
 
     def test_selecting_texture_node_without_display_flag_does_not_request_preview(self) -> None:
         texture = create_graph_node(

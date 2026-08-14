@@ -20,6 +20,7 @@ from image_converter.domain.node_graph import (
     NodeGraph,
     NodeGraphProject,
     NodeType,
+    OutputAlphaInputMode,
     OutputMode,
     SocketDirection,
     SocketType,
@@ -344,7 +345,14 @@ class NodeGraphExecutor:
                 target_size = resolved_fallback
             target_size = self._fit_preview_size(target_size, resolved_max_side)
             image = self._compose_output_preview_image(graph, node, target_size, cache).convert("RGBA")
-            return image, f"Output preview · {image.width}x{image.height} · {image.mode}"
+            meta = f"Output preview · {image.width}x{image.height} · {image.mode}"
+            overrides = self._output_channel_overrides(graph, node)
+            if overrides:
+                labels = ", ".join(item.upper() for item in overrides)
+                meta += f" · channel overrides: {labels}"
+            if self._output_alpha_is_multiplied(graph, node):
+                meta += " · alpha: Image × A"
+            return image, meta
         if node.node_type is NodeType.VIEW:
             image = self.render_view_node(
                 graph,
@@ -368,6 +376,31 @@ class NodeGraphExecutor:
             target_size = self._fit_preview_size(self._color_size(node), resolved_max_side)
             image = Image.new("RGBA", target_size, self._color_rgba(node))
             return image, f"Display flag · Color · {image.width}x{image.height} · RGBA"
+
+        image_socket = self._first_image_output_socket(node)
+        if image_socket is not None:
+            preview_connection = GraphConnection(
+                connection_id="display_preview",
+                source_node_id=node.node_id,
+                source_socket_id=image_socket.socket_id,
+                target_node_id="",
+                target_socket_id="",
+            )
+            target_size = self._preview_target_size(
+                graph,
+                preview_connection,
+                cache,
+                resolved_fallback,
+                resolved_max_side,
+            )
+            image = self._evaluate_image_socket(
+                graph,
+                preview_connection,
+                target_size,
+                set(),
+                cache,
+            ).convert("RGBA")
+            return image, f"Display flag · RGBA · {image.width}x{image.height}"
 
         output_socket = self._first_channel_output_socket(node)
         if output_socket is None:
@@ -430,6 +463,27 @@ class NodeGraphExecutor:
         if view_node.node_type is not NodeType.VIEW:
             raise GraphExecutionError(f"{view_node.title}: node is not a View node.")
 
+        image_connection = self._incoming_connection(
+            graph,
+            target_node_id=view_node.node_id,
+            target_socket_id="image",
+        )
+        if image_connection is not None:
+            target_size = self._preview_target_size(
+                graph,
+                image_connection,
+                cache,
+                fallback_size,
+                cache.max_side if max_side is None else max_side,
+            )
+            return self._evaluate_image_socket(
+                graph,
+                image_connection,
+                target_size,
+                set(),
+                cache,
+            ).convert("RGBA")
+
         connection = self._incoming_connection(
             graph,
             target_node_id=view_node.node_id,
@@ -463,7 +517,13 @@ class NodeGraphExecutor:
         issues: list[GraphValidationIssue] = []
         graph = project.graph
         self._prepare_lookup(graph)
-        node_ids = {node.node_id for node in graph.nodes}
+        nodes_by_id = {node.node_id: node for node in graph.nodes}
+        node_ids = set(nodes_by_id)
+        active_node_ids = self._nodes_upstream_of_outputs(
+            graph,
+            self._enabled_output_nodes(graph),
+        )
+        validation_size_cache = NodeGraphPreviewCache(max_bytes=8 * 1024 * 1024)
 
         for node in graph.nodes:
             if not node.node_id:
@@ -474,8 +534,9 @@ class NodeGraphExecutor:
                     )
                 )
             if node.node_type is NodeType.TEXTURE_INPUT:
-                path = Path(str(node.properties.get("path", "")))
-                if not str(path):
+                raw_path = str(node.properties.get("path", "")).strip()
+                path = Path(raw_path)
+                if not raw_path:
                     issues.append(
                         GraphValidationIssue(
                             GraphValidationSeverity.ERROR,
@@ -484,7 +545,7 @@ class NodeGraphExecutor:
                             "path",
                         )
                     )
-                elif not path.exists():
+                elif not path.is_file():
                     issues.append(
                         GraphValidationIssue(
                             GraphValidationSeverity.ERROR,
@@ -502,6 +563,126 @@ class NodeGraphExecutor:
                             f"{node.title}: не подключены каналы {', '.join(missing)}.",
                             node.node_id,
                             ",".join(missing),
+                        )
+                    )
+                overrides = self._output_channel_overrides(graph, node)
+                if overrides:
+                    override_labels = ", ".join(item.upper() for item in overrides)
+                    issues.append(
+                        GraphValidationIssue(
+                            GraphValidationSeverity.WARNING,
+                            f"{node.title}: {override_labels} input overrides the same channel "
+                            "from Image. Upstream Image edits to those channels will not affect "
+                            "this Output.",
+                            node.node_id,
+                            ",".join(overrides),
+                        )
+                    )
+            required_inputs = ()
+            if node.node_id in active_node_ids:
+                required_inputs = {
+                    NodeType.MIX_IMAGE: (
+                        ("a", "b") if self._node_enabled(node) else ("a",)
+                    ),
+                    NodeType.BLEND_IMAGE: (
+                        ("a", "b") if self._node_enabled(node) else ("a",)
+                    ),
+                    NodeType.SPLIT_RGBA: ("image",),
+                    NodeType.COMBINE_RGBA: ("r", "g", "b"),
+                    NodeType.SET_ALPHA: ("image",),
+                }.get(node.node_type, ())
+            missing_inputs = [
+                socket_id
+                for socket_id in required_inputs
+                if self._incoming_connection(
+                    graph,
+                    target_node_id=node.node_id,
+                    target_socket_id=socket_id,
+                )
+                is None
+            ]
+            if missing_inputs:
+                issues.append(
+                    GraphValidationIssue(
+                        GraphValidationSeverity.ERROR,
+                        f"{node.title}: не подключены входы {', '.join(missing_inputs)}.",
+                        node.node_id,
+                        ",".join(missing_inputs),
+                    )
+                )
+
+            if node.node_id in active_node_ids:
+                resolution_socket = ""
+                if node.node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE):
+                    candidate = str(
+                        node.properties.get("resolution_source", "a")
+                    ).lower()
+                    if candidate in {"a", "b", "mask"}:
+                        resolution_socket = candidate
+                elif node.node_type is NodeType.OUTPUT_RGBA:
+                    candidate = str(
+                        node.properties.get("resolution_source", "auto")
+                    ).lower()
+                    if candidate in {"image", "r", "g", "b", "a"}:
+                        resolution_socket = candidate
+                if resolution_socket and self._incoming_connection(
+                    graph,
+                    target_node_id=node.node_id,
+                    target_socket_id=resolution_socket,
+                ) is None:
+                    issues.append(
+                        GraphValidationIssue(
+                            GraphValidationSeverity.ERROR,
+                            f"{node.title}: resolution source {resolution_socket.upper()} is not connected.",
+                            node.node_id,
+                            resolution_socket,
+                        )
+                    )
+
+                size_socket_ids = {
+                    NodeType.MIX_IMAGE: ("a", "b", "mask"),
+                    NodeType.BLEND_IMAGE: ("a", "b", "mask"),
+                    NodeType.SET_ALPHA: ("image", "alpha"),
+                    NodeType.OUTPUT_RGBA: ("image", "r", "g", "b", "a"),
+                }.get(node.node_type, ())
+                input_sizes: list[tuple[str, tuple[int, int]]] = []
+                for socket_id in size_socket_ids:
+                    connection = self._incoming_connection(
+                        graph,
+                        target_node_id=node.node_id,
+                        target_socket_id=socket_id,
+                    )
+                    if connection is None:
+                        continue
+                    size = self._connection_natural_size(
+                        graph,
+                        connection,
+                        validation_size_cache,
+                    )
+                    if size is not None:
+                        input_sizes.append((socket_id, size))
+                unique_sizes = {size for _socket_id, size in input_sizes}
+                if len(unique_sizes) > 1:
+                    first_size = input_sizes[0][1]
+                    aspect_mismatch = any(
+                        size[0] * first_size[1] != first_size[0] * size[1]
+                        for _socket_id, size in input_sizes[1:]
+                    )
+                    details = ", ".join(
+                        f"{socket_id.upper()}={size[0]}x{size[1]}"
+                        for socket_id, size in input_sizes
+                    )
+                    suffix = (
+                        " Aspect ratios differ; full-frame scaling will stretch the inputs."
+                        if aspect_mismatch
+                        else " Inputs will be resampled to the selected working resolution."
+                    )
+                    issues.append(
+                        GraphValidationIssue(
+                            GraphValidationSeverity.WARNING,
+                            f"{node.title}: input sizes differ ({details}).{suffix}",
+                            node.node_id,
+                            "resolution",
                         )
                     )
 
@@ -524,6 +705,62 @@ class NodeGraphExecutor:
                         connection.target_socket_id,
                     )
                 )
+            source_node = nodes_by_id.get(connection.source_node_id)
+            target_node = nodes_by_id.get(connection.target_node_id)
+            if source_node is None or target_node is None:
+                continue
+            source_socket = next(
+                (
+                    socket
+                    for socket in socket_definitions(source_node.node_type)
+                    if socket.socket_id == connection.source_socket_id
+                    and socket.direction is SocketDirection.OUTPUT
+                ),
+                None,
+            )
+            target_socket = next(
+                (
+                    socket
+                    for socket in socket_definitions(target_node.node_type)
+                    if socket.socket_id == connection.target_socket_id
+                    and socket.direction is SocketDirection.INPUT
+                ),
+                None,
+            )
+            if source_socket is None:
+                issues.append(
+                    GraphValidationIssue(
+                        GraphValidationSeverity.ERROR,
+                        f"{source_node.title}: output socket {connection.source_socket_id} не найден.",
+                        source_node.node_id,
+                        connection.source_socket_id,
+                    )
+                )
+            if target_socket is None:
+                issues.append(
+                    GraphValidationIssue(
+                        GraphValidationSeverity.ERROR,
+                        f"{target_node.title}: input socket {connection.target_socket_id} не найден.",
+                        target_node.node_id,
+                        connection.target_socket_id,
+                    )
+                )
+            if (
+                source_socket is not None
+                and target_socket is not None
+                and source_socket.socket_type is not target_socket.socket_type
+            ):
+                issues.append(
+                    GraphValidationIssue(
+                        GraphValidationSeverity.ERROR,
+                        f"Несовместимые сокеты: {source_node.title}.{source_socket.name} "
+                        f"({source_socket.socket_type.value}) -> "
+                        f"{target_node.title}.{target_socket.name} "
+                        f"({target_socket.socket_type.value}).",
+                        target_node.node_id,
+                        target_socket.socket_id,
+                    )
+                )
 
         if not self._enabled_output_nodes(graph):
             issues.append(
@@ -537,6 +774,26 @@ class NodeGraphExecutor:
         for issue in issues:
             deduped[(issue.node_id, issue.socket_id, issue.message)] = issue
         return tuple(deduped.values())
+
+    @staticmethod
+    def _nodes_upstream_of_outputs(
+        graph: NodeGraph,
+        output_nodes: Iterable[GraphNode],
+    ) -> set[str]:
+        incoming_by_node: dict[str, list[GraphConnection]] = defaultdict(list)
+        for connection in graph.connections:
+            incoming_by_node[connection.target_node_id].append(connection)
+
+        active = {node.node_id for node in output_nodes}
+        pending = list(active)
+        while pending:
+            node_id = pending.pop()
+            for connection in incoming_by_node.get(node_id, ()):
+                if connection.source_node_id in active:
+                    continue
+                active.add(connection.source_node_id)
+                pending.append(connection.source_node_id)
+        return active
 
     def export_enabled_outputs(
         self,
@@ -714,15 +971,70 @@ class NodeGraphExecutor:
         cache: NodeGraphPreviewCache | None = None,
     ) -> Image.Image:
         mode = self._output_mode(output_node)
-        channels = [
-            self._evaluate_output_input(graph, output_node, socket_id, target_size, cache)
-            for socket_id in ("r", "g", "b")
-        ]
-        if mode is OutputMode.RGBA:
-            alpha = self._evaluate_optional_output_input(graph, output_node, "a", target_size, cache)
-            channels.append(alpha)
+        resolved_cache = cache or NodeGraphPreviewCache(max_side=0)
+        image_connection = self._incoming_connection(
+            graph,
+            target_node_id=output_node.node_id,
+            target_socket_id="image",
+        )
+        if image_connection is not None:
+            base = self._evaluate_image_socket(
+                graph,
+                image_connection,
+                target_size,
+                set(),
+                resolved_cache,
+            ).convert("RGBA")
+            channels = list(base.split())
+        else:
+            channels = [
+                self._evaluate_output_input_cached(
+                    graph,
+                    output_node,
+                    socket_id,
+                    target_size,
+                    resolved_cache,
+                )
+                for socket_id in ("r", "g", "b")
+            ]
+            channels.append(
+                self._evaluate_optional_output_input_cached(
+                    graph,
+                    output_node,
+                    "a",
+                    target_size,
+                    resolved_cache,
+                )
+            )
 
-        return Image.merge("RGBA" if mode is OutputMode.RGBA else "RGB", tuple(channels))
+        if image_connection is not None:
+            for index, socket_id in enumerate(("r", "g", "b", "a")):
+                connection = self._incoming_connection(
+                    graph,
+                    target_node_id=output_node.node_id,
+                    target_socket_id=socket_id,
+                )
+                if connection is None:
+                    continue
+                input_channel = self._evaluate_channel_socket_cached(
+                    graph,
+                    connection,
+                    target_size,
+                    set(),
+                    resolved_cache,
+                )
+                if (
+                    socket_id == "a"
+                    and self._output_alpha_input_mode(output_node)
+                    is OutputAlphaInputMode.MULTIPLY
+                ):
+                    channels[index] = ImageChops.multiply(channels[index], input_channel)
+                else:
+                    channels[index] = input_channel
+
+        if mode is OutputMode.RGB:
+            return Image.merge("RGB", tuple(channels[:3]))
+        return Image.merge("RGBA", tuple(channels))
 
     def _compose_output_preview_image(
         self,
@@ -735,22 +1047,53 @@ class NodeGraphExecutor:
         if missing:
             raise GraphExecutionError(f"не подключены каналы {', '.join(missing)}")
 
-        mode = self._output_mode(output_node)
-        channels = [
-            self._evaluate_output_input_cached(graph, output_node, socket_id, target_size, cache)
-            for socket_id in ("r", "g", "b")
-        ]
-        if mode is OutputMode.RGBA:
-            alpha = self._evaluate_optional_output_input_cached(
-                graph,
-                output_node,
-                "a",
-                target_size,
-                cache,
-            )
-            channels.append(alpha)
+        return self._compose_output_image(graph, output_node, target_size, cache)
 
-        return Image.merge("RGBA" if mode is OutputMode.RGBA else "RGB", tuple(channels))
+    def _output_channel_overrides(
+        self,
+        graph: NodeGraph,
+        output_node: GraphNode,
+    ) -> tuple[str, ...]:
+        if self._incoming_connection(
+            graph,
+            target_node_id=output_node.node_id,
+            target_socket_id="image",
+        ) is None:
+            return ()
+        override_socket_ids = ["r", "g", "b"]
+        if self._output_alpha_input_mode(output_node) is OutputAlphaInputMode.REPLACE:
+            override_socket_ids.append("a")
+        return tuple(
+            socket_id
+            for socket_id in override_socket_ids
+            if self._incoming_connection(
+                graph,
+                target_node_id=output_node.node_id,
+                target_socket_id=socket_id,
+            )
+            is not None
+        )
+
+    def _output_alpha_is_multiplied(
+        self,
+        graph: NodeGraph,
+        output_node: GraphNode,
+    ) -> bool:
+        return (
+            self._output_alpha_input_mode(output_node) is OutputAlphaInputMode.MULTIPLY
+            and self._incoming_connection(
+                graph,
+                target_node_id=output_node.node_id,
+                target_socket_id="image",
+            )
+            is not None
+            and self._incoming_connection(
+                graph,
+                target_node_id=output_node.node_id,
+                target_socket_id="a",
+            )
+            is not None
+        )
 
     def _evaluate_output_input(
         self,
@@ -823,6 +1166,295 @@ class NodeGraphExecutor:
         if connection is None:
             return Image.new("L", target_size, 255)
         return self._evaluate_channel_socket_cached(graph, connection, target_size, set(), cache)
+
+    def _evaluate_image_socket(
+        self,
+        graph: NodeGraph,
+        connection: GraphConnection,
+        target_size: tuple[int, int],
+        visiting: set[tuple[str, str]],
+        cache: NodeGraphPreviewCache | None = None,
+    ) -> Image.Image:
+        key = (connection.source_node_id, connection.source_socket_id)
+        cache_key = (connection.source_node_id, connection.source_socket_id, target_size)
+        if cache is not None:
+            cached = cache.get_image("image", cache_key)
+            if cached is not None:
+                return cached.copy()
+        if key in visiting:
+            raise GraphExecutionError("Graph contains a cycle.")
+        visiting.add(key)
+        try:
+            source_node = self._find_node(graph, connection.source_node_id)
+            if source_node is None:
+                raise GraphExecutionError(f"Source node {connection.source_node_id} not found.")
+
+            if source_node.node_type is NodeType.TEXTURE_INPUT:
+                if cache is None:
+                    image = self._load_texture_preview_image(source_node)
+                    if image.size != target_size:
+                        image = image.resize(target_size, RESAMPLING_LANCZOS)
+                else:
+                    image = self._load_texture_preview_image_cached(
+                        source_node,
+                        cache,
+                        target_size,
+                    )
+            elif source_node.node_type is NodeType.COLOR:
+                image = Image.new("RGBA", target_size, self._color_rgba(source_node))
+            elif source_node.node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE):
+                working_size = self._image_operation_size(
+                    graph,
+                    source_node,
+                    target_size,
+                    cache,
+                )
+                a_image = self._evaluate_required_image_input(
+                    graph,
+                    source_node,
+                    "a",
+                    working_size,
+                    visiting,
+                    cache,
+                )
+                if not self._node_enabled(source_node):
+                    image = a_image
+                else:
+                    b_image = self._evaluate_required_image_input(
+                        graph,
+                        source_node,
+                        "b",
+                        working_size,
+                        visiting,
+                        cache,
+                    )
+                    mask = self._evaluate_optional_mask_input(
+                        graph,
+                        source_node,
+                        "mask",
+                        working_size,
+                        visiting,
+                        cache,
+                        self._mask_resampling(source_node),
+                    )
+                    if source_node.node_type is NodeType.MIX_IMAGE:
+                        if mask is None:
+                            factor = max(
+                                0,
+                                min(self._property_int(source_node, "factor", 50), 100),
+                            ) / 100.0
+                            image = Image.blend(
+                                a_image.convert("RGBA"),
+                                b_image.convert("RGBA"),
+                                factor,
+                            )
+                        else:
+                            image = Image.composite(
+                                b_image.convert("RGBA"),
+                                a_image.convert("RGBA"),
+                                mask.convert("L"),
+                            )
+                    else:
+                        image = self._apply_image_blend(
+                            a_image,
+                            b_image,
+                            source_node,
+                            mask,
+                        )
+            elif source_node.node_type is NodeType.COMBINE_RGBA:
+                channels = [
+                    self._evaluate_required_channel_input(
+                        graph,
+                        source_node,
+                        socket_id,
+                        target_size,
+                        visiting,
+                        cache,
+                    )
+                    for socket_id in ("r", "g", "b")
+                ]
+                alpha = self._evaluate_optional_channel_input(
+                    graph,
+                    source_node,
+                    "a",
+                    target_size,
+                    visiting,
+                    cache,
+                )
+                if alpha is None:
+                    alpha = Image.new("L", target_size, 255)
+                image = Image.merge("RGBA", (*channels, alpha.convert("L")))
+            elif source_node.node_type is NodeType.SET_ALPHA:
+                image = self._evaluate_required_image_input(
+                    graph,
+                    source_node,
+                    "image",
+                    target_size,
+                    visiting,
+                    cache,
+                ).convert("RGBA")
+                mask = self._evaluate_optional_mask_input(
+                    graph,
+                    source_node,
+                    "alpha",
+                    target_size,
+                    visiting,
+                    cache,
+                    self._mask_resampling(source_node),
+                )
+                if mask is not None:
+                    image = self._apply_image_mask(image, mask, source_node)
+            else:
+                raise GraphExecutionError(
+                    f"Unsupported image source node: {source_node.node_type.value}"
+                )
+        finally:
+            visiting.remove(key)
+
+        if image.size != target_size:
+            image = image.resize(target_size, RESAMPLING_LANCZOS)
+        result = image.convert("RGBA").copy()
+        if cache is not None:
+            cache.put_image("image", cache_key, result.copy())
+        return result
+
+    def _evaluate_required_image_input(
+        self,
+        graph: NodeGraph,
+        node: GraphNode,
+        socket_id: str,
+        target_size: tuple[int, int],
+        visiting: set[tuple[str, str]],
+        cache: NodeGraphPreviewCache | None,
+    ) -> Image.Image:
+        connection = self._incoming_connection(
+            graph,
+            target_node_id=node.node_id,
+            target_socket_id=socket_id,
+        )
+        if connection is None:
+            if (
+                socket_id == "b"
+                and node.node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE)
+                and self._incoming_connection(
+                    graph,
+                    target_node_id=node.node_id,
+                    target_socket_id="mask",
+                )
+                is not None
+            ):
+                raise GraphExecutionError(
+                    f"{node.title}: input B is not connected. "
+                    "To apply one channel mask to a single Color/Image, use Apply Mask."
+                )
+            raise GraphExecutionError(f"{node.title}: input {socket_id} is not connected.")
+        return self._evaluate_image_socket(
+            graph,
+            connection,
+            target_size,
+            visiting,
+            cache,
+        )
+
+    def _evaluate_required_channel_input(
+        self,
+        graph: NodeGraph,
+        node: GraphNode,
+        socket_id: str,
+        target_size: tuple[int, int],
+        visiting: set[tuple[str, str]],
+        cache: NodeGraphPreviewCache | None,
+    ) -> Image.Image:
+        connection = self._incoming_connection(
+            graph,
+            target_node_id=node.node_id,
+            target_socket_id=socket_id,
+        )
+        if connection is None:
+            raise GraphExecutionError(f"{node.title}: input {socket_id} is not connected.")
+        if cache is None:
+            return self._evaluate_channel_socket(
+                graph,
+                connection,
+                target_size,
+                visiting,
+            )
+        return self._evaluate_channel_socket_cached(
+            graph,
+            connection,
+            target_size,
+            visiting,
+            cache,
+        )
+
+    def _evaluate_optional_channel_input(
+        self,
+        graph: NodeGraph,
+        node: GraphNode,
+        socket_id: str,
+        target_size: tuple[int, int],
+        visiting: set[tuple[str, str]],
+        cache: NodeGraphPreviewCache | None,
+    ) -> Image.Image | None:
+        connection = self._incoming_connection(
+            graph,
+            target_node_id=node.node_id,
+            target_socket_id=socket_id,
+        )
+        if connection is None:
+            return None
+        if cache is None:
+            return self._evaluate_channel_socket(
+                graph,
+                connection,
+                target_size,
+                visiting,
+            )
+        return self._evaluate_channel_socket_cached(
+            graph,
+            connection,
+            target_size,
+            visiting,
+            cache,
+        )
+
+    def _evaluate_optional_mask_input(
+        self,
+        graph: NodeGraph,
+        node: GraphNode,
+        socket_id: str,
+        target_size: tuple[int, int],
+        visiting: set[tuple[str, str]],
+        cache: NodeGraphPreviewCache | None,
+        resampling,
+    ) -> Image.Image | None:
+        connection = self._incoming_connection(
+            graph,
+            target_node_id=node.node_id,
+            target_socket_id=socket_id,
+        )
+        if connection is None:
+            return None
+        source_size = self._connection_natural_size(graph, connection, cache) or target_size
+        if cache is None:
+            mask = self._evaluate_channel_socket(
+                graph,
+                connection,
+                source_size,
+                visiting,
+            )
+        else:
+            mask = self._evaluate_channel_socket_cached(
+                graph,
+                connection,
+                source_size,
+                visiting,
+                cache,
+            )
+        mask = mask.convert("L")
+        if mask.size != target_size:
+            mask = mask.resize(target_size, resampling)
+        return mask
 
     def _evaluate_channel_socket(
         self,
@@ -978,6 +1610,21 @@ class NodeGraphExecutor:
                 channel = Image.merge("RGB", (red, green, blue)).convert("L")
             else:
                 channel = red
+        elif source_node.node_type is NodeType.SPLIT_RGBA:
+            image = self._evaluate_required_image_input(
+                graph,
+                source_node,
+                "image",
+                target_size,
+                visiting,
+                None,
+            ).convert("RGBA")
+            channel_name = connection.source_socket_id.upper()
+            if channel_name not in {"R", "G", "B", "A"}:
+                raise GraphExecutionError(
+                    f"Unsupported Split RGBA channel: {connection.source_socket_id}"
+                )
+            channel = image.getchannel(channel_name)
         else:
             raise GraphExecutionError(f"Unsupported source node: {source_node.node_type.value}")
 
@@ -1191,6 +1838,21 @@ class NodeGraphExecutor:
                         cache,
                     )
                     channel = Image.merge("RGB", (red, green, blue)).convert("L")
+            elif source_node.node_type is NodeType.SPLIT_RGBA:
+                image = self._evaluate_required_image_input(
+                    graph,
+                    source_node,
+                    "image",
+                    target_size,
+                    visiting,
+                    cache,
+                ).convert("RGBA")
+                channel_name = connection.source_socket_id.upper()
+                if channel_name not in {"R", "G", "B", "A"}:
+                    raise GraphExecutionError(
+                        f"Unsupported Split RGBA channel: {connection.source_socket_id}"
+                    )
+                channel = image.getchannel(channel_name)
             else:
                 raise GraphExecutionError(f"Unsupported source node: {source_node.node_type.value}")
         finally:
@@ -1208,8 +1870,23 @@ class NodeGraphExecutor:
         output_node: GraphNode,
         cache: NodeGraphPreviewCache | None = None,
     ) -> tuple[int, int] | None:
+        resolution_source = str(
+            output_node.properties.get("resolution_source", "auto")
+        ).lower()
+        if resolution_source == "custom":
+            return self._custom_resolution(output_node)
+        if resolution_source in {"image", "r", "g", "b", "a"}:
+            connection = self._incoming_connection(
+                graph,
+                target_node_id=output_node.node_id,
+                target_socket_id=resolution_source,
+            )
+            if connection is None:
+                return None
+            return self._connection_natural_size(graph, connection, cache)
+
         connections = []
-        for socket_id in ("r", "g", "b", "a"):
+        for socket_id in ("image", "r", "g", "b", "a"):
             connection = self._incoming_connection(
                 graph,
                 target_node_id=output_node.node_id,
@@ -1226,6 +1903,42 @@ class NodeGraphExecutor:
             if target_size is not None:
                 return target_size
         return None
+
+    def _image_operation_size(
+        self,
+        graph: NodeGraph,
+        node: GraphNode,
+        fallback_size: tuple[int, int],
+        cache: NodeGraphPreviewCache | None,
+    ) -> tuple[int, int]:
+        resolution_source = str(
+            node.properties.get("resolution_source", "a")
+        ).lower()
+        if resolution_source == "custom":
+            return self._custom_resolution(node)
+        if resolution_source not in {"a", "b", "mask"}:
+            resolution_source = "a"
+        connection = self._incoming_connection(
+            graph,
+            target_node_id=node.node_id,
+            target_socket_id=resolution_source,
+        )
+        if connection is None:
+            return fallback_size
+        return self._connection_natural_size(graph, connection, cache) or fallback_size
+
+    def _connection_natural_size(
+        self,
+        graph: NodeGraph,
+        connection: GraphConnection,
+        cache: NodeGraphPreviewCache | None = None,
+    ) -> tuple[int, int] | None:
+        return self._find_upstream_texture_size(
+            graph,
+            connection,
+            set(),
+            cache,
+        ) or self._find_upstream_color_size(graph, connection, set())
 
     def _find_upstream_texture_size(
         self,
@@ -1260,6 +1973,36 @@ class NodeGraphExecutor:
                 return self._find_first_upstream_texture_size(graph, source_node, ("a", "b"), visiting, cache)
             if source_node.node_type is NodeType.LUMINANCE:
                 return self._find_first_upstream_texture_size(graph, source_node, ("r", "g", "b"), visiting, cache)
+            if source_node.node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE):
+                resolution_source = str(
+                    source_node.properties.get("resolution_source", "a")
+                ).lower()
+                if resolution_source == "custom":
+                    return self._custom_resolution(source_node)
+                socket_ids = (
+                    (resolution_source,)
+                    if resolution_source in {"a", "b", "mask"}
+                    else ("a", "b", "mask")
+                )
+                return self._find_first_upstream_texture_size(
+                    graph,
+                    source_node,
+                    socket_ids,
+                    visiting,
+                    cache,
+                )
+            if source_node.node_type is NodeType.SPLIT_RGBA:
+                return self._find_first_upstream_texture_size(
+                    graph, source_node, ("image",), visiting, cache
+                )
+            if source_node.node_type is NodeType.COMBINE_RGBA:
+                return self._find_first_upstream_texture_size(
+                    graph, source_node, ("r", "g", "b", "a"), visiting, cache
+                )
+            if source_node.node_type is NodeType.SET_ALPHA:
+                return self._find_first_upstream_texture_size(
+                    graph, source_node, ("image",), visiting, cache
+                )
             return None
         finally:
             visiting.remove(key)
@@ -1316,6 +2059,32 @@ class NodeGraphExecutor:
                 return self._find_first_upstream_color_size(graph, source_node, ("a", "b"), visiting)
             if source_node.node_type is NodeType.LUMINANCE:
                 return self._find_first_upstream_color_size(graph, source_node, ("r", "g", "b"), visiting)
+            if source_node.node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE):
+                resolution_source = str(
+                    source_node.properties.get("resolution_source", "a")
+                ).lower()
+                if resolution_source == "custom":
+                    return self._custom_resolution(source_node)
+                socket_ids = (
+                    (resolution_source,)
+                    if resolution_source in {"a", "b", "mask"}
+                    else ("a", "b", "mask")
+                )
+                return self._find_first_upstream_color_size(
+                    graph, source_node, socket_ids, visiting
+                )
+            if source_node.node_type is NodeType.SPLIT_RGBA:
+                return self._find_first_upstream_color_size(
+                    graph, source_node, ("image",), visiting
+                )
+            if source_node.node_type is NodeType.COMBINE_RGBA:
+                return self._find_first_upstream_color_size(
+                    graph, source_node, ("r", "g", "b", "a"), visiting
+                )
+            if source_node.node_type is NodeType.SET_ALPHA:
+                return self._find_first_upstream_color_size(
+                    graph, source_node, ("image",), visiting
+                )
             return None
         finally:
             visiting.remove(key)
@@ -1349,6 +2118,8 @@ class NodeGraphExecutor:
         max_side: int | None = None,
     ) -> tuple[int, int]:
         target_size = self._find_upstream_texture_size(graph, connection, set(), cache)
+        if target_size is None:
+            target_size = self._find_upstream_color_size(graph, connection, set())
         if target_size is None:
             target_size = fallback_size
         return self._fit_preview_size(
@@ -1506,10 +2277,75 @@ class NodeGraphExecutor:
             return a
         return Image.blend(a, blended, opacity)
 
+    def _apply_image_blend(
+        self,
+        a_image: Image.Image,
+        b_image: Image.Image,
+        node: GraphNode,
+        mask: Image.Image | None = None,
+    ) -> Image.Image:
+        a = a_image.convert("RGBA")
+        b = b_image.convert("RGBA")
+        blended = Image.merge(
+            "RGBA",
+            tuple(
+                self._apply_blend(a_channel, b_channel, node)
+                for a_channel, b_channel in zip(a.split(), b.split(), strict=True)
+            ),
+        )
+        if mask is None:
+            return blended
+        return Image.composite(blended, a, mask.convert("L"))
+
+    def _apply_image_mask(
+        self,
+        image: Image.Image,
+        mask: Image.Image,
+        node: GraphNode,
+    ) -> Image.Image:
+        source = image.convert("RGBA")
+        red, green, blue, alpha = source.split()
+        resolved_mask = mask.convert("L")
+        mode = str(node.properties.get("mask_mode", "replace_alpha")).lower()
+
+        if mode == "multiply_rgb":
+            return Image.merge(
+                "RGBA",
+                (
+                    ImageChops.multiply(red, resolved_mask),
+                    ImageChops.multiply(green, resolved_mask),
+                    ImageChops.multiply(blue, resolved_mask),
+                    alpha,
+                ),
+            )
+        if mode == "multiply_alpha":
+            return Image.merge(
+                "RGBA",
+                (red, green, blue, ImageChops.multiply(alpha, resolved_mask)),
+            )
+        if mode == "multiply_rgba":
+            return Image.merge(
+                "RGBA",
+                tuple(
+                    ImageChops.multiply(channel, resolved_mask)
+                    for channel in (red, green, blue, alpha)
+                ),
+            )
+        return Image.merge("RGBA", (red, green, blue, resolved_mask))
+
+    @staticmethod
+    def _mask_resampling(node: GraphNode):
+        value = str(node.properties.get("mask_filter", "bilinear")).lower()
+        if value == "nearest":
+            return Image.Resampling.NEAREST
+        if value == "lanczos":
+            return Image.Resampling.LANCZOS
+        return Image.Resampling.BILINEAR
+
     @staticmethod
     def _load_texture_channel(node: GraphNode, socket_id: str) -> Image.Image:
         path = Path(str(node.properties.get("path", "")))
-        if not path.exists():
+        if not path.is_file():
             raise GraphExecutionError(f"{node.title}: texture not found: {path}")
 
         with Image.open(path) as image:
@@ -1529,7 +2365,7 @@ class NodeGraphExecutor:
     @staticmethod
     def _load_texture_preview_image(node: GraphNode) -> Image.Image:
         path = Path(str(node.properties.get("path", "")))
-        if not path.exists():
+        if not path.is_file():
             raise GraphExecutionError(f"{node.title}: texture not found: {path}")
 
         with Image.open(path) as image:
@@ -1592,12 +2428,17 @@ class NodeGraphExecutor:
                 return cached_size
 
         path = Path(str(node.properties.get("path", "")))
-        if not path.exists():
+        if not path.is_file():
             if cache is not None:
                 cache.put_texture_size(node.node_id, None)
             return None
-        with Image.open(path) as image:
-            size = image.size
+        try:
+            with Image.open(path) as image:
+                size = image.size
+        except (OSError, ValueError):
+            if cache is not None:
+                cache.put_texture_size(node.node_id, None)
+            return None
         if cache is not None:
             cache.put_texture_size(node.node_id, size)
         return size
@@ -1643,6 +2484,17 @@ class NodeGraphExecutor:
         return (dimensions[0], dimensions[1])
 
     @staticmethod
+    def _custom_resolution(node: GraphNode) -> tuple[int, int]:
+        dimensions = []
+        for property_name in ("resolution_width", "resolution_height"):
+            try:
+                value = int(node.properties.get(property_name, 1024))
+            except (TypeError, ValueError):
+                value = 1024
+            dimensions.append(max(1, min(value, 16384)))
+        return (dimensions[0], dimensions[1])
+
+    @staticmethod
     def _node_enabled(node: GraphNode) -> bool:
         return bool(node.properties.get("enabled", True))
 
@@ -1675,6 +2527,20 @@ class NodeGraphExecutor:
             return OutputMode.RGBA
 
     @staticmethod
+    def _output_alpha_input_mode(node: GraphNode) -> OutputAlphaInputMode:
+        try:
+            return OutputAlphaInputMode(
+                str(
+                    node.properties.get(
+                        "alpha_input_mode",
+                        OutputAlphaInputMode.MULTIPLY.value,
+                    )
+                )
+            )
+        except ValueError:
+            return OutputAlphaInputMode.MULTIPLY
+
+    @staticmethod
     def _first_channel_output_socket(node: GraphNode):
         return next(
             (
@@ -1682,6 +2548,18 @@ class NodeGraphExecutor:
                 for socket in socket_definitions(node.node_type)
                 if socket.direction is SocketDirection.OUTPUT
                 and socket.socket_type is SocketType.CHANNEL
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _first_image_output_socket(node: GraphNode):
+        return next(
+            (
+                socket
+                for socket in socket_definitions(node.node_type)
+                if socket.direction is SocketDirection.OUTPUT
+                and socket.socket_type is SocketType.IMAGE
             ),
             None,
         )
@@ -1762,6 +2640,12 @@ class NodeGraphExecutor:
         ]
 
     def _missing_required_output_inputs(self, graph: NodeGraph, node: GraphNode) -> tuple[str, ...]:
+        if self._incoming_connection(
+            graph,
+            target_node_id=node.node_id,
+            target_socket_id="image",
+        ) is not None:
+            return ()
         missing = []
         for socket_id in ("r", "g", "b"):
             if self._incoming_connection(

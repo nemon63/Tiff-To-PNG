@@ -52,10 +52,12 @@ from image_converter.domain.node_graph import (
     OutputMode,
     OutputProfile,
     SocketDirection,
+    SocketType,
     create_graph_node,
     incoming_connection,
     make_connection_id,
     make_node_id,
+    node_bypass_socket_pair,
     node_has_enable_flag,
     node_has_resettable_parameters,
     node_type_label,
@@ -250,7 +252,7 @@ class OutputProfilePlan:
 
 class GraphPreviewWorker(QObject):
     finished = pyqtSignal(int, object, str, str, str)
-    failed = pyqtSignal(int, str, str)
+    failed = pyqtSignal(int, str, str, str)
     completed = pyqtSignal()
 
     def __init__(
@@ -289,7 +291,12 @@ class GraphPreviewWorker(QObject):
                 meta = f"Output preview · {image.width}x{image.height} · {self._mode_label}{suffix}"
             self.finished.emit(self._generation, image, self._node.title, meta, self._node.node_id)
         except (GraphExecutionError, OSError, ValueError) as exc:
-            self.failed.emit(self._generation, self._node.title, str(exc))
+            self.failed.emit(
+                self._generation,
+                self._node.title,
+                str(exc),
+                self._node.node_id,
+            )
         finally:
             self.completed.emit()
 
@@ -298,6 +305,7 @@ class GraphWorkspace(QWidget):
     export_requested = pyqtSignal()
     output_export_requested = pyqtSignal(object)
     preview_image_requested = pyqtSignal(object, str, str, str)
+    preview_failed = pyqtSignal(str, str, str)
     status_message = pyqtSignal(str)
     watched_paths_changed = pyqtSignal(tuple)
     assets_changed = pyqtSignal(tuple)
@@ -316,7 +324,12 @@ class GraphWorkspace(QWidget):
         self._preview_threads: list[QThread] = []
         self._preview_workers: list[GraphPreviewWorker] = []
         self._preview_inflight_generation = 0
-        self._pending_preview_request: tuple[str, str, str] | None = None
+        self._pending_preview_request: tuple[
+            str,
+            str,
+            str,
+            dict[str, dict] | None,
+        ] | None = None
         self._preview_dirty_node_ids: set[str] = set()
         self._preview_full_reset_pending = False
         self._last_preview_quality_request = PREVIEW_MODE_FULL
@@ -451,6 +464,9 @@ class GraphWorkspace(QWidget):
         self.view.node_add_requested.connect(self.add_node_of_type)
         self.properties_panel = NodePropertiesPanel()
         self.properties_panel.node_changed.connect(self._on_node_properties_changed)
+        self.properties_panel.transient_preview_requested.connect(
+            self._on_transient_preview_requested
+        )
         self.properties_panel.preview_refresh_requested.connect(self._on_preview_refresh_requested)
         self.properties_panel.output_profile_apply_requested.connect(self._apply_output_profile)
         self.properties_panel.output_inputs_clear_requested.connect(self._clear_output_inputs)
@@ -1049,6 +1065,11 @@ class GraphWorkspace(QWidget):
             NodeType.ERODE_CHANNEL,
             NodeType.BLEND_CHANNEL,
             NodeType.LUMINANCE,
+            NodeType.MIX_IMAGE,
+            NodeType.BLEND_IMAGE,
+            NodeType.SPLIT_RGBA,
+            NodeType.COMBINE_RGBA,
+            NodeType.SET_ALPHA,
         ):
             return 1
         return 2
@@ -1228,25 +1249,166 @@ class GraphWorkspace(QWidget):
             return
         if not node_ids and not connection_ids:
             return
+        replacement_connections = self._dissolve_replacement_connections(
+            node_ids,
+            connection_ids,
+        )
         self._push_graph_command(
             DeleteItemsCommand(
                 self.project.graph,
                 self._on_graph_command_changed,
                 node_ids=node_ids,
                 connection_ids=connection_ids,
+                replacement_connections=replacement_connections,
             )
         )
+        if replacement_connections:
+            suffix = "connection" if len(replacement_connections) == 1 else "connections"
+            self.status_message.emit(
+                f"Node dissolved; restored {len(replacement_connections)} {suffix}."
+            )
+
+    def _dissolve_replacement_connections(
+        self,
+        node_ids: Iterable[str],
+        connection_ids: Iterable[str],
+    ) -> list[GraphConnection]:
+        resolved_node_ids = tuple(node_ids)
+        if len(resolved_node_ids) != 1 or tuple(connection_ids):
+            return []
+
+        node_id = resolved_node_ids[0]
+        node = next(
+            (candidate for candidate in self.project.graph.nodes if candidate.node_id == node_id),
+            None,
+        )
+        if node is None:
+            return []
+        bypass_pair = node_bypass_socket_pair(node.node_type)
+        if bypass_pair is None:
+            return []
+        input_socket_id, output_socket_id = bypass_pair
+        incoming = next(
+            (
+                connection
+                for connection in self.project.graph.connections
+                if connection.target_node_id == node_id
+                and connection.target_socket_id == input_socket_id
+            ),
+            None,
+        )
+        if incoming is None:
+            return []
+
+        source_node = next(
+            (
+                candidate
+                for candidate in self.project.graph.nodes
+                if candidate.node_id == incoming.source_node_id
+            ),
+            None,
+        )
+        if source_node is None:
+            return []
+        source_socket = next(
+            (
+                socket
+                for socket in socket_definitions(source_node.node_type)
+                if socket.socket_id == incoming.source_socket_id
+                and socket.direction is SocketDirection.OUTPUT
+            ),
+            None,
+        )
+        if source_socket is None:
+            return []
+
+        incident_connection_ids = {
+            connection.connection_id
+            for connection in self.project.graph.connections
+            if connection.source_node_id == node_id or connection.target_node_id == node_id
+        }
+        occupied_targets = {
+            (connection.target_node_id, connection.target_socket_id)
+            for connection in self.project.graph.connections
+            if connection.connection_id not in incident_connection_ids
+        }
+        replacements: list[GraphConnection] = []
+        replacement_targets: set[tuple[str, str]] = set()
+        for outgoing in self.project.graph.connections:
+            if (
+                outgoing.source_node_id != node_id
+                or outgoing.source_socket_id != output_socket_id
+                or outgoing.target_node_id == incoming.source_node_id
+            ):
+                continue
+            target_key = (outgoing.target_node_id, outgoing.target_socket_id)
+            if target_key in occupied_targets or target_key in replacement_targets:
+                continue
+            target_node = next(
+                (
+                    candidate
+                    for candidate in self.project.graph.nodes
+                    if candidate.node_id == outgoing.target_node_id
+                ),
+                None,
+            )
+            if target_node is None:
+                continue
+            target_socket = next(
+                (
+                    socket
+                    for socket in socket_definitions(target_node.node_type)
+                    if socket.socket_id == outgoing.target_socket_id
+                    and socket.direction is SocketDirection.INPUT
+                ),
+                None,
+            )
+            if target_socket is None or target_socket.socket_type is not source_socket.socket_type:
+                continue
+            replacements.append(
+                GraphConnection(
+                    connection_id=make_connection_id(),
+                    source_node_id=incoming.source_node_id,
+                    source_socket_id=incoming.source_socket_id,
+                    target_node_id=outgoing.target_node_id,
+                    target_socket_id=outgoing.target_socket_id,
+                )
+            )
+            replacement_targets.add(target_key)
+        return replacements
 
     def _on_connection_requested(
         self,
         connection: GraphConnection,
         rewire_connection: object | None = None,
     ) -> None:
-        remove_connections = (
+        remove_connections = list(
             [rewire_connection]
             if isinstance(rewire_connection, GraphConnection)
             else []
         )
+        cleared_overrides = 0
+        target_node = next(
+            (
+                node
+                for node in self.project.graph.nodes
+                if node.node_id == connection.target_node_id
+            ),
+            None,
+        )
+        if (
+            target_node is not None
+            and target_node.node_type is NodeType.OUTPUT_RGBA
+            and connection.target_socket_id == "image"
+        ):
+            channel_connections = [
+                candidate
+                for candidate in self.project.graph.connections
+                if candidate.target_node_id == target_node.node_id
+                and candidate.target_socket_id in {"r", "g", "b", "a"}
+            ]
+            remove_connections.extend(channel_connections)
+            cleared_overrides = len(channel_connections)
         self._push_graph_command(
             ReplaceInputConnectionCommand(
                 self.project.graph,
@@ -1256,7 +1418,12 @@ class GraphWorkspace(QWidget):
             ),
             select_node_ids=[connection.target_node_id],
         )
-        self.status_message.emit("Connection created.")
+        if cleared_overrides:
+            self.status_message.emit(
+                f"Image connected; cleared {cleared_overrides} previous channel override(s)."
+            )
+        else:
+            self.status_message.emit("Connection created.")
 
     def _on_connection_delete_requested(self, connection: GraphConnection) -> None:
         self._push_graph_command(
@@ -2042,7 +2209,11 @@ class GraphWorkspace(QWidget):
         if not isinstance(context, PortItem):
             return []
         if context.direction is SocketDirection.OUTPUT:
-            target_socket_id = self._first_channel_input_socket_id(node.node_type)
+            target_socket_id = self._first_socket_id(
+                node.node_type,
+                SocketDirection.INPUT,
+                context.socket_type,
+            )
             if target_socket_id is None:
                 return []
             return [
@@ -2055,7 +2226,11 @@ class GraphWorkspace(QWidget):
                 )
             ]
 
-        source_socket_id = self._first_channel_output_socket_id(node.node_type)
+        source_socket_id = self._first_socket_id(
+            node.node_type,
+            SocketDirection.OUTPUT,
+            context.socket_type,
+        )
         if source_socket_id is None:
             return []
         return [
@@ -2143,22 +2318,31 @@ class GraphWorkspace(QWidget):
 
     @staticmethod
     def _first_channel_input_socket_id(node_type: NodeType) -> str | None:
-        return next(
-            (
-                socket.socket_id
-                for socket in socket_definitions(node_type)
-                if socket.direction is SocketDirection.INPUT
-            ),
-            None,
+        return GraphWorkspace._first_socket_id(
+            node_type,
+            SocketDirection.INPUT,
+            SocketType.CHANNEL,
         )
 
     @staticmethod
     def _first_channel_output_socket_id(node_type: NodeType) -> str | None:
+        return GraphWorkspace._first_socket_id(
+            node_type,
+            SocketDirection.OUTPUT,
+            SocketType.CHANNEL,
+        )
+
+    @staticmethod
+    def _first_socket_id(
+        node_type: NodeType,
+        direction: SocketDirection,
+        socket_type: SocketType,
+    ) -> str | None:
         return next(
             (
                 socket.socket_id
                 for socket in socket_definitions(node_type)
-                if socket.direction is SocketDirection.OUTPUT
+                if socket.direction is direction and socket.socket_type is socket_type
             ),
             None,
         )
@@ -2302,6 +2486,7 @@ class GraphWorkspace(QWidget):
         *,
         mode_label: str = "",
         preview_mode: str = PREVIEW_MODE_FULL,
+        property_overrides: dict[str, dict] | None = None,
     ) -> None:
         self._last_preview_node_id = node.node_id
         self._last_preview_mode_label = mode_label
@@ -2309,9 +2494,20 @@ class GraphWorkspace(QWidget):
         self._preview_generation += 1
         generation = self._preview_generation
         if self._preview_inflight_generation:
-            self._pending_preview_request = (node.node_id, mode_label, preview_mode)
+            self._pending_preview_request = (
+                node.node_id,
+                mode_label,
+                preview_mode,
+                deepcopy(property_overrides) if property_overrides else None,
+            )
             return
-        self._start_preview_request(node, mode_label, generation, preview_mode)
+        self._start_preview_request(
+            node,
+            mode_label,
+            generation,
+            preview_mode,
+            property_overrides,
+        )
 
     def _start_preview_request(
         self,
@@ -2319,9 +2515,15 @@ class GraphWorkspace(QWidget):
         mode_label: str,
         generation: int,
         preview_mode: str,
+        property_overrides: dict[str, dict] | None = None,
     ) -> None:
         self._preview_inflight_generation = generation
         snapshot = deepcopy(self.project)
+        if property_overrides:
+            for graph_node in snapshot.graph.nodes:
+                properties = property_overrides.get(graph_node.node_id)
+                if properties is not None:
+                    graph_node.properties = deepcopy(properties)
         node_snapshot = next(
             (
                 graph_node
@@ -2400,7 +2602,13 @@ class GraphWorkspace(QWidget):
         if pending is not None:
             self._restart_pending_preview(pending)
 
-    def _on_preview_worker_failed(self, generation: int, title: str, message: str) -> None:
+    def _on_preview_worker_failed(
+        self,
+        generation: int,
+        title: str,
+        message: str,
+        node_id: str,
+    ) -> None:
         self._preview_inflight_generation = 0
         self._reapply_pending_preview_invalidation()
         pending = self._pending_preview_request
@@ -2409,12 +2617,16 @@ class GraphWorkspace(QWidget):
             if pending is not None:
                 self._restart_pending_preview(pending)
             return
+        self.preview_failed.emit(title, message, node_id)
         self.status_message.emit(f"{title}: preview failed: {message}")
         if pending is not None:
             self._restart_pending_preview(pending)
 
-    def _restart_pending_preview(self, pending: tuple[str, str, str]) -> None:
-        node_id, mode_label, preview_mode = pending
+    def _restart_pending_preview(
+        self,
+        pending: tuple[str, str, str, dict[str, dict] | None],
+    ) -> None:
+        node_id, mode_label, preview_mode, property_overrides = pending
         node = next(
             (
                 graph_node
@@ -2425,7 +2637,13 @@ class GraphWorkspace(QWidget):
         )
         if node is None:
             return
-        self._start_preview_request(node, mode_label, self._preview_generation, preview_mode)
+        self._start_preview_request(
+            node,
+            mode_label,
+            self._preview_generation,
+            preview_mode,
+            property_overrides,
+        )
 
     def _reapply_pending_preview_invalidation(self) -> None:
         if self._preview_full_reset_pending:
@@ -2445,6 +2663,33 @@ class GraphWorkspace(QWidget):
         preview_target = self._active_display_node() or node
         mode_label = self._last_preview_mode_label if preview_target.node_id == self._last_preview_node_id else ""
         self._request_preview_node(preview_target, mode_label=mode_label, preview_mode=preview_mode)
+
+    def _on_transient_preview_requested(
+        self,
+        node: GraphNode,
+        properties: object,
+        preview_mode: object,
+    ) -> None:
+        if not isinstance(properties, dict):
+            return
+        if not isinstance(preview_mode, str):
+            preview_mode = PREVIEW_MODE_DRAFT
+        item = self._scene.node_items.get(node.node_id)
+        if item is not None:
+            item.set_color_preview(properties)
+        self._invalidate_preview_from_node(node)
+        preview_target = self._active_display_node() or node
+        mode_label = (
+            self._last_preview_mode_label
+            if preview_target.node_id == self._last_preview_node_id
+            else ""
+        )
+        self._request_preview_node(
+            preview_target,
+            mode_label=mode_label,
+            preview_mode=preview_mode,
+            property_overrides={node.node_id: properties},
+        )
 
     def _preview_max_side_for_mode(self, preview_mode: str) -> int:
         if preview_mode == PREVIEW_MODE_DRAFT:

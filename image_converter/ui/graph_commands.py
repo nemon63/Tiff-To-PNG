@@ -106,8 +106,11 @@ class DeleteItemsCommand(GraphCommand):
         *,
         node_ids: Iterable[str] = (),
         connection_ids: Iterable[str] = (),
+        replacement_connections: Iterable[GraphConnection] = (),
     ):
-        super().__init__(graph, on_changed, "Delete selection", needs_rebuild=True)
+        self.replacement_connections = list(replacement_connections)
+        text = "Dissolve node" if self.replacement_connections else "Delete selection"
+        super().__init__(graph, on_changed, text, needs_rebuild=True)
         self._node_ids = set(node_ids)
         requested_connection_ids = set(connection_ids)
         self.nodes = [node for node in graph.nodes if node.node_id in self._node_ids]
@@ -119,6 +122,9 @@ class DeleteItemsCommand(GraphCommand):
             or connection.target_node_id in self._node_ids
         ]
         self._connection_ids = {connection.connection_id for connection in self.connections}
+        self._replacement_connection_ids = {
+            connection.connection_id for connection in self.replacement_connections
+        }
 
     def redo(self) -> None:
         self.graph.nodes = [node for node in self.graph.nodes if node.node_id not in self._node_ids]
@@ -127,9 +133,20 @@ class DeleteItemsCommand(GraphCommand):
             for connection in self.graph.connections
             if connection.connection_id not in self._connection_ids
         ]
+        existing_connection_ids = {connection.connection_id for connection in self.graph.connections}
+        self.graph.connections.extend(
+            connection
+            for connection in self.replacement_connections
+            if connection.connection_id not in existing_connection_ids
+        )
         self._emit_changed()
 
     def undo(self) -> None:
+        self.graph.connections = [
+            connection
+            for connection in self.graph.connections
+            if connection.connection_id not in self._replacement_connection_ids
+        ]
         existing_node_ids = {node.node_id for node in self.graph.nodes}
         existing_connection_ids = {connection.connection_id for connection in self.graph.connections}
         self.graph.nodes.extend(node for node in self.nodes if node.node_id not in existing_node_ids)

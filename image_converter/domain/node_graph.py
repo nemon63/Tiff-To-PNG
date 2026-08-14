@@ -20,6 +20,11 @@ class NodeType(str, Enum):
     ERODE_CHANNEL = "erode_channel"
     BLEND_CHANNEL = "blend_channel"
     LUMINANCE = "luminance"
+    MIX_IMAGE = "mix_image"
+    BLEND_IMAGE = "blend_image"
+    SPLIT_RGBA = "split_rgba"
+    COMBINE_RGBA = "combine_rgba"
+    SET_ALPHA = "set_alpha"
     VIEW = "view"
     OUTPUT_RGBA = "output_rgba"
 
@@ -37,6 +42,11 @@ class SocketType(str, Enum):
 class OutputMode(str, Enum):
     RGB = "rgb"
     RGBA = "rgba"
+
+
+class OutputAlphaInputMode(str, Enum):
+    MULTIPLY = "multiply"
+    REPLACE = "replace"
 
 
 class OutputProfile(str, Enum):
@@ -76,6 +86,8 @@ OPERATION_NODE_TYPES = (
     NodeType.ERODE_CHANNEL,
     NodeType.BLEND_CHANNEL,
     NodeType.LUMINANCE,
+    NodeType.MIX_IMAGE,
+    NodeType.BLEND_IMAGE,
 )
 
 
@@ -149,8 +161,13 @@ def node_type_label(node_type: NodeType) -> str:
         NodeType.BLUR_CHANNEL: "Blur",
         NodeType.DILATE_CHANNEL: "Dilate",
         NodeType.ERODE_CHANNEL: "Erode",
-        NodeType.BLEND_CHANNEL: "Blend",
+        NodeType.BLEND_CHANNEL: "Blend Channel",
         NodeType.LUMINANCE: "Luminance",
+        NodeType.MIX_IMAGE: "Mix Image",
+        NodeType.BLEND_IMAGE: "Blend Image",
+        NodeType.SPLIT_RGBA: "Split RGBA",
+        NodeType.COMBINE_RGBA: "Combine RGBA",
+        NodeType.SET_ALPHA: "Apply Mask",
         NodeType.VIEW: "View",
         NodeType.OUTPUT_RGBA: "Output",
     }
@@ -210,6 +227,25 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
         return {"enabled": True, "radius": 1}
     if node_type is NodeType.BLEND_CHANNEL:
         return {"enabled": True, "mode": "multiply", "opacity": 100}
+    if node_type is NodeType.MIX_IMAGE:
+        return {
+            "enabled": True,
+            "factor": 50,
+            "resolution_source": "a",
+            "resolution_width": 1024,
+            "resolution_height": 1024,
+            "mask_filter": "bilinear",
+        }
+    if node_type is NodeType.BLEND_IMAGE:
+        return {
+            "enabled": True,
+            "mode": "multiply",
+            "opacity": 100,
+            "resolution_source": "a",
+            "resolution_width": 1024,
+            "resolution_height": 1024,
+            "mask_filter": "bilinear",
+        }
     if node_type is NodeType.LUMINANCE:
         return {"enabled": True}
     if node_type is NodeType.VIEW:
@@ -219,8 +255,17 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
             "filename": "packed.png",
             "output_path": "",
             "mode": OutputMode.RGBA.value,
+            "alpha_input_mode": OutputAlphaInputMode.MULTIPLY.value,
             "profile": OutputProfile.GENERIC_RGBA.value,
             "enabled": True,
+            "resolution_source": "auto",
+            "resolution_width": 1024,
+            "resolution_height": 1024,
+        }
+    if node_type is NodeType.SET_ALPHA:
+        return {
+            "mask_mode": "replace_alpha",
+            "mask_filter": "bilinear",
         }
     return {}
 
@@ -237,6 +282,22 @@ def resettable_node_property_keys(node_type: NodeType) -> tuple[str, ...]:
         NodeType.DILATE_CHANNEL: ("radius",),
         NodeType.ERODE_CHANNEL: ("radius",),
         NodeType.BLEND_CHANNEL: ("mode", "opacity"),
+        NodeType.MIX_IMAGE: (
+            "factor",
+            "resolution_source",
+            "resolution_width",
+            "resolution_height",
+            "mask_filter",
+        ),
+        NodeType.BLEND_IMAGE: (
+            "mode",
+            "opacity",
+            "resolution_source",
+            "resolution_width",
+            "resolution_height",
+            "mask_filter",
+        ),
+        NodeType.SET_ALPHA: ("mask_mode", "mask_filter"),
     }
     return mapping.get(node_type, ())
 
@@ -279,6 +340,7 @@ def create_graph_node(
 def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
     if node_type is NodeType.TEXTURE_INPUT:
         return (
+            GraphSocket("image", "RGBA", SocketDirection.OUTPUT, SocketType.IMAGE),
             GraphSocket("r", "R", SocketDirection.OUTPUT, SocketType.CHANNEL),
             GraphSocket("g", "G", SocketDirection.OUTPUT, SocketType.CHANNEL),
             GraphSocket("b", "B", SocketDirection.OUTPUT, SocketType.CHANNEL),
@@ -286,6 +348,7 @@ def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
         )
     if node_type is NodeType.COLOR:
         return (
+            GraphSocket("image", "RGBA", SocketDirection.OUTPUT, SocketType.IMAGE),
             GraphSocket("r", "R", SocketDirection.OUTPUT, SocketType.CHANNEL),
             GraphSocket("g", "G", SocketDirection.OUTPUT, SocketType.CHANNEL),
             GraphSocket("b", "B", SocketDirection.OUTPUT, SocketType.CHANNEL),
@@ -346,18 +409,80 @@ def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
             GraphSocket("b", "B", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("out", "L", SocketDirection.OUTPUT, SocketType.CHANNEL),
         )
+    if node_type is NodeType.MIX_IMAGE:
+        return (
+            GraphSocket("a", "A", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("b", "B", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("mask", "Mask", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("image", "RGBA", SocketDirection.OUTPUT, SocketType.IMAGE),
+        )
+    if node_type is NodeType.BLEND_IMAGE:
+        return (
+            GraphSocket("a", "A", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("b", "B", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("mask", "Mask", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("image", "RGBA", SocketDirection.OUTPUT, SocketType.IMAGE),
+        )
+    if node_type is NodeType.SPLIT_RGBA:
+        return (
+            GraphSocket("image", "RGBA", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("r", "R", SocketDirection.OUTPUT, SocketType.CHANNEL),
+            GraphSocket("g", "G", SocketDirection.OUTPUT, SocketType.CHANNEL),
+            GraphSocket("b", "B", SocketDirection.OUTPUT, SocketType.CHANNEL),
+            GraphSocket("a", "A", SocketDirection.OUTPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.COMBINE_RGBA:
+        return (
+            GraphSocket("r", "R", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("g", "G", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("b", "B", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("a", "A", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("image", "RGBA", SocketDirection.OUTPUT, SocketType.IMAGE),
+        )
+    if node_type is NodeType.SET_ALPHA:
+        return (
+            GraphSocket("image", "Image", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("alpha", "Mask", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("out", "RGBA", SocketDirection.OUTPUT, SocketType.IMAGE),
+        )
     if node_type is NodeType.VIEW:
         return (
+            GraphSocket("image", "Image", SocketDirection.INPUT, SocketType.IMAGE),
             GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
         )
     if node_type is NodeType.OUTPUT_RGBA:
         return (
+            GraphSocket("image", "Image", SocketDirection.INPUT, SocketType.IMAGE),
             GraphSocket("r", "R", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("g", "G", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("b", "B", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("a", "A", SocketDirection.INPUT, SocketType.CHANNEL),
         )
     return ()
+
+
+def node_bypass_socket_pair(node_type: NodeType) -> tuple[str, str] | None:
+    """Return the primary input/output pair used to bypass a processing node."""
+    if node_type in (
+        NodeType.INVERT_CHANNEL,
+        NodeType.LEVELS_CHANNEL,
+        NodeType.REMAP_CHANNEL,
+        NodeType.CLAMP_CHANNEL,
+        NodeType.THRESHOLD_CHANNEL,
+        NodeType.BLUR_CHANNEL,
+        NodeType.DILATE_CHANNEL,
+        NodeType.ERODE_CHANNEL,
+    ):
+        return ("in", "out")
+    if node_type is NodeType.BLEND_CHANNEL:
+        return ("a", "out")
+    if node_type is NodeType.LUMINANCE:
+        return ("r", "out")
+    if node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE):
+        return ("a", "image")
+    if node_type is NodeType.SET_ALPHA:
+        return ("image", "out")
+    return None
 
 
 def find_node(graph: NodeGraph, node_id: str) -> GraphNode | None:

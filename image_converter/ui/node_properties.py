@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 from image_converter.domain.node_graph import (
     GraphNode,
     NodeType,
+    OutputAlphaInputMode,
     OutputMode,
     OutputProfile,
     TextureDataRole,
@@ -39,6 +40,7 @@ from image_converter.ui.node_editor_constants import (
 )
 class NodePropertiesPanel(QWidget):
     node_changed = pyqtSignal(object, object, object, bool, object)
+    transient_preview_requested = pyqtSignal(object, object, object)
     preview_refresh_requested = pyqtSignal(object, object)
     output_profile_apply_requested = pyqtSignal(object)
     output_inputs_clear_requested = pyqtSignal(object)
@@ -122,6 +124,11 @@ class NodePropertiesPanel(QWidget):
         self.title_edit = QLineEdit()
         self.title_edit.editingFinished.connect(self._apply_changes)
         self.form.addRow("Title", self.title_edit)
+
+        self.node_help_label = QLabel()
+        self.node_help_label.setObjectName("SummaryText")
+        self.node_help_label.setWordWrap(True)
+        self.form.addRow("Purpose", self.node_help_label)
 
         self.node_enabled_checkbox = QCheckBox("Enabled")
         self.node_enabled_checkbox.toggled.connect(self._apply_changes)
@@ -282,6 +289,76 @@ class NodePropertiesPanel(QWidget):
         self.blend_opacity_host = self._byte_row_widget(self.blend_opacity_slider, self.blend_opacity_spin)
         self.form.addRow("Opacity", self.blend_opacity_host)
 
+        self.mix_factor_slider, self.mix_factor_spin = self._make_slider_spin_pair(
+            0,
+            100,
+            initial=50,
+            suffix="%",
+        )
+        self.mix_factor_host = self._byte_row_widget(
+            self.mix_factor_slider,
+            self.mix_factor_spin,
+        )
+        self.form.addRow("Factor", self.mix_factor_host)
+
+        self.image_resolution_source_combo = QComboBox()
+        for label, value in (
+            ("Input A", "a"),
+            ("Input B", "b"),
+            ("Mask", "mask"),
+            ("Custom", "custom"),
+        ):
+            self.image_resolution_source_combo.addItem(label, value)
+        self.image_resolution_source_combo.currentIndexChanged.connect(
+            self._on_resolution_source_changed
+        )
+        self.form.addRow("Resolution", self.image_resolution_source_combo)
+
+        self.output_resolution_source_combo = QComboBox()
+        for label, value in (
+            ("Auto", "auto"),
+            ("Image", "image"),
+            ("R", "r"),
+            ("G", "g"),
+            ("B", "b"),
+            ("A", "a"),
+            ("Custom", "custom"),
+        ):
+            self.output_resolution_source_combo.addItem(label, value)
+        self.output_resolution_source_combo.currentIndexChanged.connect(
+            self._on_resolution_source_changed
+        )
+        self.form.addRow("Resolution", self.output_resolution_source_combo)
+
+        self.resolution_width_spin = self._make_int_spin(1, 16384, suffix=" px")
+        self.resolution_height_spin = self._make_int_spin(1, 16384, suffix=" px")
+        self.custom_resolution_host = self._resolution_widget(
+            self.resolution_width_spin,
+            self.resolution_height_spin,
+        )
+        self.form.addRow("Custom Size", self.custom_resolution_host)
+
+        self.mask_filter_combo = QComboBox()
+        for label, value in (
+            ("Nearest (hard masks)", "nearest"),
+            ("Bilinear (soft masks)", "bilinear"),
+            ("Lanczos (smooth resize)", "lanczos"),
+        ):
+            self.mask_filter_combo.addItem(label, value)
+        self.mask_filter_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Mask Filter", self.mask_filter_combo)
+
+        self.mask_mode_combo = QComboBox()
+        for label, value in (
+            ("Replace Alpha", "replace_alpha"),
+            ("Multiply Alpha", "multiply_alpha"),
+            ("Multiply RGB", "multiply_rgb"),
+            ("Multiply RGBA", "multiply_rgba"),
+        ):
+            self.mask_mode_combo.addItem(label, value)
+        self.mask_mode_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Apply To", self.mask_mode_combo)
+
         self.filename_edit = QLineEdit()
         self.filename_edit.setPlaceholderText("packed_rgba.png")
         self.filename_edit.setToolTip("Output filename inside Export Folder. Add an extension to choose format.")
@@ -341,6 +418,21 @@ class NodePropertiesPanel(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._apply_changes)
         self.form.addRow("Mode", self.mode_combo)
 
+        self.output_alpha_input_mode_combo = QComboBox()
+        self.output_alpha_input_mode_combo.addItem(
+            "Multiply Image Alpha",
+            OutputAlphaInputMode.MULTIPLY.value,
+        )
+        self.output_alpha_input_mode_combo.addItem(
+            "Replace Image Alpha",
+            OutputAlphaInputMode.REPLACE.value,
+        )
+        self.output_alpha_input_mode_combo.setToolTip(
+            "Controls how a connected A input combines with alpha already present in Image."
+        )
+        self.output_alpha_input_mode_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Alpha Input", self.output_alpha_input_mode_combo)
+
         self.enabled_checkbox = QCheckBox("Enabled")
         self.enabled_checkbox.toggled.connect(self._apply_changes)
         self.form.addRow("Export", self.enabled_checkbox)
@@ -370,6 +462,7 @@ class NodePropertiesPanel(QWidget):
             if node is None:
                 return
             self.title_edit.setText(node.title)
+            self.node_help_label.setText(self._node_help_text(node.node_type))
             self.node_enabled_checkbox.setChecked(bool(node.properties.get("enabled", True)))
             self.path_edit.setText(str(node.properties.get("path", "")))
             self._set_combo_value(
@@ -410,6 +503,30 @@ class NodePropertiesPanel(QWidget):
                     self.blend_mode_combo.setCurrentIndex(index)
                     break
             self.blend_opacity_spin.setValue(self._coerce_int(node.properties.get("opacity"), 100))
+            self.mix_factor_spin.setValue(self._coerce_int(node.properties.get("factor"), 50))
+            self._set_combo_value(
+                self.image_resolution_source_combo,
+                str(node.properties.get("resolution_source", "a")),
+            )
+            self._set_combo_value(
+                self.output_resolution_source_combo,
+                str(node.properties.get("resolution_source", "auto")),
+            )
+            self.resolution_width_spin.setValue(
+                self._coerce_int(node.properties.get("resolution_width"), 1024)
+            )
+            self.resolution_height_spin.setValue(
+                self._coerce_int(node.properties.get("resolution_height"), 1024)
+            )
+            self._set_combo_value(
+                self.mask_filter_combo,
+                str(node.properties.get("mask_filter", "bilinear")),
+                fallback_index=1,
+            )
+            self._set_combo_value(
+                self.mask_mode_combo,
+                str(node.properties.get("mask_mode", "replace_alpha")),
+            )
             self.filename_edit.setText(str(node.properties.get("filename", "packed.png")))
             self.output_path_edit.setText(str(node.properties.get("output_path", "")))
             self._update_output_format_hint()
@@ -420,11 +537,21 @@ class NodePropertiesPanel(QWidget):
             self.enabled_checkbox.setChecked(bool(node.properties.get("enabled", True)))
             mode_value = str(node.properties.get("mode", OutputMode.RGBA.value))
             self._set_combo_value(self.mode_combo, mode_value, fallback_index=1)
+            self._set_combo_value(
+                self.output_alpha_input_mode_combo,
+                str(
+                    node.properties.get(
+                        "alpha_input_mode",
+                        OutputAlphaInputMode.MULTIPLY.value,
+                    )
+                ),
+            )
             self._sync_visibility(node.node_type)
         finally:
             self._suppress = False
 
     def _sync_visibility(self, node_type: NodeType) -> None:
+        self._set_row_visible(self.node_help_label, bool(self._node_help_text(node_type)))
         self._set_row_visible(self.node_enabled_checkbox, node_has_enable_flag(node_type))
         self._set_row_visible(self.path_host, node_type is NodeType.TEXTURE_INPUT)
         self._set_row_visible(self.texture_color_space_combo, node_type is NodeType.TEXTURE_INPUT)
@@ -448,16 +575,73 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.blur_radius_host, node_type is NodeType.BLUR_CHANNEL)
         self._set_row_visible(self.dilate_radius_host, node_type is NodeType.DILATE_CHANNEL)
         self._set_row_visible(self.erode_radius_host, node_type is NodeType.ERODE_CHANNEL)
-        self._set_row_visible(self.blend_mode_combo, node_type is NodeType.BLEND_CHANNEL)
-        self._set_row_visible(self.blend_opacity_host, node_type is NodeType.BLEND_CHANNEL)
+        blend_node = node_type in (NodeType.BLEND_CHANNEL, NodeType.BLEND_IMAGE)
+        self._set_row_visible(self.blend_mode_combo, blend_node)
+        self._set_row_visible(self.blend_opacity_host, blend_node)
+        self._set_row_visible(self.mix_factor_host, node_type is NodeType.MIX_IMAGE)
+        image_resolution_node = node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE)
+        self._set_row_visible(self.image_resolution_source_combo, image_resolution_node)
+        self._set_row_visible(
+            self.output_resolution_source_combo,
+            node_type is NodeType.OUTPUT_RGBA,
+        )
+        self._set_row_visible(
+            self.mask_filter_combo,
+            node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE, NodeType.SET_ALPHA),
+        )
+        self._set_row_visible(self.mask_mode_combo, node_type is NodeType.SET_ALPHA)
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_path_host, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_profile_combo, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.profile_actions_host, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.profile_summary_label, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.mode_combo, node_type is NodeType.OUTPUT_RGBA)
+        self._set_row_visible(
+            self.output_alpha_input_mode_combo,
+            node_type is NodeType.OUTPUT_RGBA,
+        )
         self._set_row_visible(self.enabled_checkbox, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.export_output_button, node_type is NodeType.OUTPUT_RGBA)
+        self._sync_resolution_visibility(node_type)
+
+    @staticmethod
+    def _node_help_text(node_type: NodeType) -> str:
+        return {
+            NodeType.MIX_IMAGE: (
+                "Mixes RGBA inputs A and B. Mask 0 uses A; Mask 255 uses B. "
+                "Factor is used when Mask is not connected."
+            ),
+            NodeType.BLEND_IMAGE: (
+                "Blends two required RGBA inputs A and B using Blend Mode and Opacity. "
+                "An optional Mask limits the effect. For one Color/Image plus a channel mask, "
+                "use Apply Mask instead."
+            ),
+            NodeType.SPLIT_RGBA: "Splits one RGBA image into separate R, G, B and A channels.",
+            NodeType.COMBINE_RGBA: (
+                "Builds one RGBA image from separate R, G, B and optional A channels."
+            ),
+            NodeType.SET_ALPHA: (
+                "Applies a channel mask to an RGBA image. Replace Alpha creates a regular "
+                "transparent cutout; Multiply RGB reproduces per-channel color masking."
+            ),
+            NodeType.OUTPUT_RGBA: (
+                "Image supplies the RGBA base. R, G and B replace individual base channels. "
+                "A multiplies Image alpha by default, so existing transparency is preserved."
+            ),
+        }.get(node_type, "")
+
+    def _on_resolution_source_changed(self, *_args: object) -> None:
+        if self._node is not None:
+            self._sync_resolution_visibility(self._node.node_type)
+        self._apply_changes()
+
+    def _sync_resolution_visibility(self, node_type: NodeType) -> None:
+        custom_selected = False
+        if node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE):
+            custom_selected = self.image_resolution_source_combo.currentData() == "custom"
+        elif node_type is NodeType.OUTPUT_RGBA:
+            custom_selected = self.output_resolution_source_combo.currentData() == "custom"
+        self._set_row_visible(self.custom_resolution_host, custom_selected)
 
     def _export_output(self) -> None:
         if self._node is None or self._node.node_type is not NodeType.OUTPUT_RGBA:
@@ -480,14 +664,28 @@ class NodePropertiesPanel(QWidget):
             self.color_blue_spin.value(),
             self.color_alpha_spin.value(),
         )
-        color = QColorDialog.getColor(
-            initial,
-            self,
-            "Choose Color",
-            QColorDialog.ColorDialogOption.ShowAlphaChannel,
-        )
+        dialog = QColorDialog(initial, self)
+        dialog.setWindowTitle("Choose Color")
+        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dialog.currentColorChanged.connect(self._preview_selected_color)
+
+        if dialog.exec():
+            color = dialog.currentColor()
+            if color.isValid():
+                self._set_color_controls(color)
+                self._apply_changes()
+            return
+
+        self._set_color_controls(initial)
+        self._emit_transient_color_preview(initial, PREVIEW_MODE_FULL)
+
+    def _preview_selected_color(self, color: QColor) -> None:
         if not color.isValid():
             return
+        self._set_color_controls(color)
+        self._emit_transient_color_preview(color, PREVIEW_MODE_DRAFT)
+
+    def _set_color_controls(self, color: QColor) -> None:
         self._numeric_preview_timer.stop()
         self._suppress = True
         try:
@@ -498,7 +696,20 @@ class NodePropertiesPanel(QWidget):
         finally:
             self._suppress = False
         self._update_color_button()
-        self._apply_changes()
+
+    def _emit_transient_color_preview(self, color: QColor, preview_mode: str) -> None:
+        if self._node is None or self._node.node_type is not NodeType.COLOR:
+            return
+        properties = dict(self._node.properties)
+        properties.update(
+            {
+                "red": color.red(),
+                "green": color.green(),
+                "blue": color.blue(),
+                "alpha": color.alpha(),
+            }
+        )
+        self.transient_preview_requested.emit(self._node, properties, preview_mode)
 
     def _update_color_button(self, *_args: object) -> None:
         red = self.color_red_spin.value()
@@ -734,9 +945,35 @@ class NodePropertiesPanel(QWidget):
             next_properties["radius"] = self.dilate_radius_spin.value()
         elif self._node.node_type is NodeType.ERODE_CHANNEL:
             next_properties["radius"] = self.erode_radius_spin.value()
-        elif self._node.node_type is NodeType.BLEND_CHANNEL:
+        elif self._node.node_type in (NodeType.BLEND_CHANNEL, NodeType.BLEND_IMAGE):
             next_properties["mode"] = str(self.blend_mode_combo.currentData() or "multiply")
             next_properties["opacity"] = self.blend_opacity_spin.value()
+            if self._node.node_type is NodeType.BLEND_IMAGE:
+                next_properties["resolution_source"] = str(
+                    self.image_resolution_source_combo.currentData() or "a"
+                )
+                next_properties["resolution_width"] = self.resolution_width_spin.value()
+                next_properties["resolution_height"] = self.resolution_height_spin.value()
+                next_properties["mask_filter"] = str(
+                    self.mask_filter_combo.currentData() or "bilinear"
+                )
+        elif self._node.node_type is NodeType.MIX_IMAGE:
+            next_properties["factor"] = self.mix_factor_spin.value()
+            next_properties["resolution_source"] = str(
+                self.image_resolution_source_combo.currentData() or "a"
+            )
+            next_properties["resolution_width"] = self.resolution_width_spin.value()
+            next_properties["resolution_height"] = self.resolution_height_spin.value()
+            next_properties["mask_filter"] = str(
+                self.mask_filter_combo.currentData() or "bilinear"
+            )
+        elif self._node.node_type is NodeType.SET_ALPHA:
+            next_properties["mask_mode"] = str(
+                self.mask_mode_combo.currentData() or "replace_alpha"
+            )
+            next_properties["mask_filter"] = str(
+                self.mask_filter_combo.currentData() or "bilinear"
+            )
         elif self._node.node_type is NodeType.OUTPUT_RGBA:
             filename_text = self.filename_edit.text().strip() or "packed.png"
             output_path_text = self.output_path_edit.text().strip()
@@ -747,7 +984,16 @@ class NodePropertiesPanel(QWidget):
                 or OutputProfile.GENERIC_RGBA.value
             )
             next_properties["mode"] = str(self.mode_combo.currentData() or OutputMode.RGBA.value)
+            next_properties["alpha_input_mode"] = str(
+                self.output_alpha_input_mode_combo.currentData()
+                or OutputAlphaInputMode.MULTIPLY.value
+            )
             next_properties["enabled"] = self.enabled_checkbox.isChecked()
+            next_properties["resolution_source"] = str(
+                self.output_resolution_source_combo.currentData() or "auto"
+            )
+            next_properties["resolution_width"] = self.resolution_width_spin.value()
+            next_properties["resolution_height"] = self.resolution_height_spin.value()
         if next_title == self._node.title and next_properties == self._node.properties:
             return
         needs_rebuild = previous_title != next_title
