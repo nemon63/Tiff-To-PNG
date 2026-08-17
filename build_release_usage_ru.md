@@ -236,6 +236,11 @@ build_release.bat --skip-installer --no-bump-version
 build_release.bat --keep-build --verbose
 ```
 
+5. При временной ошибке Inno Setup `EndUpdateResource failed (110)` скрипт
+   автоматически повторяет сборку установщика до трех раз. Если все попытки
+   завершились ошибкой, проверьте антивирус и индексатор для конкретной папки
+   `D:\_BUILD\TexturePipelineWorkbench\installer`.
+
 ## Замечание по окружению
 
 Скрипт сам использует `pip` и при необходимости ставит `PyInstaller` в `.venv`.

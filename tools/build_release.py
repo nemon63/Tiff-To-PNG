@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,8 @@ PYINSTALLER_HIDDEN_IMPORTS = (
     "PIL._tkinter_finder",
 )
 PYINSTALLER_COLLECT_ALL = ("PIL",)
+INNO_BUILD_ATTEMPTS = 3
+INNO_RETRY_DELAY_SECONDS = 2.0
 
 
 class BuildError(RuntimeError):
@@ -169,7 +172,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.skip_installer:
         installer_command = build_inno_command(app_meta, layout)
-        run_command(installer_command, cwd=layout.project_root)
+        run_command(
+            installer_command,
+            cwd=layout.project_root,
+            attempts=INNO_BUILD_ATTEMPTS,
+            retry_delay_seconds=INNO_RETRY_DELAY_SECONDS,
+            retry_hint=(
+                "Inno Setup output may be temporarily locked by antivirus or indexing."
+            ),
+        )
         verify_installer_output(app_meta, layout)
 
     print(f"[OK] Release directory: {layout.release_dir}")
@@ -525,14 +536,41 @@ def format_command(command: list[str]) -> str:
     return subprocess.list2cmdline(command)
 
 
-def run_command(command: list[str], *, cwd: Path) -> None:
+def run_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    attempts: int = 1,
+    retry_delay_seconds: float = 0.0,
+    retry_hint: str = "",
+) -> None:
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+
     env = os.environ.copy()
     if len(command) >= 4 and command[0] == sys.executable and command[1:3] == ["-m", "pip"]:
         env.setdefault("NO_PROXY", "*")
         env.setdefault("no_proxy", "*")
-    result = subprocess.run(command, cwd=cwd, check=False, env=env)
-    if result.returncode != 0:
-        raise BuildError(f"Command failed with exit code {result.returncode}: {format_command(command)}")
+
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(command, cwd=cwd, check=False, env=env)
+        if result.returncode == 0:
+            return
+        if attempt == attempts:
+            raise BuildError(
+                f"Command failed with exit code {result.returncode}: "
+                f"{format_command(command)}"
+            )
+
+        print(
+            f"[WARN] Command failed with exit code {result.returncode} "
+            f"(attempt {attempt}/{attempts})."
+        )
+        if retry_hint:
+            print(f"[WARN] {retry_hint}")
+        if retry_delay_seconds > 0:
+            print(f"[INFO] Retrying in {retry_delay_seconds:g} seconds...")
+            time.sleep(retry_delay_seconds)
 
 
 def copy_release_payload(app_meta: AppMeta, layout: BuildLayout) -> None:
