@@ -14,7 +14,7 @@ from image_converter.domain.models import (
     TextureMapType,
 )
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
-from image_converter.services.map_types import known_map_aliases
+from image_converter.services.map_types import known_map_aliases, strip_channel_pack_suffix
 from image_converter.services.naming import apply_naming_rules
 from image_converter.services.pipeline import RESAMPLING_LANCZOS, ResizeProcessor
 
@@ -122,7 +122,12 @@ PACK_LAYOUTS: dict[ChannelPackLayout, tuple[PackChannelRule, ...]] = {
             label=TextureMapType.AO.label,
             candidates=(PackSourceCandidate(TextureMapType.AO),),
         ),
-        PackChannelRule(channel="B", label="Detail Mask", fill_value=255),
+        PackChannelRule(
+            channel="B",
+            label=TextureMapType.DETAIL_MASK.label,
+            candidates=(PackSourceCandidate(TextureMapType.DETAIL_MASK),),
+            fill_value=255,
+        ),
         PackChannelRule(
             channel="A",
             label=TextureMapType.SMOOTHNESS.label,
@@ -131,6 +136,40 @@ PACK_LAYOUTS: dict[ChannelPackLayout, tuple[PackChannelRule, ...]] = {
                 PackSourceCandidate(TextureMapType.ROUGHNESS, invert=True),
             ),
         ),
+    ),
+}
+
+# Packed inputs are normalized to the Offline/Production semantic set. Unity's
+# Smoothness alpha is inverted once here so all downstream layouts can consume
+# the resulting Roughness channel in exactly the same way as a separate map.
+PACKED_INPUT_CHANNELS: dict[
+    ChannelPackLayout,
+    tuple[tuple[str, TextureMapType, bool], ...],
+] = {
+    ChannelPackLayout.ORM: (
+        ("R", TextureMapType.AO, False),
+        ("G", TextureMapType.ROUGHNESS, False),
+        ("B", TextureMapType.METALLIC, False),
+    ),
+    ChannelPackLayout.RMA: (
+        ("R", TextureMapType.ROUGHNESS, False),
+        ("G", TextureMapType.METALLIC, False),
+        ("B", TextureMapType.AO, False),
+    ),
+    ChannelPackLayout.MRA: (
+        ("R", TextureMapType.METALLIC, False),
+        ("G", TextureMapType.ROUGHNESS, False),
+        ("B", TextureMapType.AO, False),
+    ),
+    ChannelPackLayout.UNITY_URP: (
+        ("R", TextureMapType.METALLIC, False),
+        ("A", TextureMapType.ROUGHNESS, True),
+    ),
+    ChannelPackLayout.UNITY_HDRP: (
+        ("R", TextureMapType.METALLIC, False),
+        ("G", TextureMapType.AO, False),
+        ("B", TextureMapType.DETAIL_MASK, False),
+        ("A", TextureMapType.ROUGHNESS, True),
     ),
 }
 
@@ -168,6 +207,10 @@ def channel_pack_mapping_text(layout: ChannelPackLayout) -> str:
     return f"{layout.label}: " + ", ".join(parts)
 
 
+def channel_pack_output_suffix(layout: ChannelPackLayout) -> str:
+    return _pack_output_suffix(layout)
+
+
 def packed_source_map_types(layout: ChannelPackLayout) -> frozenset[TextureMapType]:
     return frozenset(
         candidate.map_type
@@ -176,12 +219,75 @@ def packed_source_map_types(layout: ChannelPackLayout) -> frozenset[TextureMapTy
     )
 
 
+def packed_layout_map_types(layout: ChannelPackLayout) -> frozenset[TextureMapType]:
+    return frozenset(map_type for _channel, map_type, _invert in PACKED_INPUT_CHANNELS[layout])
+
+
+def expand_packed_sources(
+    sources: tuple[BatchSource, ...] | list[BatchSource],
+) -> tuple[BatchSource, ...]:
+    expanded: list[BatchSource] = []
+    for source in sources:
+        if source.packed_layout is None or source.source_channel is not None:
+            expanded.append(source)
+            continue
+
+        base_name = _derive_pack_base_name(source.path.stem, TextureMapType.UNKNOWN)
+        if not base_name:
+            base_name = source.path.stem
+        for channel, map_type, invert in PACKED_INPUT_CHANNELS[source.packed_layout]:
+            expanded.append(
+                BatchSource(
+                    path=source.path,
+                    root=source.root,
+                    map_type=map_type,
+                    packed_layout=source.packed_layout,
+                    source_channel=channel,
+                    invert_channel=invert,
+                    output_stem=f"{base_name}_{map_type.value}",
+                )
+            )
+    return tuple(expanded)
+
+
+def build_traditional_sources(
+    sources: tuple[BatchSource, ...] | list[BatchSource],
+) -> tuple[BatchSource, ...]:
+    expanded = expand_packed_sources(sources)
+    direct_roughness_keys = {
+        _semantic_source_key(source)
+        for source in expanded
+        if source.map_type is TextureMapType.ROUGHNESS
+    }
+    traditional: list[BatchSource] = []
+    for source in expanded:
+        if source.map_type is not TextureMapType.SMOOTHNESS:
+            traditional.append(source)
+            continue
+        if _semantic_source_key(source) in direct_roughness_keys:
+            continue
+
+        base_name = _derive_pack_base_name(source.path.stem, source.map_type)
+        traditional.append(
+            BatchSource(
+                path=source.path,
+                root=source.root,
+                map_type=TextureMapType.ROUGHNESS,
+                source_channel=source.source_channel,
+                invert_channel=not source.invert_channel,
+                output_stem=f"{base_name}_{TextureMapType.ROUGHNESS.value}",
+            )
+        )
+    return tuple(traditional)
+
+
 def build_channel_pack_jobs(
     sources: tuple[BatchSource, ...] | list[BatchSource],
     output_root: Path | None,
     options: ConversionOptions,
 ) -> tuple[ChannelPackJob, ...]:
     layout_rules = PACK_LAYOUTS[options.packing.layout]
+    sources = expand_packed_sources(sources)
     relevant_map_types = {
         candidate.map_type
         for rule in layout_rules
@@ -203,7 +309,10 @@ def build_channel_pack_jobs(
         source_root = source.root or source.path.parent
         relative_dir = _relative_dir(source.path.parent, source_root)
         group_key = (str(source_root).lower(), str(relative_dir).lower(), base_name.lower())
-        groups.setdefault(group_key, {})[source.map_type] = source
+        sources_by_map = groups.setdefault(group_key, {})
+        existing = sources_by_map.get(source.map_type)
+        if existing is None or _source_priority(source) > _source_priority(existing):
+            sources_by_map[source.map_type] = source
         group_context[group_key] = (source_root, relative_dir, base_name)
 
     jobs: list[ChannelPackJob] = []
@@ -371,6 +480,20 @@ def _resolve_channel_rule(
                 invert=candidate.invert,
             )
 
+    if (
+        any(candidate.map_type is TextureMapType.AO for candidate in rule.candidates)
+        and any(
+            source.packed_layout is ChannelPackLayout.UNITY_URP
+            for source in sources_by_map.values()
+        )
+    ):
+        return ResolvedPackChannel(
+            channel=rule.channel,
+            label=rule.label,
+            source=None,
+            fill_value=255,
+        )
+
     return ResolvedPackChannel(
         channel=rule.channel,
         label=rule.label,
@@ -409,6 +532,10 @@ def _format_pack_job_summary(job: ChannelPackJob) -> str:
 def _describe_resolved_channel(channel: ResolvedPackChannel) -> str:
     if channel.source is not None:
         source_text = channel.source.path.name
+        if channel.source.source_channel is not None:
+            source_text = f"{source_text}[{channel.source.source_channel}]"
+        if channel.source.invert_channel:
+            source_text = f"Invert({source_text})"
         if channel.invert:
             source_text = f"Invert({source_text})"
         return f"{channel.channel}={source_text}"
@@ -455,7 +582,13 @@ def _load_channel_image(
     resize_processor: ResizeProcessor,
 ) -> Image.Image:
     with Image.open(source.path) as image:
-        channel_image = _extract_first_frame(image).convert("L")
+        working_image = _extract_first_frame(image)
+        if source.source_channel is not None:
+            channel_image = working_image.convert("RGBA").getchannel(source.source_channel)
+        else:
+            channel_image = working_image.convert("L")
+        if source.invert_channel:
+            channel_image = ImageOps.invert(channel_image)
         channel_image = resize_processor.process(channel_image, options)
         return channel_image.copy()
 
@@ -465,7 +598,8 @@ def _derive_pack_base_name(stem: str, map_type: TextureMapType) -> str:
     if not normalized_stem:
         return ""
 
-    stripped = _strip_any_known_map_suffix(normalized_stem)
+    without_pack_suffix = strip_channel_pack_suffix(normalized_stem)
+    stripped = _strip_any_known_map_suffix(without_pack_suffix)
     if stripped:
         return stripped
     if map_type is TextureMapType.UNKNOWN:
@@ -502,3 +636,16 @@ def _relative_dir(path: Path, root: Path) -> Path:
 
 def _extract_first_frame(image: Image.Image) -> Image.Image:
     return copy_first_frame_preserving_alpha(image)
+
+
+def _source_priority(source: BatchSource) -> int:
+    # A dedicated semantic texture is more authoritative than a channel derived
+    # from a packed input when both are present in one material set.
+    return 1 if source.source_channel is None else 0
+
+
+def _semantic_source_key(source: BatchSource) -> tuple[str, str, str]:
+    source_root = source.root or source.path.parent
+    relative_dir = _relative_dir(source.path.parent, source_root)
+    base_name = _derive_pack_base_name(source.path.stem, source.map_type)
+    return str(source_root).casefold(), str(relative_dir).casefold(), base_name.casefold()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
@@ -37,6 +38,137 @@ from image_converter.domain.models import (
 from image_converter.services.naming import build_output_filename
 from image_converter.services.packing import channel_pack_mapping_text
 from image_converter.ui.common import CURRENT_PRESET_DATA
+
+
+class TextureSetSummaryLabel(QLabel):
+    """Readable rich-text view that keeps the plain summary available to callers."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._plain_summary = ""
+        self._rendered_html = ""
+        self.setWordWrap(True)
+        self.setTextFormat(Qt.TextFormat.RichText)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.set_summary_text(text)
+
+    def set_summary_text(self, text: str) -> None:
+        self._plain_summary = text
+        self._rendered_html = self._build_html(text)
+        super().setText(self._rendered_html)
+
+    def text(self) -> str:
+        return self._plain_summary
+
+    @property
+    def rendered_html(self) -> str:
+        return self._rendered_html
+
+    @staticmethod
+    def _build_html(text: str) -> str:
+        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return ""
+
+        parts = [
+            '<div style="font-size:12px; color:#d7e2ef;">',
+            (
+                '<div style="font-size:13px; font-weight:600; color:#f2f6fb; '
+                'margin-bottom:4px;">'
+                f"{escape(lines[0])}</div>"
+            ),
+        ]
+        output_rows: list[str] = []
+
+        def flush_rows() -> None:
+            if not output_rows:
+                return
+            parts.append(
+                '<table width="100%" cellspacing="2" cellpadding="2" '
+                'style="margin-top:4px; margin-bottom:4px;">'
+            )
+            parts.extend(output_rows)
+            parts.append("</table>")
+            output_rows.clear()
+
+        for line in lines[1:]:
+            if "найден источник" in line or "выход, предусмотренный пайплайном" in line:
+                flush_rows()
+                parts.append(
+                    '<div style="margin:3px 0 7px 0; font-size:11px; color:#8fa3b8;">'
+                    f"{escape(line.strip())}</div>"
+                )
+                continue
+            if line[0] in {"✓", "○", "●"}:
+                status = line[0]
+                body = line[1:].strip()
+                title, filename, description = TextureSetSummaryLabel._split_output_line(body)
+                status_color = {
+                    "✓": "#72d694",
+                    "○": "#f0b95b",
+                    "●": "#68aef2",
+                }[status]
+                detail_parts: list[str] = []
+                if filename:
+                    detail_parts.append(
+                        f'<span style="color:#8fc7ff;">{escape(filename)}</span>'
+                    )
+                if description:
+                    detail_parts.append(
+                        f'<span style="color:#9eafc1;">{escape(description)}</span>'
+                    )
+                details = " &nbsp;·&nbsp; ".join(detail_parts)
+                detail_html = f'<br/><span style="font-size:10px;">{details}</span>' if details else ""
+                output_rows.append(
+                    '<tr bgcolor="#202832">'
+                    f'<td width="16" valign="top"><span style="font-size:12px; color:{status_color};">'
+                    f"{status}</span></td>"
+                    '<td valign="top">'
+                    f'<span style="font-size:11px; font-weight:600; color:#edf4fb;">'
+                    f"{escape(title)}</span>{detail_html}</td></tr>"
+                )
+                continue
+
+            flush_rows()
+            stripped = line.strip()
+            if stripped.startswith("Каналы:"):
+                parts.append(
+                    '<div style="margin:1px 0 7px 25px; color:#9eb7d1;">'
+                    f"{escape(stripped)}</div>"
+                )
+            elif stripped.startswith("Не будут созданы"):
+                parts.append(
+                    '<div style="margin-top:7px; padding:5px; color:#f0bd69; '
+                    'background-color:#332b20;">'
+                    f"{escape(stripped)}</div>"
+                )
+            elif stripped.startswith(("- ", "Дополнительно", "Наборы:")):
+                parts.append(
+                    '<div style="margin-top:5px; color:#b7c5d4;">'
+                    f"{escape(stripped.removeprefix('- '))}</div>"
+                )
+            else:
+                parts.append(
+                    '<div style="margin-top:4px; color:#899caf;">'
+                    f"{escape(stripped)}</div>"
+                )
+
+        flush_rows()
+        parts.append("</div>")
+        return "".join(parts)
+
+    @staticmethod
+    def _split_output_line(body: str) -> tuple[str, str, str]:
+        title = body
+        filename = ""
+        description = ""
+        if " → " in body:
+            title, remainder = body.split(" → ", 1)
+            if " — " in remainder:
+                filename, description = remainder.split(" — ", 1)
+            else:
+                filename = remainder
+        return title.strip(), filename.strip(), description.strip()
 
 
 class SettingsPanel(QWidget):
@@ -171,15 +303,14 @@ class SettingsPanel(QWidget):
         return group
 
     def _build_output_bundle_group(self) -> QGroupBox:
-        group = QGroupBox("Итоговый набор файлов")
+        group = QGroupBox("Итоговый Texture Set")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
-        self.output_bundle_summary_label = QLabel(
+        self.output_bundle_summary_label = TextureSetSummaryLabel(
             "Выберите сценарий и добавьте файлы в очередь, чтобы увидеть ожидаемый состав экспорта."
         )
         self.output_bundle_summary_label.setObjectName("SummaryText")
-        self.output_bundle_summary_label.setWordWrap(True)
         layout.addWidget(self.output_bundle_summary_label)
         return group
 
@@ -264,6 +395,12 @@ class SettingsPanel(QWidget):
         self.pack_enable_checkbox.toggled.connect(self._refresh_packing_ui)
         layout.addWidget(self.pack_enable_checkbox)
 
+        self.unpack_packed_checkbox = QCheckBox(
+            "Распаковывать найденные packed textures в отдельные карты"
+        )
+        self.unpack_packed_checkbox.toggled.connect(self._refresh_packing_ui)
+        layout.addWidget(self.unpack_packed_checkbox)
+
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Режим:"))
         self.pack_mode_combo = QComboBox()
@@ -299,6 +436,7 @@ class SettingsPanel(QWidget):
 
         self._register_interactive(
             self.pack_enable_checkbox,
+            self.unpack_packed_checkbox,
             self.pack_mode_combo,
             self.pack_layout_combo,
         )
@@ -435,6 +573,7 @@ class SettingsPanel(QWidget):
             self.naming_replace_spaces_checkbox,
             self.naming_normalize_suffix_checkbox,
             self.pack_enable_checkbox,
+            self.unpack_packed_checkbox,
         )
         for widget in toggles:
             widget.toggled.connect(self._notify_options_changed)
@@ -505,6 +644,7 @@ class SettingsPanel(QWidget):
             png8=self.png8_checkbox.isChecked(),
             png8_colors=self.png8_colors_spin.value(),
             dither=self.dither_checkbox.isChecked(),
+            unpack_packed=self.unpack_packed_checkbox.isChecked(),
             naming=self.build_naming_rules(),
             packing=self.build_channel_packing_options(),
         )
@@ -533,6 +673,7 @@ class SettingsPanel(QWidget):
             self.naming_replace_spaces_checkbox.setChecked(options.naming.replace_spaces)
             self.naming_normalize_suffix_checkbox.setChecked(options.naming.normalize_map_suffix)
             self.pack_enable_checkbox.setChecked(options.packing.enabled)
+            self.unpack_packed_checkbox.setChecked(options.unpack_packed)
             for index in range(self.pack_layout_combo.count()):
                 if self.pack_layout_combo.itemData(index) == options.packing.layout:
                     self.pack_layout_combo.setCurrentIndex(index)
@@ -675,14 +816,26 @@ class SettingsPanel(QWidget):
         self.pack_layout_combo.setEnabled(self.pack_enable_checkbox.isChecked())
         self.pack_mode_combo.setEnabled(self.pack_enable_checkbox.isChecked())
         self.packing_mode_label.setText(self._packing_mode_description(packing_options))
-        self.packing_mapping_label.setText(channel_pack_mapping_text(packing_options.layout))
 
         if not packing_options.enabled:
-            self.packing_queue_label.setText(
-                "Упаковка каналов выключена. Для каждого исходника будет сохранен отдельный PNG."
-            )
+            if self.unpack_packed_checkbox.isChecked():
+                self.packing_mapping_label.setText(
+                    "Вход: ORM, RMA, MRA, Unity URP Metallic/Smoothness или Unity HDRP Mask Map. "
+                    "Выход: отдельные AO, Roughness, Metallic и HDRP Detail Mask."
+                )
+                self.packing_queue_label.setText(
+                    "Traditional / Non-Packed: распознанные ORM/RMA/MRA и Unity packed textures "
+                    "будут разложены на AO, Roughness, Metallic и HDRP Detail Mask. "
+                    "Остальные карты сохранятся отдельно."
+                )
+            else:
+                self.packing_mapping_label.setText("Packed-преобразование не используется.")
+                self.packing_queue_label.setText(
+                    "Упаковка каналов выключена. Для каждого исходника будет сохранен отдельный PNG."
+                )
             return
 
+        self.packing_mapping_label.setText(channel_pack_mapping_text(packing_options.layout))
         self.packing_queue_label.setText(self._packing_preflight_text)
 
     def set_packing_preflight_summary(self, text: str) -> None:
@@ -690,7 +843,7 @@ class SettingsPanel(QWidget):
         self._refresh_packing_ui()
 
     def set_output_bundle_summary(self, text: str) -> None:
-        self.output_bundle_summary_label.setText(text)
+        self.output_bundle_summary_label.set_summary_text(text)
 
     def minimumSizeHint(self) -> QSize:
         return QSize(260, 480)
@@ -700,6 +853,8 @@ class SettingsPanel(QWidget):
 
     def _packing_mode_description(self, packing_options: ChannelPackingOptions) -> str:
         if not packing_options.enabled:
+            if self.unpack_packed_checkbox.isChecked():
+                return "Traditional / Non-Packed: packed-входы распаковываются в отдельные PBR-карты."
             return "Режим упаковки каналов выключен."
         if packing_options.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
             return "Packed + нужные карты: приложение сохранит итоговую packed texture и отдельно выгрузит только те карты, которые не входят в packed-схему."
@@ -762,6 +917,13 @@ class SettingsPanel(QWidget):
     def _preset_packing_summary(self, options: ConversionOptions) -> str:
         packing = options.packing
         if not packing.enabled:
+            if options.unpack_packed:
+                return (
+                    "Преобразование packed textures\n"
+                    "Traditional / Non-Packed Workflow (Offline / Production).\n"
+                    "ORM/RMA/MRA и Unity packed maps распаковываются в отдельные "
+                    "AO, Roughness, Metallic и HDRP Detail Mask; остальные карты сохраняются отдельно."
+                )
             return (
                 "Упаковка каналов\n"
                 "Выключена.\n"

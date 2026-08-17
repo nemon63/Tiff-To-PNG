@@ -26,6 +26,7 @@ def serialize_conversion_options(options: ConversionOptions) -> dict[str, Any]:
         "png8": options.png8,
         "png8_colors": options.png8_colors,
         "dither": options.dither,
+        "unpack_packed": options.unpack_packed,
         "naming": {
             "lowercase": options.naming.lowercase,
             "replace_spaces": options.naming.replace_spaces,
@@ -80,6 +81,7 @@ def deserialize_conversion_options(data: dict[str, Any]) -> ConversionOptions:
         png8=bool(data.get("png8", False)),
         png8_colors=_coerce_int(data.get("png8_colors"), 256),
         dither=bool(data.get("dither", True)),
+        unpack_packed=bool(data.get("unpack_packed", False)),
         naming=NamingRules(
             lowercase=bool(naming_data.get("lowercase", False)),
             replace_spaces=bool(naming_data.get("replace_spaces", False)),

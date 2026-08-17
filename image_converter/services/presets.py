@@ -49,6 +49,25 @@ SYSTEM_PRESETS: tuple[ConversionPreset, ...] = (
         ),
     ),
     ConversionPreset(
+        preset_id="system:offline-production",
+        name="Traditional / Non-Packed Workflow",
+        scope=PresetScope.SYSTEM,
+        description=(
+            "Offline / Production workflow: полный набор отдельных PBR-карт без ресайза и PNG-8. "
+            "Распознает ORM/RMA/MRA, Unity URP и Unity HDRP packed textures, "
+            "раскладывает их на AO, Roughness и Metallic, сохраняет HDRP Detail Mask "
+            "и остальные карты отдельно."
+        ),
+        options=ConversionOptions(
+            optimize=True,
+            compress_level=6,
+            resize_mode=ResizeMode.NONE,
+            png8=False,
+            unpack_packed=True,
+            naming=NamingRules(normalize_map_suffix=True),
+        ),
+    ),
+    ConversionPreset(
         preset_id="system:unreal-orm",
         name="Unreal ORM Pack",
         scope=PresetScope.SYSTEM,

@@ -32,6 +32,7 @@ class TextureMapType(str, Enum):
     OPACITY = "opacity"
     EMISSIVE = "emissive"
     HEIGHT = "height"
+    DETAIL_MASK = "detail_mask"
 
     @property
     def label(self) -> str:
@@ -46,6 +47,7 @@ class TextureMapType(str, Enum):
             TextureMapType.OPACITY: "Opacity",
             TextureMapType.EMISSIVE: "Emissive",
             TextureMapType.HEIGHT: "Height",
+            TextureMapType.DETAIL_MASK: "Detail Mask",
         }
         return mapping[self]
 
@@ -155,6 +157,7 @@ class ConversionOptions:
     png8: bool = False
     png8_colors: int = 256
     dither: bool = True
+    unpack_packed: bool = False
     naming: NamingRules = field(default_factory=NamingRules)
     packing: ChannelPackingOptions = field(default_factory=ChannelPackingOptions)
 
@@ -177,6 +180,10 @@ class BatchSource:
     path: Path
     root: Path | None = None
     map_type: TextureMapType = TextureMapType.UNKNOWN
+    packed_layout: ChannelPackLayout | None = None
+    source_channel: str | None = None
+    invert_channel: bool = False
+    output_stem: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -240,6 +247,7 @@ class QueueItem:
     output_path: Path | None = None
     message: str = ""
     map_type_override: TextureMapType | None = None
+    packed_layout_override: ChannelPackLayout | None = None
 
     @property
     def path(self) -> Path:
@@ -253,9 +261,19 @@ class QueueItem:
     def effective_map_type(self) -> TextureMapType:
         if self.map_type_override is not None:
             return self.map_type_override
+        if self.packed_layout_override is not None or self.source.packed_layout is not None:
+            return TextureMapType.UNKNOWN
         if self.metadata is not None:
             return self.metadata.map_type
         return TextureMapType.UNKNOWN
+
+    @property
+    def effective_packed_layout(self) -> ChannelPackLayout | None:
+        if self.packed_layout_override is not None:
+            return self.packed_layout_override
+        if self.map_type_override is not None:
+            return None
+        return self.source.packed_layout
 
     @property
     def batch_source(self) -> BatchSource:
@@ -263,6 +281,7 @@ class QueueItem:
             path=self.path,
             root=self.root,
             map_type=self.effective_map_type,
+            packed_layout=self.effective_packed_layout,
         )
 
 

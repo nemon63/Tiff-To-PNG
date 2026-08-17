@@ -3,7 +3,33 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from image_converter.domain.models import TextureMapType
+from image_converter.domain.models import ChannelPackLayout, TextureMapType
+
+
+PACK_LAYOUT_SUFFIXES: dict[ChannelPackLayout, tuple[str, ...]] = {
+    ChannelPackLayout.ORM: (
+        "orm",
+        "arm",
+        "occlusion_roughness_metallic",
+        "ambient_occlusion_roughness_metallic",
+    ),
+    ChannelPackLayout.RMA: ("rma", "roughness_metallic_ao"),
+    ChannelPackLayout.MRA: ("mra", "metallic_roughness_ao"),
+    ChannelPackLayout.UNITY_URP: (
+        "metallicsmoothness",
+        "metallic_smoothness",
+        "urp_metallicsmoothness",
+        "urp_metallic_smoothness",
+        "metallicglossmap",
+        "metallic_gloss_map",
+    ),
+    ChannelPackLayout.UNITY_HDRP: (
+        "maskmap",
+        "mask_map",
+        "hdrp_maskmap",
+        "hdrp_mask_map",
+    ),
+}
 
 MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
     (
@@ -31,6 +57,10 @@ MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
         ("ao", "ambientocclusion", "ambient_occlusion", "occlusion", "occ"),
     ),
     (
+        TextureMapType.DETAIL_MASK,
+        ("detailmask", "detail_mask"),
+    ),
+    (
         TextureMapType.OPACITY,
         ("opacity", "alpha", "mask", "transparency", "transparent", "opc"),
     ),
@@ -54,6 +84,7 @@ CANONICAL_MAP_SUFFIXES: dict[TextureMapType, str] = {
     TextureMapType.OPACITY: "opacity",
     TextureMapType.EMISSIVE: "emissive",
     TextureMapType.HEIGHT: "height",
+    TextureMapType.DETAIL_MASK: "detailmask",
 }
 
 
@@ -89,6 +120,37 @@ def detect_texture_map_type(path: Path) -> TextureMapType:
     return TextureMapType.UNKNOWN
 
 
+def detect_channel_pack_layout(path: Path) -> ChannelPackLayout | None:
+    normalized_stem = _normalized_stem(path.stem)
+    collapsed_stem = normalized_stem.replace("_", "")
+    for layout, aliases in PACK_LAYOUT_SUFFIXES.items():
+        for alias in aliases:
+            normalized_alias = _normalized_stem(alias)
+            if not normalized_alias:
+                continue
+            collapsed_alias = normalized_alias.replace("_", "")
+            if normalized_stem == normalized_alias:
+                return layout
+            if normalized_stem.endswith(f"_{normalized_alias}"):
+                return layout
+            if len(collapsed_alias) >= 5 and collapsed_stem.endswith(collapsed_alias):
+                return layout
+    return None
+
+
+def strip_channel_pack_suffix(stem: str) -> str:
+    normalized_stem = _normalized_stem(stem)
+    for aliases in PACK_LAYOUT_SUFFIXES.values():
+        for alias in sorted(aliases, key=len, reverse=True):
+            normalized_alias = _normalized_stem(alias)
+            if normalized_stem == normalized_alias:
+                return ""
+            suffix = f"_{normalized_alias}"
+            if normalized_stem.endswith(suffix):
+                return normalized_stem[: -len(suffix)].strip("_")
+    return normalized_stem
+
+
 def _matches_alias(
     normalized_stem: str,
     collapsed_stem: str,
@@ -118,3 +180,10 @@ def _matches_alias(
         return True
 
     return False
+
+
+def _normalized_stem(stem: str) -> str:
+    with_camel_breaks = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", stem)
+    with_camel_breaks = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", with_camel_breaks)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", with_camel_breaks).strip("_").lower()
+    return re.sub(r"_+", "_", normalized)

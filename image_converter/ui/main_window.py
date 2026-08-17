@@ -44,6 +44,7 @@ from image_converter.domain.models import (
     AppSettings,
     BatchRequest,
     BatchSource,
+    ChannelPackLayout,
     ChannelPackingMode,
     ConversionPreset,
     QueueItem,
@@ -79,9 +80,14 @@ from image_converter.application.thumbnail import ThumbnailController
 from image_converter.application.job_coordinator import ApplicationJobCoordinator
 from image_converter.services.packing import (
     build_channel_pack_jobs,
+    build_traditional_sources,
+    channel_pack_mapping_text,
+    channel_pack_output_suffix,
+    packed_layout_map_types,
     packed_source_map_types,
     summarize_channel_pack_jobs,
 )
+from image_converter.services.map_types import canonical_map_suffix
 from image_converter.services.presets import PresetRepository
 from image_converter.services.validation import validate_request
 from image_converter.domain.constants import FILE_DIALOG_FILTER
@@ -1042,7 +1048,15 @@ class MainWindow(QMainWindow):
             for item in items:
                 self._queue_row_items.append(item)
                 metadata = item.metadata
-                if options.packing.enabled and options.packing.mode is ChannelPackingMode.PACK_ONLY:
+                if options.unpack_packed and item.effective_packed_layout is not None and not options.packing.enabled:
+                    unpacked_labels = self._map_type_list_text(
+                        packed_layout_map_types(item.effective_packed_layout)
+                    )
+                    output_text = f"Распаковка: {unpacked_labels}"
+                    output_tooltip = (
+                        "Packed texture будет разложена в отдельные карты: " + unpacked_labels
+                    )
+                elif options.packing.enabled and options.packing.mode is ChannelPackingMode.PACK_ONLY:
                     output_text = "В составе packed texture"
                     output_tooltip = (
                         str(item.output_path)
@@ -1052,7 +1066,10 @@ class MainWindow(QMainWindow):
                 elif (
                     options.packing.enabled
                     and options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER
-                    and item.effective_map_type in packed_source_map_types(options.packing.layout)
+                    and (
+                        item.effective_map_type in packed_source_map_types(options.packing.layout)
+                        or item.effective_packed_layout is not None
+                    )
                 ):
                     output_text = "В составе packed texture"
                     output_tooltip = (
@@ -1132,15 +1149,24 @@ class MainWindow(QMainWindow):
         return table_item
 
     def _asset_type_text(self, item: QueueItem) -> str:
+        if item.effective_packed_layout is not None:
+            return f"Packed {item.effective_packed_layout.label}"
         return _map_type_label(item.effective_map_type)
 
     def _map_type_tooltip(self, item: QueueItem) -> str:
         metadata = item.metadata
-        lines = [f"Тип карты: {_map_type_label(item.effective_map_type)}"]
+        if item.effective_packed_layout is not None:
+            lines = [f"Packed layout: {item.effective_packed_layout.label}"]
+            lines.append(
+                "Каналы: "
+                + self._map_type_list_text(packed_layout_map_types(item.effective_packed_layout))
+            )
+        else:
+            lines = [f"Тип карты: {_map_type_label(item.effective_map_type)}"]
         lines.append(
             f"Color Space: {_colorspace_label(recommended_colorspace_for_map_type(item.effective_map_type))}"
         )
-        if item.map_type_override is not None:
+        if item.map_type_override is not None or item.packed_layout_override is not None:
             lines.append("Источник: ручное переопределение")
         elif metadata is not None:
             lines.append("Источник: автоопределение по имени файла")
@@ -1197,6 +1223,26 @@ class MainWindow(QMainWindow):
         options = self.settings_panel.build_conversion_options()
         output_root_text = self.settings_panel.output_edit.text().strip()
         output_root = Path(output_root_text) if output_root_text else None
+        if options.unpack_packed and source.packed_layout is not None and not options.packing.enabled:
+            expanded_sources = build_traditional_sources([source])
+            if expanded_sources:
+                return BatchConversionService.build_destination_for_source(
+                    expanded_sources[0],
+                    output_root,
+                    options,
+                )
+        if (
+            options.unpack_packed
+            and source.map_type is TextureMapType.SMOOTHNESS
+            and not options.packing.enabled
+        ):
+            traditional_sources = build_traditional_sources([source])
+            if traditional_sources:
+                return BatchConversionService.build_destination_for_source(
+                    traditional_sources[0],
+                    output_root,
+                    options,
+                )
         if options.packing.enabled and options.packing.mode in {
             ChannelPackingMode.PACK_ONLY,
             ChannelPackingMode.PACK_WITH_REMAINDER,
@@ -1210,7 +1256,10 @@ class MainWindow(QMainWindow):
             if (
                 pack_jobs
                 and options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER
-                and source.map_type in packed_source_map_types(options.packing.layout)
+                and (
+                    source.map_type in packed_source_map_types(options.packing.layout)
+                    or source.packed_layout is not None
+                )
             ):
                 return pack_jobs[0].output_path
         return BatchConversionService.build_destination_for_source(
@@ -1375,85 +1424,165 @@ class MainWindow(QMainWindow):
             for item in self._queue_items
             if item.status is not QueueStatus.ERROR
         ]
-        if not source_items:
-            if not options.packing.enabled:
-                return "Для выбранного сценария\n- Отдельно: все исходные карты\n- Packed texture: не используется"
-            packed_types = packed_source_map_types(options.packing.layout)
-            packed_labels = self._map_type_list_text(packed_types)
-            if options.packing.mode is ChannelPackingMode.PACK_ONLY:
-                return (
-                    "Для выбранного сценария\n"
-                    f"- Packed: {options.packing.layout.label}\n"
-                    f"- Не будут выгружены отдельно: {packed_labels}"
-                )
-            if options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
-                separate_text = self._map_type_list_text(
-                    self._generic_nonpacked_map_types(options.packing.layout)
-                )
-                return (
-                    "Для выбранного сценария\n"
-                    f"- Отдельно при наличии: {separate_text}\n"
-                    f"- Packed: {options.packing.layout.label}\n"
-                    f"- Не дублировать отдельно: {packed_labels}"
-                )
-            return (
-                "Для выбранного сценария\n"
-                "- Отдельно: все исходные карты\n"
-                f"- Дополнительно packed: {options.packing.layout.label}"
-            )
+        available_map_types = self._available_logical_map_types(source_items)
+        if (
+            options.unpack_packed
+            and not options.packing.enabled
+            and TextureMapType.SMOOTHNESS in available_map_types
+        ):
+            available_map_types.discard(TextureMapType.SMOOTHNESS)
+            available_map_types.add(TextureMapType.ROUGHNESS)
+        has_sources = bool(source_items)
+        scope_text = "для текущей очереди" if has_sources else "шаблон выбранного пайплайна"
+        lines = [f"Будут созданы — {scope_text}"]
+        lines.append(
+            "✓ найден источник   ○ нет исходных данных"
+            if has_sources
+            else "● выход, предусмотренный пайплайном"
+        )
 
-        available_map_types = {
-            item.effective_map_type
-            for item in source_items
-            if item.effective_map_type is not TextureMapType.UNKNOWN
-        }
+        if not options.packing.enabled and options.unpack_packed:
+            traditional_types = (
+                TextureMapType.BASECOLOR,
+                TextureMapType.ROUGHNESS,
+                TextureMapType.METALLIC,
+                TextureMapType.NORMAL,
+                TextureMapType.AO,
+            )
+            for map_type in traditional_types:
+                lines.append(
+                    self._texture_output_preview_line(
+                        map_type,
+                        available=not has_sources or map_type in available_map_types,
+                        planned=not has_sources,
+                    )
+                )
+
+            extra_types = available_map_types - set(traditional_types)
+            if extra_types:
+                lines.append(
+                    "Дополнительно отдельными PNG: "
+                    + self._map_type_list_text(extra_types)
+                )
+            if has_sources:
+                missing = set(traditional_types) - available_map_types
+                if missing:
+                    lines.append(
+                        "Не будут созданы — нет исходных данных: "
+                        + self._map_type_list_text(missing)
+                    )
+            lines.append("Packed texture: не используется")
+            return "\n".join(lines)
 
         if not options.packing.enabled:
-            return (
-                "Для текущей очереди\n"
-                "- Отдельно: все исходные карты\n"
-                "- Packed texture: не используется"
-            )
+            if has_sources and available_map_types:
+                lines.extend(
+                    self._texture_output_preview_line(map_type, available=True)
+                    for map_type in self._ordered_map_types(available_map_types)
+                )
+                lines.append("- Отдельно: " + self._map_type_list_text(available_map_types))
+            else:
+                lines.append("● Отдельные PNG для всех исходных карт")
+                lines.append("- Отдельно: все исходные карты")
+            lines.append("Packed texture: не используется")
+            return "\n".join(lines)
 
         packed_types = packed_source_map_types(options.packing.layout)
         packed_labels = self._map_type_list_text(packed_types)
+        pack_jobs = build_channel_pack_jobs(
+            [item.batch_source for item in source_items],
+            None,
+            options,
+        ) if has_sources else ()
+        packed_available = not has_sources or any(job.is_ready for job in pack_jobs)
 
         if options.packing.mode is ChannelPackingMode.PACK_ONLY:
-            return (
-                "Для текущей очереди\n"
-                f"- Packed: {options.packing.layout.label}\n"
-                f"- Не будут выгружены отдельно: {packed_labels}"
-            )
-
-        if options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
+            separate_types: list[TextureMapType] = []
+        else:
             separate_source = (
                 available_map_types
-                if available_map_types
-                else self._generic_nonpacked_map_types(options.packing.layout)
+                if has_sources
+                else self._pipeline_template_separate_map_types(options.packing.layout)
             )
             separate_types = [
                 map_type
                 for map_type in self._ordered_map_types(separate_source)
-                if map_type not in packed_types
+                if (
+                    options.packing.mode is ChannelPackingMode.AFTER_CONVERSION
+                    or map_type not in packed_types
+                )
             ]
-            separate_text = (
-                self._map_type_list_text(separate_types)
-                if separate_types
-                else "нет"
-            )
-            prefix = "Отдельно" if available_map_types else "Отдельно при наличии"
-            return (
-                "Для текущей очереди\n"
-                f"- {prefix}: {separate_text}\n"
-                f"- Packed: {options.packing.layout.label}\n"
-                f"- Не дублировать отдельно: {packed_labels}"
+
+        if separate_types:
+            lines.append("- Отдельно: " + self._map_type_list_text(separate_types))
+            lines.extend(
+                self._texture_output_preview_line(
+                    map_type,
+                    available=True,
+                    planned=not has_sources,
+                )
+                for map_type in separate_types
             )
 
-        return (
-            "Для текущей очереди\n"
-            "- Отдельно: все исходные карты\n"
-            f"- Дополнительно packed: {options.packing.layout.label}"
+        pack_status = "●" if not has_sources else "✓" if packed_available else "○"
+        suffix = channel_pack_output_suffix(options.packing.layout)
+        lines.append(
+            f"{pack_status} Packed: {options.packing.layout.label} → *_{suffix}.png"
         )
+        lines.append("  Каналы: " + channel_pack_mapping_text(options.packing.layout))
+
+        if options.packing.mode is ChannelPackingMode.PACK_ONLY:
+            lines.append(f"- Не будут выгружены отдельно: {packed_labels}")
+        elif options.packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
+            lines.append(f"- Не дублировать отдельно: {packed_labels}")
+        else:
+            lines.append(f"- Дополнительно packed: {options.packing.layout.label}")
+
+        if has_sources and pack_jobs:
+            ready_count = sum(job.is_ready for job in pack_jobs)
+            lines.append(
+                f"Наборы: готово {ready_count}, неполных {len(pack_jobs) - ready_count}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _available_logical_map_types(source_items: list[QueueItem]) -> set[TextureMapType]:
+        available: set[TextureMapType] = set()
+        for item in source_items:
+            if item.effective_packed_layout is not None:
+                available.update(packed_layout_map_types(item.effective_packed_layout))
+            elif item.effective_map_type is not TextureMapType.UNKNOWN:
+                available.add(item.effective_map_type)
+        return available
+
+    @staticmethod
+    def _texture_output_preview_line(
+        map_type: TextureMapType,
+        *,
+        available: bool,
+        planned: bool = False,
+    ) -> str:
+        display_names = {
+            TextureMapType.BASECOLOR: "Base Color / Albedo",
+            TextureMapType.ROUGHNESS: "Roughness",
+            TextureMapType.METALLIC: "Metallic",
+            TextureMapType.NORMAL: "Normal",
+            TextureMapType.AO: "Ambient Occlusion (AO)",
+            TextureMapType.DETAIL_MASK: "Detail Mask",
+        }
+        descriptions = {
+            TextureMapType.BASECOLOR: "чистый цвет поверхности",
+            TextureMapType.ROUGHNESS: "карта шероховатости, grayscale",
+            TextureMapType.METALLIC: "карта металличности, grayscale",
+            TextureMapType.NORMAL: "карта рельефа, RGB",
+            TextureMapType.AO: "карта микрозатенения, grayscale",
+            TextureMapType.DETAIL_MASK: "HDRP detail mask, grayscale",
+        }
+        status = "●" if planned else "✓" if available else "○"
+        suffix = canonical_map_suffix(map_type) or map_type.value
+        display_name = display_names.get(map_type, map_type.label)
+        description = descriptions.get(map_type, "отдельная текстура")
+        return f"{status} {display_name} → *_{suffix}.png — {description}"
 
     @staticmethod
     def _ordered_map_types(map_types: set[TextureMapType] | frozenset[TextureMapType]) -> list[TextureMapType]:
@@ -1489,16 +1618,16 @@ class MainWindow(QMainWindow):
         return ", ".join(map_type.label for map_type in ordered)
 
     @staticmethod
-    def _generic_nonpacked_map_types(layout: object) -> set[TextureMapType]:
-        packed_types = packed_source_map_types(layout)
-        return {
+    def _pipeline_template_separate_map_types(
+        layout: ChannelPackLayout,
+    ) -> set[TextureMapType]:
+        map_types = {
             TextureMapType.BASECOLOR,
             TextureMapType.NORMAL,
-            TextureMapType.EMISSIVE,
-            TextureMapType.HEIGHT,
-            TextureMapType.OPACITY,
-            TextureMapType.SMOOTHNESS,
-        } - set(packed_types)
+        }
+        if layout is ChannelPackLayout.UNITY_URP:
+            map_types.add(TextureMapType.AO)
+        return map_types
 
     def _apply_preset(self, preset_id: str) -> None:
         preset = self._presets_by_id.get(preset_id)
@@ -1667,8 +1796,13 @@ class MainWindow(QMainWindow):
 
         if map_type_override is None:
             item.map_type_override = None
+            item.packed_layout_override = None
         elif isinstance(map_type_override, TextureMapType):
             item.map_type_override = map_type_override
+            item.packed_layout_override = None
+        elif isinstance(map_type_override, ChannelPackLayout):
+            item.map_type_override = None
+            item.packed_layout_override = map_type_override
         else:
             return
 

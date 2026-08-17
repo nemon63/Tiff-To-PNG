@@ -19,6 +19,7 @@ TECHNICAL_MAP_TYPES = {
     TextureMapType.AO,
     TextureMapType.OPACITY,
     TextureMapType.HEIGHT,
+    TextureMapType.DETAIL_MASK,
 }
 
 COLOR_NAME_ALIASES = map_type_aliases(TextureMapType.BASECOLOR) + map_type_aliases(TextureMapType.EMISSIVE)
@@ -30,6 +31,7 @@ TECHNICAL_NAME_ALIASES = (
     + map_type_aliases(TextureMapType.AO)
     + map_type_aliases(TextureMapType.OPACITY)
     + map_type_aliases(TextureMapType.HEIGHT)
+    + map_type_aliases(TextureMapType.DETAIL_MASK)
 )
 
 

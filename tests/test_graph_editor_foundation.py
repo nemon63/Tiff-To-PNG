@@ -1551,6 +1551,7 @@ class ChannelPackingPlanTests(unittest.TestCase):
         preset_names = {preset.name: preset for preset in SYSTEM_PRESETS}
 
         self.assertIn("Unreal ORM Pack", preset_names)
+        self.assertIn("Traditional / Non-Packed Workflow", preset_names)
         self.assertIn("Unity URP Pack", preset_names)
         self.assertIn("Unity HDRP Mask Map", preset_names)
         self.assertIn("Fast Preview 1K", preset_names)
@@ -1565,6 +1566,12 @@ class ChannelPackingPlanTests(unittest.TestCase):
         self.assertEqual(
             ChannelPackLayout.ORM,
             preset_names["Unreal ORM Pack"].options.packing.layout,
+        )
+        self.assertTrue(
+            preset_names["Traditional / Non-Packed Workflow"].options.unpack_packed
+        )
+        self.assertFalse(
+            preset_names["Traditional / Non-Packed Workflow"].options.packing.enabled
         )
         self.assertIn(
             "длинная сторона больше 4096 px",
@@ -3553,6 +3560,75 @@ class GraphEditorFoundationTests(unittest.TestCase):
             )
             self.assertIn("Файлы: перезапись выключена; исходники сохраняются", preset_text)
             self.assertIn("Packed: ORM", bundle_text)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_traditional_preset_previews_substance_style_texture_set(self) -> None:
+        window = MainWindow()
+        try:
+            presets = list(SYSTEM_PRESETS)
+            window._presets_by_id = {preset.preset_id: preset for preset in presets}
+            window.settings_panel.set_available_presets(presets)
+            traditional = next(
+                preset
+                for preset in presets
+                if preset.name == "Traditional / Non-Packed Workflow"
+            )
+
+            window.settings_panel.apply_conversion_options(traditional.options)
+            window._refresh_output_bundle_summary()
+
+            bundle_text = window.settings_panel.output_bundle_summary_label.text()
+            self.assertIn("Base Color / Albedo → *_basecolor.png", bundle_text)
+            self.assertIn("Roughness → *_roughness.png", bundle_text)
+            self.assertIn("Metallic → *_metallic.png", bundle_text)
+            self.assertIn("Normal → *_normal.png", bundle_text)
+            self.assertIn("Ambient Occlusion (AO) → *_ao.png", bundle_text)
+            self.assertIn("Packed texture: не используется", bundle_text)
+            rendered_html = window.settings_panel.output_bundle_summary_label.rendered_html
+            self.assertIn('<table width="100%"', rendered_html)
+            self.assertIn('bgcolor="#202832"', rendered_html)
+            self.assertIn("Base Color / Albedo", rendered_html)
+            self.assertIn("*_basecolor.png", rendered_html)
+            self.assertIn("чистый цвет поверхности", rendered_html)
+
+            base_metadata = AssetMetadata(
+                "PNG", 4, 4, "RGB", False, 64, TextureMapType.BASECOLOR
+            )
+            normal_metadata = AssetMetadata(
+                "PNG", 4, 4, "RGB", False, 64, TextureMapType.NORMAL
+            )
+            window.add_queue_items(
+                [
+                    QueueItem(
+                        BatchSource(
+                            Path("D:/textures/key_basecolor.png"),
+                            Path("D:/textures"),
+                            TextureMapType.BASECOLOR,
+                        ),
+                        AssetKind.IMAGE,
+                        base_metadata,
+                    ),
+                    QueueItem(
+                        BatchSource(
+                            Path("D:/textures/key_normal.png"),
+                            Path("D:/textures"),
+                            TextureMapType.NORMAL,
+                        ),
+                        AssetKind.IMAGE,
+                        normal_metadata,
+                    ),
+                ]
+            )
+            bundle_text = window.settings_panel.output_bundle_summary_label.text()
+            self.assertIn("✓ Base Color / Albedo", bundle_text)
+            self.assertIn("○ Roughness", bundle_text)
+            self.assertIn(
+                "Не будут созданы — нет исходных данных: AO, Roughness, Metallic",
+                bundle_text,
+            )
         finally:
             window.close()
             window.deleteLater()

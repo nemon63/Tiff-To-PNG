@@ -13,7 +13,7 @@ from image_converter.services.image_loading import (
     image_has_alpha,
     prepare_image_header_preserving_alpha,
 )
-from image_converter.services.map_types import detect_texture_map_type
+from image_converter.services.map_types import detect_channel_pack_layout, detect_texture_map_type
 
 
 @dataclass(slots=True, frozen=True)
@@ -74,7 +74,11 @@ class AssetScanner:
             if path.suffix.lower() not in SUPPORTED_SOURCE_EXTENSIONS:
                 ignored_messages.append(f"Пропуск неподдерживаемого файла: {path.name}")
                 return
-            yield BatchSource(path=path, root=path.parent)
+            yield BatchSource(
+                path=path,
+                root=path.parent,
+                packed_layout=detect_channel_pack_layout(path),
+            )
             return
 
         iterator = path.rglob("*") if recursive else path.glob("*")
@@ -87,7 +91,11 @@ class AssetScanner:
                 continue
             if file_path.suffix.lower() in SUPPORTED_SOURCE_EXTENSIONS:
                 supported_count += 1
-                yield BatchSource(path=file_path, root=path)
+                yield BatchSource(
+                    path=file_path,
+                    root=path,
+                    packed_layout=detect_channel_pack_layout(file_path),
+                )
             else:
                 unsupported_count += 1
 

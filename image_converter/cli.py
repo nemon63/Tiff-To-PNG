@@ -68,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build only packed textures and skip regular per-file PNG conversion",
     )
     parser.add_argument(
+        "--unpack-packed",
+        action="store_true",
+        help=(
+            "Unpack detected ORM/RMA/MRA/Unity packed textures to separate "
+            "AO/Roughness/Metallic/Detail Mask maps"
+        ),
+    )
+    parser.add_argument(
         "--compress-level",
         type=int,
         default=6,
@@ -147,6 +155,7 @@ def build_request_from_args(args: argparse.Namespace) -> BatchRequest:
             png8=args.png8,
             png8_colors=args.png8_colors,
             dither=args.dither,
+            unpack_packed=args.unpack_packed,
             naming=NamingRules(
                 lowercase=args.lowercase_names,
                 replace_spaces=args.replace_spaces,

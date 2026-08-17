@@ -12,7 +12,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from image_converter.domain.models import ConversionOptions, QueueItem, QueueStatus, TextureMapType
+from image_converter.domain.models import (
+    ChannelPackLayout,
+    ConversionOptions,
+    QueueItem,
+    QueueStatus,
+    TextureMapType,
+)
 from image_converter.services.colorspace import item_preflight_warnings
 from image_converter.services.inspection import build_output_estimate
 from image_converter.services.naming import build_output_filename
@@ -247,8 +253,13 @@ class MetadataPanel(QWidget):
             self._conversion_options,
             item.effective_map_type,
         )
+        role_text = (
+            f"Packed {item.effective_packed_layout.label}"
+            if item.effective_packed_layout is not None
+            else _map_type_label(item.effective_map_type)
+        )
         self.asset_meta_label.setText(
-            f"{_map_type_label(item.effective_map_type)}  •  {metadata.resolution_text}  •  {metadata.mode}  •  {output_estimate.colorspace_text}"
+            f"{role_text}  •  {metadata.resolution_text}  •  {metadata.mode}  •  {output_estimate.colorspace_text}"
         )
         output_name = build_output_filename(
             item.path,
@@ -322,15 +333,28 @@ class MetadataPanel(QWidget):
             self.map_type_combo.blockSignals(False)
             return
 
-        detected_map_type = item.metadata.map_type
-        self.map_type_combo.addItem(f"Авто: {_map_type_label(detected_map_type)}", AUTO_MAP_TYPE_DATA)
+        detected_packed_layout = item.source.packed_layout
+        if detected_packed_layout is not None:
+            auto_label = f"Авто: Packed {detected_packed_layout.label}"
+        else:
+            auto_label = f"Авто: {_map_type_label(item.metadata.map_type)}"
+        self.map_type_combo.addItem(auto_label, AUTO_MAP_TYPE_DATA)
         self.map_type_combo.addItem(_map_type_label(TextureMapType.UNKNOWN), TextureMapType.UNKNOWN)
         for map_type in TextureMapType:
             if map_type is TextureMapType.UNKNOWN:
                 continue
             self.map_type_combo.addItem(_map_type_label(map_type), map_type)
 
-        current_value = item.map_type_override if item.map_type_override is not None else AUTO_MAP_TYPE_DATA
+        self.map_type_combo.insertSeparator(self.map_type_combo.count())
+        for packed_layout in ChannelPackLayout:
+            self.map_type_combo.addItem(f"Packed {packed_layout.label}", packed_layout)
+
+        if item.packed_layout_override is not None:
+            current_value = item.packed_layout_override
+        elif item.map_type_override is not None:
+            current_value = item.map_type_override
+        else:
+            current_value = AUTO_MAP_TYPE_DATA
         for index in range(self.map_type_combo.count()):
             if self.map_type_combo.itemData(index) == current_value:
                 self.map_type_combo.setCurrentIndex(index)

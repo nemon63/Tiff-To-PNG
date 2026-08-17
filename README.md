@@ -3,6 +3,16 @@
 Модульное приложение на `PyQt6` для пакетной конвертации изображений в PNG.
 Входные форматы включают `DDS`, `PNG`, `TIFF`, `TGA`, `JPEG`, `BMP`, `GIF`, `WEBP` и `PSD`.
 Для игровых воркфлоу уже есть packing-профили `ORM`, `RMA`, `MRA`, `Unity URP` и `Unity HDRP`.
+Packed-текстуры можно напрямую перепаковывать между этими схемами без предварительной ручной распаковки.
+Системный сценарий `Traditional / Non-Packed Workflow` раскладывает packed-входы
+в отдельные PBR-карты для Offline / Production.
+Блок `Итоговый Texture Set` показывает предусмотренные выбранным пайплайном файлы,
+их suffix и packed channel mapping. После добавления очереди он отдельно отмечает
+доступные outputs и карты, для которых не хватает исходных данных.
+
+Автоопределение packed layout работает по стандартным suffix: `*_orm`, `*_arm`, `*_rma`,
+`*_mra`, `*_metallicsmoothness`, `*_metallicglossmap` и `*_maskmap`. Для нестандартного
+имени layout можно вручную выбрать в `Asset Inspector -> Map Type` как `Packed ...`.
 
 ## Требования
 
@@ -83,6 +93,8 @@ cd d:\Python\Tiff-To-PNG
 - `--resize-percent` — масштабирование в процентах
 - `--max-side` — ограничение длинной стороны
 - `--png8` — сохранить как `PNG-8`
+- `--pack-layout` — собрать или перепаковать в `orm`, `rma`, `mra`, `unity_urp` или `unity_hdrp`
+- `--unpack-packed` — распаковать распознанные packed-текстуры в отдельные карты
 
 Полная справка:
 
