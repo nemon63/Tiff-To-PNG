@@ -285,16 +285,6 @@ class SettingsPanel(QWidget):
 
         layout.addLayout(actions_row)
 
-        self.preset_summary_label = QLabel()
-        self.preset_summary_label.setObjectName("SummaryText")
-        self.preset_summary_label.setWordWrap(True)
-        layout.addWidget(self.preset_summary_label)
-
-        self.preset_packing_summary_label = QLabel()
-        self.preset_packing_summary_label.setObjectName("SummaryText")
-        self.preset_packing_summary_label.setWordWrap(True)
-        layout.addWidget(self.preset_packing_summary_label)
-
         self._register_interactive(
             self.preset_combo,
             self.save_preset_button,
@@ -720,10 +710,20 @@ class SettingsPanel(QWidget):
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
         self.preset_combo.addItem("Ручной режим", CURRENT_PRESET_DATA)
+        self.preset_combo.setItemData(
+            0,
+            self._preset_tooltip(None),
+            Qt.ItemDataRole.ToolTipRole,
+        )
 
         for preset in presets:
             source_label = "Системный" if preset.is_system else "Пользовательский"
             self.preset_combo.addItem(f"{preset.name} [{source_label}]", preset.preset_id)
+            self.preset_combo.setItemData(
+                self.preset_combo.count() - 1,
+                self._preset_tooltip(preset),
+                Qt.ItemDataRole.ToolTipRole,
+            )
 
         self.preset_combo.blockSignals(False)
         self.set_selected_preset_id(None)
@@ -768,26 +768,7 @@ class SettingsPanel(QWidget):
         preset = self._presets_by_id.get(preset_id or "")
 
         self.delete_preset_button.setEnabled(preset is not None and not preset.is_system)
-
-        if preset is None:
-            self.preset_summary_label.setText(
-                "Ручной режим. Параметры ниже применяются напрямую.\n"
-                + self._preset_export_summary(self.build_conversion_options())
-            )
-            self.preset_packing_summary_label.setText(
-                self._preset_packing_summary(self.build_conversion_options())
-            )
-            return
-
-        source_label = "Системный" if preset.is_system else "Пользовательский"
-        description = preset.description or "Без описания."
-        self.preset_summary_label.setText(
-            f"{source_label} сценарий. {description}\n"
-            + self._preset_export_summary(preset.options)
-        )
-        self.preset_packing_summary_label.setText(
-            self._preset_packing_summary(preset.options)
-        )
+        self.preset_combo.setToolTip(self._preset_tooltip(preset))
 
     def _notify_options_changed(self, *_args: object) -> None:
         if self._suppress_option_signal:
@@ -862,81 +843,47 @@ class SettingsPanel(QWidget):
             return "Только Packed: приложение соберет только итоговый packed texture и не будет сохранять отдельные PNG по каждому исходнику."
         return "Сначала PNG, потом Packed: приложение сохранит отдельные PNG по каждому исходнику и затем соберет итоговую packed texture."
 
-    def _preset_export_summary(self, options: ConversionOptions) -> str:
-        return "\n".join(
+    def _preset_tooltip(self, preset: ConversionPreset | None) -> str:
+        if preset is None:
+            return "Ручной режим\nИспользуются текущие параметры вкладок ниже."
+
+        options = preset.options
+        lines = [
+            preset.name,
             (
-                "Что получится",
-                f"Формат: {self._format_summary(options)}",
-                f"Размер: {self._resize_summary(options)}",
-                f"Сжатие: {self._compression_summary(options)}",
-                f"Имена: {self._naming_rules_summary(options.naming)}",
-                f"Файлы: {self._file_behavior_summary(options)}",
+                f"Формат: {self._format_summary(options)} · "
+                f"Размер: {self._resize_summary(options)}"
+            ),
+        ]
+        packing = options.packing
+        if packing.enabled:
+            mapping = channel_pack_mapping_text(packing.layout)
+            if packing.mode is ChannelPackingMode.PACK_ONLY:
+                output = "только packed texture"
+            elif packing.mode is ChannelPackingMode.PACK_WITH_REMAINDER:
+                output = "packed texture + карты вне packed-схемы"
+            else:
+                output = "packed texture + все отдельные карты"
+            lines.extend((mapping, f"Выход: {output}"))
+        elif options.unpack_packed:
+            lines.append(
+                "Выход: все карты отдельными PNG; packed-карты будут распакованы"
             )
-        )
+        else:
+            lines.append("Выход: отдельные PNG")
+        return "\n".join(lines)
 
     def _format_summary(self, options: ConversionOptions) -> str:
         if options.png8:
             dither_text = ", dithering" if options.dither else ""
-            return f"PNG-8, {options.png8_colors} цветов{dither_text}"
+            return f"PNG-8 ({options.png8_colors} цветов{dither_text})"
         if options.force_rgba:
-            return "PNG, принудительный RGBA"
-        return "PNG, без принудительного RGBA"
+            return "PNG (RGBA)"
+        return "PNG"
 
     def _resize_summary(self, options: ConversionOptions) -> str:
         if options.resize_mode is ResizeMode.PERCENT:
-            return f"{options.resize_percent}% от оригинала"
+            return f"{options.resize_percent}%"
         if options.resize_mode is ResizeMode.MAX_SIDE:
-            return f"уменьшать только если длинная сторона больше {options.max_side} px"
-        return "без изменения размера"
-
-    def _compression_summary(self, options: ConversionOptions) -> str:
-        optimize_text = "optimize включен" if options.optimize else "optimize выключен"
-        return f"уровень {options.compress_level}, {optimize_text}"
-
-    def _naming_rules_summary(self, naming_rules: NamingRules) -> str:
-        rules: list[str] = []
-        if naming_rules.lowercase:
-            rules.append("lowercase")
-        if naming_rules.replace_spaces:
-            rules.append("пробелы -> _")
-        if naming_rules.normalize_map_suffix:
-            rules.append("suffix по типу карты")
-        if not rules:
-            return "без изменений"
-        return ", ".join(rules)
-
-    def _file_behavior_summary(self, options: ConversionOptions) -> str:
-        overwrite_text = "перезапись включена" if options.overwrite else "перезапись выключена"
-        source_text = (
-            "исходники удаляются после успешной конвертации"
-            if options.delete_source
-            else "исходники сохраняются"
-        )
-        return f"{overwrite_text}; {source_text}"
-
-    def _preset_packing_summary(self, options: ConversionOptions) -> str:
-        packing = options.packing
-        if not packing.enabled:
-            if options.unpack_packed:
-                return (
-                    "Преобразование packed textures\n"
-                    "Traditional / Non-Packed Workflow (Offline / Production).\n"
-                    "ORM/RMA/MRA и Unity packed maps распаковываются в отдельные "
-                    "AO, Roughness, Metallic и HDRP Detail Mask; остальные карты сохраняются отдельно."
-                )
-            return (
-                "Упаковка каналов\n"
-                "Выключена.\n"
-                "Будут сохранены обычные PNG по каждому исходнику."
-            )
-
-        mode_label = packing.mode.label
-        mapping_text = channel_pack_mapping_text(packing.layout)
-        mode_description = self._packing_mode_description(packing)
-        return (
-            "Упаковка каналов\n"
-            f"Режим: {mode_label}\n"
-            f"Схема: {packing.layout.label}\n"
-            f"{mapping_text}\n"
-            f"{mode_description}"
-        )
+            return f"до {options.max_side} px"
+        return "исходный"

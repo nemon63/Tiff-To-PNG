@@ -3523,17 +3523,18 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertTrue(options.force_rgba)
             self.assertFalse(options.packing.enabled)
             self.assertEqual("UI RGBA Clean", window.settings_panel.preset_combo.currentText().split(" [")[0])
-            self.assertIn("иконок и UI-элементов", window.settings_panel.preset_summary_label.text())
-            self.assertIn("Что получится", window.settings_panel.preset_summary_label.text())
-            self.assertIn("Формат: PNG, принудительный RGBA", window.settings_panel.preset_summary_label.text())
-            self.assertIn("Упаковка каналов", window.settings_panel.preset_packing_summary_label.text())
-            self.assertIn("Выключена", window.settings_panel.preset_packing_summary_label.text())
+            tooltip = window.settings_panel.preset_combo.toolTip()
+            self.assertIn("UI RGBA Clean", tooltip)
+            self.assertIn("Формат: PNG (RGBA) · Размер: исходный", tooltip)
+            self.assertIn("Выход: отдельные PNG", tooltip)
+            self.assertFalse(hasattr(window.settings_panel, "preset_summary_label"))
+            self.assertFalse(hasattr(window.settings_panel, "preset_packing_summary_label"))
         finally:
             window.close()
             window.deleteLater()
             self.app.processEvents()
 
-    def test_selecting_unreal_pack_preset_shows_packing_summary_in_source_tab(self) -> None:
+    def test_selecting_unreal_pack_preset_shows_compact_tooltip(self) -> None:
         window = MainWindow()
         try:
             presets = list(SYSTEM_PRESETS)
@@ -3547,18 +3548,12 @@ class GraphEditorFoundationTests(unittest.TestCase):
                     break
             self.app.processEvents()
 
-            summary_text = window.settings_panel.preset_packing_summary_label.text()
-            preset_text = window.settings_panel.preset_summary_label.text()
+            tooltip = window.settings_panel.preset_combo.toolTip()
             bundle_text = window.settings_panel.output_bundle_summary_label.text()
-            self.assertIn("Упаковка каналов", summary_text)
-            self.assertIn("Режим: Packed + нужные карты", summary_text)
-            self.assertIn("Схема: ORM", summary_text)
-            self.assertIn("ORM: R=AO, G=Roughness, B=Metallic", summary_text)
-            self.assertIn(
-                "Размер: уменьшать только если длинная сторона больше 4096 px",
-                preset_text,
-            )
-            self.assertIn("Файлы: перезапись выключена; исходники сохраняются", preset_text)
+            self.assertIn("Unreal ORM Pack", tooltip)
+            self.assertIn("ORM: R=AO, G=Roughness, B=Metallic", tooltip)
+            self.assertIn("packed texture + карты вне packed-схемы", tooltip)
+            self.assertIn("Размер: до 4096 px", tooltip)
             self.assertIn("Packed: ORM", bundle_text)
         finally:
             window.close()
