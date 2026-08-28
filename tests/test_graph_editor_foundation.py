@@ -12,9 +12,10 @@ import unittest
 from unittest import mock
 
 from PIL import Image, ImageFilter
-from PyQt6.QtCore import QEventLoop, QObject, QTimer, Qt
+from PyQt6.QtCore import QEventLoop, QObject, QPoint, QTimer, Qt
 from PyQt6.QtCore import QItemSelectionModel
 from PyQt6.QtGui import QColor
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLabel
 
 from image_converter.domain.models import (
@@ -68,7 +69,8 @@ from image_converter.application.thumbnail import ThumbnailController
 from image_converter.ui.graph_commands import AddNodesCommand, MoveNodesCommand, ReplaceInputConnectionCommand
 from image_converter.ui.main_window import MainWindow
 from image_converter.ui.asset_browser import GraphAssetsPanel
-from image_converter.ui.graph_canvas import GraphNodeItem
+from image_converter.ui.graph_canvas import ConnectionItem, GraphNodeItem
+from image_converter.ui.node_help import node_help_content
 from image_converter.ui.node_editor import GraphWorkspace
 from image_converter.ui.node_editor import DRAFT_PREVIEW_MAX_SIDE, PREVIEW_MODE_DRAFT, PREVIEW_MODE_FULL
 from image_converter.ui.node_properties import NodePropertiesPanel
@@ -1660,6 +1662,121 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertIs(original_item, self.workspace._scene.node_items[node.node_id])
         self.assertEqual((120.0, 80.0), node.position)
         self.assertTrue(original_item.isSelected())
+
+    def test_every_node_has_help_without_header_or_body_overlaps(self) -> None:
+        for node_type in NodeType:
+            with self.subTest(node_type=node_type):
+                self.assertIsNotNone(node_help_content(node_type))
+                item = GraphNodeItem(
+                    create_graph_node(node_type),
+                    self.workspace._scene.texture_visual_cache,
+                )
+                self.assertIsNotNone(item.help_button_item)
+                self.assertIsNotNone(item.help_button_label)
+
+                help_rect = item._help_button_rect()
+                self.assertFalse(help_rect.intersects(item._display_flag_rect()))
+                if item.enable_flag_item is not None:
+                    self.assertFalse(help_rect.intersects(item._enable_flag_rect()))
+                if item.reset_button_item is not None:
+                    self.assertFalse(help_rect.intersects(item._reset_button_rect()))
+                if item.render_flag_item is not None:
+                    self.assertFalse(help_rect.intersects(item._render_flag_rect()))
+
+                assert item.title_item is not None
+                title_rect = item.title_item.mapRectToParent(item.title_item.boundingRect())
+                self.assertLessEqual(title_rect.right() + 4, help_rect.left())
+
+                for port in item.port_items.values():
+                    port_rect = port.mapRectToParent(port.boundingRect())
+                    self.assertGreaterEqual(port_rect.top(), item.rect().top())
+                    self.assertLessEqual(port_rect.bottom(), item.rect().bottom())
+                for label in item.port_label_items.values():
+                    label_rect = label.mapRectToParent(label.boundingRect())
+                    self.assertGreaterEqual(label_rect.top(), item.rect().top())
+                    self.assertLessEqual(label_rect.bottom(), item.rect().bottom())
+
+    def test_selected_connection_uses_highlight_pen_without_selection_frame(self) -> None:
+        source_node = create_graph_node(NodeType.CONSTANT_CHANNEL)
+        target_node = create_graph_node(NodeType.INVERT_CHANNEL)
+        source_item = GraphNodeItem(source_node)
+        target_item = GraphNodeItem(target_node)
+        connection = GraphConnection(
+            make_connection_id(),
+            source_node.node_id,
+            "out",
+            target_node.node_id,
+            "in",
+        )
+        item = ConnectionItem(
+            connection,
+            source_item.port_items["out"],
+            target_item.port_items["in"],
+        )
+
+        normal_pen = item._display_pen()
+        item.setSelected(True)
+        selected_pen = item._display_pen()
+
+        self.assertEqual("#5ba7ff", normal_pen.color().name())
+        self.assertEqual("#ffd166", selected_pen.color().name())
+        self.assertGreater(selected_pen.widthF(), normal_pen.widthF())
+        self.assertEqual(Qt.PenStyle.SolidLine, selected_pen.style())
+
+    def test_mix_image_help_popup_can_pin_and_auto_close(self) -> None:
+        mix = create_graph_node(NodeType.MIX_IMAGE)
+        self.workspace._scene.add_node(mix)
+        self.workspace.resize(900, 640)
+        self.workspace.show()
+        self.app.processEvents()
+
+        node_item = self.workspace._scene.node_items[mix.node_id]
+        help_center = node_item.mapToScene(node_item._help_button_rect().center())
+        click_position = self.workspace.view.mapFromScene(help_center)
+        self.assertTrue(self.workspace.view.viewport().rect().contains(click_position))
+
+        QTest.mouseClick(
+            self.workspace.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=click_position,
+        )
+        self.app.processEvents()
+
+        popup = self.workspace.view.node_help_popup
+        self.assertIsNotNone(popup)
+        assert popup is not None
+        self.assertTrue(popup.isVisible())
+        self.assertEqual("Mix Image", popup.title_label.text())
+        self.assertIn("два RGBA-изображения", popup.summary_label.text())
+        self.assertIn("заменяет Factor", popup.detail_labels["Mask"].text())
+        self.assertGreaterEqual(popup.summary_label.font().pixelSize(), 14)
+        self.assertGreaterEqual(popup.detail_labels["Mask"].font().pixelSize(), 13)
+
+        popup.pin_button.setChecked(True)
+        self.app.processEvents()
+        self.assertTrue(popup.windowFlags() & Qt.WindowType.WindowTitleHint)
+        self.assertFalse(popup.windowFlags() & Qt.WindowType.FramelessWindowHint)
+        self.assertFalse(popup.close_button.isVisible())
+
+        target_position = popup.pos() + QPoint(30, 24)
+        popup.move(target_position)
+        popup.resize(620, 500)
+        self.app.processEvents()
+        self.assertLessEqual((target_position - popup.pos()).manhattanLength(), 4)
+        self.assertEqual(620, popup.width())
+        self.assertEqual(500, popup.height())
+
+        popup._arm_auto_close()
+        popup._check_auto_close(QPoint(-10000, -10000))
+        self.assertTrue(popup.isVisible())
+        self.assertTrue(popup.is_pinned)
+
+        popup.pin_button.setChecked(False)
+        self.app.processEvents()
+        self.assertTrue(popup.windowFlags() & Qt.WindowType.FramelessWindowHint)
+        self.assertTrue(popup.close_button.isVisible())
+        popup._check_auto_close(QPoint(-10000, -10000))
+        self.assertFalse(popup.isVisible())
 
     def test_graph_export_worker_keeps_gui_event_loop_responsive(self) -> None:
         with TemporaryDirectory() as tmp:

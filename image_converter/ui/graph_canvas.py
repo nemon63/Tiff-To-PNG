@@ -3,8 +3,17 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
-from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPainterPath,
+    QPainterPathStroker,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
@@ -34,12 +43,15 @@ from image_converter.domain.node_graph import (
     socket_definitions,
 )
 from image_converter.services.map_types import detect_texture_map_type
+from image_converter.ui.node_help import NodeHelpPopup, node_help_content
 from image_converter.ui.node_visual_cache import TextureVisualCache
 
 NODE_WIDTH = 190
 TEXTURE_NODE_WIDTH = 260
 TITLE_HEIGHT = 28
 ROW_HEIGHT = 22
+NODE_BODY_TOP_PADDING = 30
+NODE_BODY_BOTTOM_PADDING = 10
 PORT_RADIUS = 6
 FLAG_SIZE = 14
 FLAG_TOP = 7
@@ -65,12 +77,13 @@ class ConnectionItem(QGraphicsPathItem):
         self.target_port = target_port
         self.setZValue(-10)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        wire_color = (
+        self._wire_color = (
             QColor("#B678FF")
             if source_port.socket_type is SocketType.IMAGE
             else QColor("#5BA7FF")
         )
-        self.setPen(QPen(wire_color, 2.0))
+        # Keep the item's bounds large enough for the thicker selected wire.
+        self.setPen(QPen(self._wire_color, 4.0))
         self.update_path()
 
     def update_path(self) -> None:
@@ -89,6 +102,23 @@ class ConnectionItem(QGraphicsPathItem):
         stroker = QPainterPathStroker()
         stroker.setWidth(10.0)
         return stroker.createStroke(self.path())
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        # QGraphicsPathItem draws a dashed bounding rectangle for selected paths.
+        # Paint the wire directly so selection is communicated by the wire itself.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(self._display_pen())
+        painter.drawPath(self.path())
+
+    def _display_pen(self) -> QPen:
+        pen = QPen(
+            QColor("#FFD166") if self.isSelected() else self._wire_color,
+            3.5 if self.isSelected() else 2.0,
+        )
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        return pen
 
     def mousePressEvent(self, event) -> None:
         if (
@@ -179,12 +209,18 @@ class GraphNodeItem(QGraphicsRectItem):
         self.render_flag_label: QGraphicsSimpleTextItem | None = None
         self.reset_button_item: QGraphicsRectItem | None = None
         self.reset_button_label: QGraphicsSimpleTextItem | None = None
+        self.help_button_item: QGraphicsEllipseItem | None = None
+        self.help_button_label: QGraphicsSimpleTextItem | None = None
         self._drag_start_position: tuple[float, float] | None = None
         sockets = socket_definitions(node.node_type)
         input_count = sum(1 for socket in sockets if socket.direction is SocketDirection.INPUT)
         output_count = sum(1 for socket in sockets if socket.direction is SocketDirection.OUTPUT)
         row_count = max(input_count, output_count, 2)
-        body_height = row_count * ROW_HEIGHT + 16
+        body_height = (
+            NODE_BODY_TOP_PADDING
+            + row_count * ROW_HEIGHT
+            + NODE_BODY_BOTTOM_PADDING
+        )
         if node.node_type is NodeType.TEXTURE_INPUT:
             body_height = TEXTURE_BODY_HEIGHT
         self.setRect(0, 0, self.node_width, TITLE_HEIGHT + body_height)
@@ -198,13 +234,10 @@ class GraphNodeItem(QGraphicsRectItem):
         self._build_contents()
 
     def _build_contents(self) -> None:
-        title_bg = QGraphicsRectItem(0, 0, self.node_width, TITLE_HEIGHT, self)
-        title_bg.setPen(QPen(Qt.PenStyle.NoPen))
-        title_bg.setBrush(QColor("#2F3741"))
-
-        self.title_item = QGraphicsSimpleTextItem(self._elide_text(self.node.title, self._title_max_chars()), self)
+        self.title_item = QGraphicsSimpleTextItem("", self)
         self.title_item.setBrush(QColor("#E4EAF1"))
         self.title_item.setPos(10, 6)
+        self.title_item.setText(self._elided_node_title())
         self.title_item.setToolTip(self.node.title)
 
         self._build_flag_items()
@@ -310,8 +343,17 @@ class GraphNodeItem(QGraphicsRectItem):
         visual = self._texture_visual_cache.get(path)
         return visual.pixmap if visual is not None else None
 
-    def _title_max_chars(self) -> int:
-        return 28 if self.node.node_type is NodeType.TEXTURE_INPUT else 22
+    def _elided_node_title(self) -> str:
+        right_edge = self.node_width - 8
+        if node_help_content(self.node.node_type) is not None:
+            right_edge = self._help_button_rect().left()
+        available_width = max(20, int(right_edge - 16))
+        font = self.title_item.font() if self.title_item is not None else QFont()
+        return QFontMetrics(font).elidedText(
+            self.node.title,
+            Qt.TextElideMode.ElideRight,
+            available_width,
+        )
 
     def _texture_metadata_line(self) -> str:
         path = Path(str(self.node.properties.get("path", "")))
@@ -376,6 +418,21 @@ class GraphNodeItem(QGraphicsRectItem):
         return f"{text[:head]}...{text[-tail:]}"
 
     def _build_flag_items(self) -> None:
+        if node_help_content(self.node.node_type) is not None:
+            help_rect = self._help_button_rect()
+            self.help_button_item = QGraphicsEllipseItem(help_rect, self)
+            self.help_button_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.help_button_item.setBrush(QColor("#253C52"))
+            self.help_button_item.setPen(QPen(QColor("#6EA8FE"), 1.0))
+            self.help_button_item.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.help_button_item.setToolTip("Описание ноды")
+            self.help_button_label = QGraphicsSimpleTextItem("?", self)
+            self.help_button_label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.help_button_label.setBrush(QColor("#DCEBFA"))
+            self.help_button_label.setPos(help_rect.x() + 4, help_rect.y() - 1)
+            self.help_button_label.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.help_button_label.setToolTip("Описание ноды")
+
         if node_has_resettable_parameters(self.node.node_type):
             reset_rect = self._reset_button_rect()
             self.reset_button_item = QGraphicsRectItem(reset_rect, self)
@@ -448,7 +505,7 @@ class GraphNodeItem(QGraphicsRectItem):
 
     def refresh_content(self) -> None:
         if self.title_item is not None:
-            self.title_item.setText(self._elide_text(self.node.title, self._title_max_chars()))
+            self.title_item.setText(self._elided_node_title())
             self.title_item.setToolTip(self.node.title)
 
         if self.node.node_type is NodeType.TEXTURE_INPUT:
@@ -575,9 +632,27 @@ class GraphNodeItem(QGraphicsRectItem):
     def _render_flag_rect(self) -> QRectF:
         return QRectF(self.node_width - FLAG_SIZE - 8, FLAG_TOP, FLAG_SIZE, FLAG_SIZE)
 
+    def _help_button_rect(self) -> QRectF:
+        occupied_flags = 1
+        if self.node.node_type is NodeType.OUTPUT_RGBA:
+            occupied_flags += 1
+        if node_has_enable_flag(self.node.node_type):
+            occupied_flags += 1
+        if node_has_resettable_parameters(self.node.node_type):
+            occupied_flags += 1
+        return self._flag_rect_from_right(occupied_flags)
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             scene = self.scene()
+            if (
+                isinstance(scene, GraphScene)
+                and node_help_content(self.node.node_type) is not None
+                and self._help_button_rect().contains(event.pos())
+            ):
+                scene.node_help_requested.emit(self.node, self)
+                event.accept()
+                return
             if isinstance(scene, GraphScene) and not scene.editing_enabled:
                 super().mousePressEvent(event)
                 return
@@ -649,8 +724,28 @@ class GraphNodeItem(QGraphicsRectItem):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect()
         color = QColor("#2B3540") if self.isSelected() else QColor("#232A32")
+
+        node_path = QPainterPath()
+        node_path.addRoundedRect(rect, 5, 5)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
-        painter.setPen(QPen(QColor("#5BA7FF") if self.isSelected() else QColor("#3A434D"), 1.2))
+        painter.drawPath(node_path)
+
+        painter.save()
+        painter.setClipPath(node_path)
+        painter.fillRect(
+            QRectF(rect.left(), rect.top(), rect.width(), TITLE_HEIGHT),
+            QColor("#2F3741"),
+        )
+        painter.restore()
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(
+            QPen(
+                QColor("#5BA7FF") if self.isSelected() else QColor("#3A434D"),
+                1.2,
+            )
+        )
         painter.drawRoundedRect(rect, 5, 5)
 
 
@@ -663,6 +758,7 @@ class GraphScene(QGraphicsScene):
     node_display_flag_clicked = pyqtSignal(object)
     node_double_clicked = pyqtSignal(object)
     node_enable_flag_clicked = pyqtSignal(object)
+    node_help_requested = pyqtSignal(object, object)
     node_moved = pyqtSignal(object, object, object)
     nodes_moved = pyqtSignal(object, object)
     node_render_flag_clicked = pyqtSignal(object)
@@ -1009,6 +1105,7 @@ class GraphView(QGraphicsView):
 
     def __init__(self, scene: GraphScene, parent: QWidget | None = None):
         super().__init__(scene, parent)
+        self.node_help_popup: NodeHelpPopup | None = None
         self._pan_start: QPoint | None = None
         self._pan_scroll: tuple[int, int] = (0, 0)
         self._knife_active = False
@@ -1022,6 +1119,27 @@ class GraphView(QGraphicsView):
         self.setBackgroundBrush(QColor("#15191E"))
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        scene.node_help_requested.connect(self._show_node_help)
+
+    def _show_node_help(self, node: GraphNode, node_item: GraphNodeItem) -> None:
+        content = node_help_content(node.node_type)
+        if content is None:
+            return
+
+        if self.node_help_popup is not None:
+            self.node_help_popup.close()
+            self.node_help_popup.deleteLater()
+
+        popup = NodeHelpPopup(content, self)
+        self.node_help_popup = popup
+
+        help_rect = node_item._help_button_rect()
+        scene_rect = node_item.mapRectToScene(help_rect)
+        top_left = self.viewport().mapToGlobal(self.mapFromScene(scene_rect.topLeft()))
+        bottom_right = self.viewport().mapToGlobal(
+            self.mapFromScene(scene_rect.bottomRight())
+        )
+        popup.show_near(QRect(top_left, bottom_right).normalized())
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y() or event.pixelDelta().y()
