@@ -236,6 +236,31 @@ NODE_HELP_CONTENT: dict[NodeType, NodeHelpContent] = {
         ),
         note="Mask Filter управляет ресайзом маски. Отключённая нода пропускает A.",
     ),
+    NodeType.NORMAL_MAP: NodeHelpContent(
+        title="Normal Map",
+        summary="Исправляет и преобразует tangent-space Normal Map без изменения Alpha.",
+        details=(
+            ("Normal", "Исходная RGB/RGBA tangent-space Normal Map."),
+            ("Flip Red", "Инвертирует X-компоненту нормали в красном канале."),
+            (
+                "Flip Green",
+                "Инвертирует Y-компоненту: это преобразование DirectX ↔ OpenGL.",
+            ),
+            (
+                "Reconstruct Blue",
+                "Восстанавливает положительный Z из каналов R и G.",
+            ),
+            ("Normalize", "Приводит длину каждого RGB-вектора к единице."),
+            (
+                "Strength",
+                "Масштабирует X/Y: 0% даёт плоскую нормаль, 100% сохраняет силу.",
+            ),
+        ),
+        note=(
+            "Strength, отличный от 100%, и Reconstruct Blue автоматически сохраняют "
+            "корректную длину вектора. Если нода отключена, изображение проходит без изменений."
+        ),
+    ),
     NodeType.SPLIT_RGBA: NodeHelpContent(
         title="Split RGBA",
         summary="Разделяет одно RGBA-изображение на четыре grayscale-канала.",

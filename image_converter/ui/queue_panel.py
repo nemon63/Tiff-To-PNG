@@ -145,6 +145,13 @@ class QueuePanel(QWidget):
         self.summary_label.setObjectName("SummaryText")
         layout.addWidget(self.summary_label)
 
+        self.texture_set_validation_label = QLabel(
+            "Texture Set Validator: добавьте распознанные PBR-карты."
+        )
+        self.texture_set_validation_label.setObjectName("SummaryText")
+        self.texture_set_validation_label.setWordWrap(True)
+        layout.addWidget(self.texture_set_validation_label)
+
         self.table = QueueTableWidget()
         self.table.setColumnCount(len(QUEUE_HEADERS))
         self.table.setHorizontalHeaderLabels(QUEUE_HEADERS)
@@ -209,6 +216,9 @@ class QueuePanel(QWidget):
 
     def set_graph_apply_preflight_summary(self, text: str) -> None:
         self.graph_apply_preflight_label.setText(text)
+
+    def set_texture_set_validation_summary(self, text: str) -> None:
+        self.texture_set_validation_label.setText(text)
 
     def minimumSizeHint(self) -> QSize:
         return QSize(240, 180)

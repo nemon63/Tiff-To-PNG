@@ -5,6 +5,7 @@ from pathlib import Path
 
 from image_converter.domain.models import QueueItem, TextureColorSpace, TextureMapType
 from image_converter.services.map_types import map_type_aliases
+from image_converter.services.material_validation import filename_semantic_warning
 
 COLOR_MAP_TYPES = {
     TextureMapType.BASECOLOR,
@@ -66,6 +67,12 @@ def item_preflight_warnings(item: QueueItem) -> tuple[str, ...]:
     colorspace_warning = build_colorspace_warning(item.path, item.effective_map_type)
     if colorspace_warning and colorspace_warning not in base_warnings:
         base_warnings.append(colorspace_warning)
+    semantic_warning = filename_semantic_warning(item)
+    if semantic_warning and semantic_warning not in base_warnings:
+        base_warnings.append(semantic_warning)
+    for warning in item.validation_warnings:
+        if warning not in base_warnings:
+            base_warnings.append(warning)
     return tuple(base_warnings)
 
 

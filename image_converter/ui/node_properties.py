@@ -301,6 +301,34 @@ class NodePropertiesPanel(QWidget):
         )
         self.form.addRow("Factor", self.mix_factor_host)
 
+        self.normal_flip_red_checkbox = QCheckBox("Invert X")
+        self.normal_flip_red_checkbox.toggled.connect(self._apply_changes)
+        self.form.addRow("Flip Red", self.normal_flip_red_checkbox)
+
+        self.normal_flip_green_checkbox = QCheckBox("DirectX ↔ OpenGL")
+        self.normal_flip_green_checkbox.toggled.connect(self._apply_changes)
+        self.form.addRow("Flip Green", self.normal_flip_green_checkbox)
+
+        self.normal_reconstruct_blue_checkbox = QCheckBox("Rebuild Z from R + G")
+        self.normal_reconstruct_blue_checkbox.toggled.connect(self._apply_changes)
+        self.form.addRow("Blue", self.normal_reconstruct_blue_checkbox)
+
+        self.normal_normalize_checkbox = QCheckBox("Unit-length vectors")
+        self.normal_normalize_checkbox.toggled.connect(self._apply_changes)
+        self.form.addRow("Normalize", self.normal_normalize_checkbox)
+
+        self.normal_strength_slider, self.normal_strength_spin = self._make_slider_spin_pair(
+            0,
+            400,
+            initial=100,
+            suffix="%",
+        )
+        self.normal_strength_host = self._byte_row_widget(
+            self.normal_strength_slider,
+            self.normal_strength_spin,
+        )
+        self.form.addRow("Strength", self.normal_strength_host)
+
         self.image_resolution_source_combo = QComboBox()
         for label, value in (
             ("Input A", "a"),
@@ -504,6 +532,21 @@ class NodePropertiesPanel(QWidget):
                     break
             self.blend_opacity_spin.setValue(self._coerce_int(node.properties.get("opacity"), 100))
             self.mix_factor_spin.setValue(self._coerce_int(node.properties.get("factor"), 50))
+            self.normal_flip_red_checkbox.setChecked(
+                bool(node.properties.get("flip_red", False))
+            )
+            self.normal_flip_green_checkbox.setChecked(
+                bool(node.properties.get("flip_green", False))
+            )
+            self.normal_reconstruct_blue_checkbox.setChecked(
+                bool(node.properties.get("reconstruct_blue", False))
+            )
+            self.normal_normalize_checkbox.setChecked(
+                bool(node.properties.get("normalize", False))
+            )
+            self.normal_strength_spin.setValue(
+                self._coerce_int(node.properties.get("strength"), 100)
+            )
             self._set_combo_value(
                 self.image_resolution_source_combo,
                 str(node.properties.get("resolution_source", "a")),
@@ -579,6 +622,12 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.blend_mode_combo, blend_node)
         self._set_row_visible(self.blend_opacity_host, blend_node)
         self._set_row_visible(self.mix_factor_host, node_type is NodeType.MIX_IMAGE)
+        normal_map_node = node_type is NodeType.NORMAL_MAP
+        self._set_row_visible(self.normal_flip_red_checkbox, normal_map_node)
+        self._set_row_visible(self.normal_flip_green_checkbox, normal_map_node)
+        self._set_row_visible(self.normal_reconstruct_blue_checkbox, normal_map_node)
+        self._set_row_visible(self.normal_normalize_checkbox, normal_map_node)
+        self._set_row_visible(self.normal_strength_host, normal_map_node)
         image_resolution_node = node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE)
         self._set_row_visible(self.image_resolution_source_combo, image_resolution_node)
         self._set_row_visible(
@@ -615,6 +664,10 @@ class NodePropertiesPanel(QWidget):
                 "Blends two required RGBA inputs A and B using Blend Mode and Opacity. "
                 "An optional Mask limits the effect. For one Color/Image plus a channel mask, "
                 "use Apply Mask instead."
+            ),
+            NodeType.NORMAL_MAP: (
+                "Converts tangent-space Normal Maps: flip X/Y, rebuild Blue, "
+                "normalize vectors and adjust strength. Flip Green converts DirectX ↔ OpenGL."
             ),
             NodeType.SPLIT_RGBA: "Splits one RGBA image into separate R, G, B and A channels.",
             NodeType.COMBINE_RGBA: (
@@ -967,6 +1020,14 @@ class NodePropertiesPanel(QWidget):
             next_properties["mask_filter"] = str(
                 self.mask_filter_combo.currentData() or "bilinear"
             )
+        elif self._node.node_type is NodeType.NORMAL_MAP:
+            next_properties["flip_red"] = self.normal_flip_red_checkbox.isChecked()
+            next_properties["flip_green"] = self.normal_flip_green_checkbox.isChecked()
+            next_properties["reconstruct_blue"] = (
+                self.normal_reconstruct_blue_checkbox.isChecked()
+            )
+            next_properties["normalize"] = self.normal_normalize_checkbox.isChecked()
+            next_properties["strength"] = self.normal_strength_spin.value()
         elif self._node.node_type is NodeType.SET_ALPHA:
             next_properties["mask_mode"] = str(
                 self.mask_mode_combo.currentData() or "replace_alpha"

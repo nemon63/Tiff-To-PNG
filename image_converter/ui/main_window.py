@@ -88,6 +88,10 @@ from image_converter.services.packing import (
     summarize_channel_pack_jobs,
 )
 from image_converter.services.map_types import canonical_map_suffix
+from image_converter.services.material_validation import (
+    normalized_path_key,
+    validate_texture_sets,
+)
 from image_converter.services.presets import PresetRepository
 from image_converter.services.validation import validate_request
 from image_converter.domain.constants import FILE_DIALOG_FILTER
@@ -1027,10 +1031,19 @@ class MainWindow(QMainWindow):
     def _render_queue(self) -> None:
         table = self.queue_panel.table
         selected_key = self._selected_queue_key()
+        options = self.settings_panel.build_conversion_options()
+        validation_result = validate_texture_sets(self._queue_items, options)
+        for item in self._queue_items:
+            item.validation_warnings = validation_result.warnings_by_path.get(
+                normalized_path_key(item.path),
+                (),
+            )
+        self.queue_panel.set_texture_set_validation_summary(
+            validation_result.summary_text()
+        )
         self.queue_panel.drop_hint.setVisible(not self._queue_items)
         table.clearContents()
         table.clearSpans()
-        options = self.settings_panel.build_conversion_options()
         grouped_items = self._group_queue_items_by_folder()
         self._queue_row_items = []
         total_rows = sum(len(items) + 1 for _label, _tooltip, items in grouped_items)

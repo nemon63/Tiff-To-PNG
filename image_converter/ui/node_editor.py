@@ -1141,6 +1141,7 @@ class GraphWorkspace(QWidget):
 
     def _refresh_validation(self) -> None:
         issues = self._executor.validate_issues(self.project)
+        self._scene.set_validation_issues(issues)
         self.validation_table.blockSignals(True)
         try:
             self.validation_table.setRowCount(len(issues))

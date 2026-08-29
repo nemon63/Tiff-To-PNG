@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
+import math
 from pathlib import Path
 
 from PIL import Image
 
 from image_converter.domain.constants import SUPPORTED_SOURCE_EXTENSIONS
-from image_converter.domain.models import AssetKind, AssetMetadata, BatchSource, QueueItem, QueueStatus
+from image_converter.domain.models import (
+    AssetKind,
+    AssetMetadata,
+    BatchSource,
+    NormalMapStatistics,
+    QueueItem,
+    QueueStatus,
+    TextureMapType,
+)
 from image_converter.services.image_loading import (
     copy_first_frame_preserving_alpha,
     image_has_alpha,
@@ -129,6 +138,8 @@ class AssetScanner:
     def _read_metadata(self, path: Path) -> AssetMetadata:
         file_size = path.stat().st_size
         map_type = detect_texture_map_type(path)
+        validation_grayscale_sample: bytes | None = None
+        normal_map_statistics: NormalMapStatistics | None = None
         with Image.open(path) as image:
             prepare_image_header_preserving_alpha(image)
             width, height = image.size
@@ -136,6 +147,20 @@ class AssetScanner:
             frame_count = getattr(image, "n_frames", 1)
             has_alpha = image_has_alpha(image)
             format_name = (image.format or path.suffix.removeprefix(".")).upper()
+            if map_type in (TextureMapType.ROUGHNESS, TextureMapType.SMOOTHNESS):
+                validation_image = copy_first_frame_preserving_alpha(image).convert("L")
+                validation_image = validation_image.resize(
+                    (128, 128),
+                    Image.Resampling.BILINEAR,
+                )
+                validation_grayscale_sample = validation_image.tobytes()
+            elif map_type is TextureMapType.NORMAL:
+                validation_image = copy_first_frame_preserving_alpha(image).convert("RGB")
+                validation_image = validation_image.resize(
+                    (128, 128),
+                    Image.Resampling.BILINEAR,
+                )
+                normal_map_statistics = self._normal_map_statistics(validation_image)
 
         warnings: list[str] = []
         if width <= 0 or height <= 0:
@@ -164,6 +189,8 @@ class AssetScanner:
             frame_count=frame_count,
             warnings=tuple(warnings),
             alpha_fully_opaque=None if has_alpha else False,
+            validation_grayscale_sample=validation_grayscale_sample,
+            normal_map_statistics=normal_map_statistics,
         )
 
     def analyze_alpha(self, path: Path, metadata: AssetMetadata) -> AssetMetadata:
@@ -189,3 +216,34 @@ class AssetScanner:
     @staticmethod
     def _is_power_of_two(value: int) -> bool:
         return value > 0 and (value & (value - 1)) == 0
+
+    @staticmethod
+    def _normal_map_statistics(image: Image.Image) -> NormalMapStatistics:
+        raw = image.tobytes()
+        pixel_count = max(1, len(raw) // 3)
+        red_total = 0
+        green_total = 0
+        blue_total = 0
+        negative_z_count = 0
+        length_outlier_count = 0
+        for index in range(0, len(raw), 3):
+            red, green, blue = raw[index : index + 3]
+            red_total += red
+            green_total += green
+            blue_total += blue
+            x = red / 127.5 - 1.0
+            y = green / 127.5 - 1.0
+            z = blue / 127.5 - 1.0
+            if z < 0.0:
+                negative_z_count += 1
+            if abs(math.sqrt(x * x + y * y + z * z) - 1.0) > 0.35:
+                length_outlier_count += 1
+        return NormalMapStatistics(
+            mean_rgb=(
+                red_total / pixel_count,
+                green_total / pixel_count,
+                blue_total / pixel_count,
+            ),
+            negative_z_ratio=negative_z_count / pixel_count,
+            vector_length_outlier_ratio=length_outlier_count / pixel_count,
+        )

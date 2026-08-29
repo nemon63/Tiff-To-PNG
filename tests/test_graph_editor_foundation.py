@@ -35,6 +35,8 @@ from image_converter.domain.models import (
 )
 from image_converter.domain.node_graph import (
     GraphConnection,
+    GraphValidationIssue,
+    GraphValidationSeverity,
     NodeGraph,
     NodeGraphProject,
     NodeType,
@@ -49,6 +51,13 @@ from image_converter.services.asset_queue import AssetScanner
 from image_converter.services.conversion import BatchConversionService, ImageConverter
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
 from image_converter.services.map_types import detect_texture_map_type
+from image_converter.services.colorspace import item_preflight_warnings
+from image_converter.services.material_validation import (
+    detect_normal_map_orientation,
+    graph_roughness_glossiness_issues,
+    texture_set_pair_warnings,
+    validate_texture_sets,
+)
 from image_converter.services.node_graph_executor import (
     GraphExecutionError,
     NodeGraphExecutor,
@@ -164,6 +173,434 @@ class ImageLoadingTests(unittest.TestCase):
             item = AssetScanner().scan_paths([source], recursive=False).items[0]
             self.assertIsNotNone(item.metadata)
             self.assertEqual(TextureMapType.EMISSIVE, item.metadata.map_type)
+
+    def test_basecolor_short_alias_df_is_detected_in_queue(self) -> None:
+        source = Path("bike_damaged_df.png")
+
+        self.assertEqual(TextureMapType.BASECOLOR, detect_texture_map_type(source))
+
+
+class MaterialValidationTests(unittest.TestCase):
+    def test_manual_roughness_assignment_warns_for_glossiness_filename(self) -> None:
+        item = QueueItem(
+            BatchSource(Path("bike_glossiness.png")),
+            AssetKind.IMAGE,
+            None,
+            map_type_override=TextureMapType.ROUGHNESS,
+        )
+
+        warnings = item_preflight_warnings(item)
+
+        self.assertTrue(any("Вероятная ошибка" in warning for warning in warnings))
+        self.assertTrue(any("нужна инверсия" in warning for warning in warnings))
+
+    def test_texture_pair_comparison_accepts_inverse_and_warns_for_duplicate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            roughness_path = root / "bike_roughness.png"
+            smoothness_path = root / "bike_glossiness.png"
+            roughness = Image.frombytes("L", (4, 1), bytes((0, 64, 128, 255)))
+            roughness.save(roughness_path)
+
+            smoothness = Image.eval(roughness, lambda value: 255 - value)
+            smoothness.save(smoothness_path)
+            scanned_items = AssetScanner().scan_paths(
+                (roughness_path, smoothness_path),
+                recursive=False,
+            ).items
+            self.assertEqual(
+                {},
+                texture_set_pair_warnings(scanned_items),
+            )
+
+            roughness.save(smoothness_path)
+            scanned_items = AssetScanner().scan_paths(
+                (roughness_path, smoothness_path),
+                recursive=False,
+            ).items
+            warnings = texture_set_pair_warnings(scanned_items)
+
+            self.assertEqual(2, len(warnings))
+            self.assertTrue(
+                all(
+                    "почти одинаковы" in path_warnings[0]
+                    for path_warnings in warnings.values()
+                )
+            )
+
+    def test_graph_validator_requires_invert_between_glossiness_and_unreal(self) -> None:
+        smoothness = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            properties={"path": "D:/textures/bike_glossiness.png"},
+        )
+        invert = create_graph_node(NodeType.INVERT_CHANNEL)
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.UNREAL_ORM.value},
+        )
+
+        direct_graph = NodeGraph(
+            nodes=[smoothness, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(),
+                    smoothness.node_id,
+                    "r",
+                    output.node_id,
+                    "g",
+                )
+            ],
+        )
+        direct_issues = graph_roughness_glossiness_issues(direct_graph)
+        self.assertEqual(1, len(direct_issues))
+        self.assertIn("ожидает Roughness", direct_issues[0].message)
+        self.assertIn("получает Smoothness", direct_issues[0].message)
+
+        corrected_graph = NodeGraph(
+            nodes=[smoothness, invert, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(),
+                    smoothness.node_id,
+                    "r",
+                    invert.node_id,
+                    "in",
+                ),
+                GraphConnection(
+                    make_connection_id(),
+                    invert.node_id,
+                    "out",
+                    output.node_id,
+                    "g",
+                ),
+            ],
+        )
+        self.assertEqual((), graph_roughness_glossiness_issues(corrected_graph))
+
+        invert.properties["enabled"] = False
+        disabled_issues = graph_roughness_glossiness_issues(corrected_graph)
+        self.assertEqual(1, len(disabled_issues))
+        self.assertIn("получает Smoothness", disabled_issues[0].message)
+
+    def test_graph_validator_understands_packed_smoothness_channel(self) -> None:
+        mask_map = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            properties={"path": "D:/textures/bike_maskmap.png"},
+        )
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.UNREAL_ORM.value},
+        )
+        graph = NodeGraph(
+            nodes=[mask_map, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(),
+                    mask_map.node_id,
+                    "a",
+                    output.node_id,
+                    "g",
+                )
+            ],
+        )
+
+        issues = graph_roughness_glossiness_issues(graph)
+
+        self.assertEqual(1, len(issues))
+        self.assertIs(GraphValidationSeverity.ERROR, issues[0].severity)
+        self.assertIn("Ошибка схемы", issues[0].message)
+        self.assertIn("получает Smoothness", issues[0].message)
+
+    def test_graph_validator_requires_invert_for_roughness_in_unity_alpha(self) -> None:
+        roughness = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            properties={"path": "D:/textures/bike_roughness.png"},
+        )
+        invert = create_graph_node(NodeType.INVERT_CHANNEL)
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.UNITY_HDRP.value},
+        )
+        direct_graph = NodeGraph(
+            nodes=[roughness, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(), roughness.node_id, "r", output.node_id, "a"
+                )
+            ],
+        )
+        self.assertIn(
+            "ожидает Smoothness",
+            graph_roughness_glossiness_issues(direct_graph)[0].message,
+        )
+
+        corrected_graph = NodeGraph(
+            nodes=[roughness, invert, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(), roughness.node_id, "r", invert.node_id, "in"
+                ),
+                GraphConnection(
+                    make_connection_id(), invert.node_id, "out", output.node_id, "a"
+                ),
+            ],
+        )
+        self.assertEqual((), graph_roughness_glossiness_issues(corrected_graph))
+
+    def test_graph_validator_marks_ambiguous_texture_for_review(self) -> None:
+        ambiguous = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            properties={"path": "D:/textures/bike_surface_data.png"},
+        )
+        output = create_graph_node(
+            NodeType.OUTPUT_RGBA,
+            properties={"profile": OutputProfile.UNREAL_ORM.value},
+        )
+        graph = NodeGraph(
+            nodes=[ambiguous, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(), ambiguous.node_id, "r", output.node_id, "g"
+                )
+            ],
+        )
+
+        issues = graph_roughness_glossiness_issues(graph)
+
+        self.assertEqual(1, len(issues))
+        self.assertIs(GraphValidationSeverity.WARNING, issues[0].severity)
+        self.assertIn("Требует проверки", issues[0].message)
+
+    def test_texture_set_validator_reports_resolution_duplicates_and_missing_maps(self) -> None:
+        root = Path("D:/textures")
+        basecolor = QueueItem(
+            BatchSource(root / "bike_basecolor.png", root),
+            AssetKind.IMAGE,
+            AssetMetadata("PNG", 4096, 4096, "RGB", False, 64, TextureMapType.BASECOLOR),
+        )
+        normal = QueueItem(
+            BatchSource(root / "bike_normal.png", root),
+            AssetKind.IMAGE,
+            AssetMetadata("PNG", 2048, 2048, "RGB", False, 64, TextureMapType.NORMAL),
+        )
+        roughness = QueueItem(
+            BatchSource(root / "bike_roughness.png", root),
+            AssetKind.IMAGE,
+            AssetMetadata("PNG", 4096, 4096, "L", False, 64, TextureMapType.ROUGHNESS),
+        )
+        duplicate_roughness = QueueItem(
+            BatchSource(root / "bike_rough.png", root),
+            AssetKind.IMAGE,
+            AssetMetadata("PNG", 4096, 4096, "L", False, 64, TextureMapType.ROUGHNESS),
+        )
+
+        result = validate_texture_sets(
+            (basecolor, normal, roughness, duplicate_roughness),
+            ConversionOptions(unpack_packed=True),
+        )
+
+        self.assertEqual(1, len(result.reports))
+        report = result.reports[0]
+        self.assertIn("разные разрешения", "\n".join(report.issues))
+        self.assertIn("несколько карт Roughness", "\n".join(report.issues))
+        self.assertIn("AO, Metallic", "\n".join(report.issues))
+        self.assertEqual(0, result.ready_count)
+        self.assertEqual(1, result.warning_count)
+
+    def test_traditional_validator_accepts_complete_hdrp_source_set(self) -> None:
+        root = Path("D:/textures")
+        metadata = AssetMetadata("PNG", 4096, 4096, "RGBA", True, 64)
+        items = (
+            QueueItem(
+                BatchSource(root / "bike_basecolor.png", root),
+                AssetKind.IMAGE,
+                replace(metadata, map_type=TextureMapType.BASECOLOR),
+            ),
+            QueueItem(
+                BatchSource(root / "bike_normal.png", root),
+                AssetKind.IMAGE,
+                replace(metadata, map_type=TextureMapType.NORMAL),
+            ),
+            QueueItem(
+                BatchSource(
+                    root / "bike_maskmap.png",
+                    root,
+                    packed_layout=ChannelPackLayout.UNITY_HDRP,
+                ),
+                AssetKind.IMAGE,
+                metadata,
+            ),
+        )
+
+        result = validate_texture_sets(
+            items,
+            ConversionOptions(unpack_packed=True),
+        )
+
+        self.assertEqual(1, len(result.reports))
+        self.assertTrue(result.reports[0].is_ready)
+        self.assertEqual({}, result.warnings_by_path)
+
+    def test_pack_only_validator_does_not_require_basecolor_or_normal(self) -> None:
+        root = Path("D:/textures")
+        items = (
+            QueueItem(
+                BatchSource(root / "bike_metallic.png", root),
+                AssetKind.IMAGE,
+                AssetMetadata(
+                    "PNG", 2048, 2048, "L", False, 64, TextureMapType.METALLIC
+                ),
+            ),
+            QueueItem(
+                BatchSource(root / "bike_roughness.png", root),
+                AssetKind.IMAGE,
+                AssetMetadata(
+                    "PNG", 2048, 2048, "L", False, 64, TextureMapType.ROUGHNESS
+                ),
+            ),
+        )
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.UNITY_URP,
+                mode=ChannelPackingMode.PACK_ONLY,
+            )
+        )
+
+        result = validate_texture_sets(items, options)
+
+        self.assertEqual(1, len(result.reports))
+        self.assertTrue(result.reports[0].is_ready)
+
+    def test_normal_orientation_suffixes_are_detected(self) -> None:
+        self.assertEqual(
+            "directx",
+            detect_normal_map_orientation(Path("bike_normal_dx.png")),
+        )
+        self.assertEqual(
+            "opengl",
+            detect_normal_map_orientation(Path("bike_nml_OpenGL.tif")),
+        )
+        self.assertIsNone(
+            detect_normal_map_orientation(Path("bike_normal.png"))
+        )
+
+    def test_normal_validator_warns_when_orientation_conflicts_with_unity(self) -> None:
+        root = Path("D:/textures")
+        normal = QueueItem(
+            BatchSource(root / "bike_normal_dx.png", root),
+            AssetKind.IMAGE,
+            AssetMetadata("PNG", 2048, 2048, "RGB", False, 64, TextureMapType.NORMAL),
+        )
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.UNITY_HDRP,
+                mode=ChannelPackingMode.PACK_WITH_REMAINDER,
+            )
+        )
+
+        result = validate_texture_sets((normal,), options)
+        issues = "\n".join(result.reports[0].issues)
+
+        self.assertIn("DirectX (Y−)", issues)
+        self.assertIn("ожидает OpenGL (Y+)", issues)
+        self.assertIn("Flip Green", issues)
+
+    def test_normal_validator_warns_when_orientation_conflicts_with_unreal(self) -> None:
+        root = Path("D:/textures")
+        normal = QueueItem(
+            BatchSource(root / "bike_normal_gl.png", root),
+            AssetKind.IMAGE,
+            AssetMetadata("PNG", 2048, 2048, "RGB", False, 64, TextureMapType.NORMAL),
+        )
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.ORM,
+                mode=ChannelPackingMode.PACK_WITH_REMAINDER,
+            )
+        )
+
+        result = validate_texture_sets((normal,), options)
+        issues = "\n".join(result.reports[0].issues)
+
+        self.assertIn("OpenGL (Y+)", issues)
+        self.assertIn("ожидает DirectX (Y−)", issues)
+        self.assertIn("Flip Green", issues)
+
+    def test_normal_validator_does_not_guess_ambiguous_orientation(self) -> None:
+        root = Path("D:/textures")
+        normal = QueueItem(
+            BatchSource(root / "bike_normal.png", root),
+            AssetKind.IMAGE,
+            AssetMetadata("PNG", 2048, 2048, "RGB", False, 64, TextureMapType.NORMAL),
+        )
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.UNITY_URP,
+                mode=ChannelPackingMode.PACK_WITH_REMAINDER,
+            )
+        )
+
+        result = validate_texture_sets((normal,), options)
+
+        self.assertFalse(
+            any("Flip Green" in issue for issue in result.reports[0].issues)
+        )
+
+    def test_manual_normal_override_still_checks_mode_and_orientation(self) -> None:
+        root = Path("D:/textures")
+        item = QueueItem(
+            BatchSource(root / "bike_height_dx.png", root),
+            AssetKind.IMAGE,
+            AssetMetadata("PNG", 2048, 2048, "L", False, 64),
+        )
+        item.map_type_override = TextureMapType.NORMAL
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.UNITY_HDRP,
+                mode=ChannelPackingMode.PACK_WITH_REMAINDER,
+            )
+        )
+
+        result = validate_texture_sets((item,), options)
+        issues = "\n".join(result.reports[0].issues)
+
+        self.assertIn("ожидается RGB или RGBA", issues)
+        self.assertIn("ожидает OpenGL (Y+)", issues)
+
+    def test_normal_validator_accepts_flat_tangent_space_normal(self) -> None:
+        with TemporaryDirectory() as tmp:
+            normal_path = Path(tmp) / "bike_normal.png"
+            Image.new("RGB", (8, 8), (128, 128, 255)).save(normal_path)
+            item = AssetScanner().scan_paths(
+                (normal_path,),
+                recursive=False,
+            ).items[0]
+
+            result = validate_texture_sets((item,), ConversionOptions())
+
+            self.assertEqual(1, len(result.reports))
+            self.assertTrue(result.reports[0].is_ready)
+            self.assertIsNotNone(item.metadata.normal_map_statistics)
+
+    def test_normal_validator_rejects_grayscale_and_non_normal_pixels(self) -> None:
+        with TemporaryDirectory() as tmp:
+            normal_path = Path(tmp) / "bike_normal.png"
+            Image.new("L", (8, 8), 32).save(normal_path)
+            item = AssetScanner().scan_paths(
+                (normal_path,),
+                recursive=False,
+            ).items[0]
+
+            result = validate_texture_sets((item,), ConversionOptions())
+            issues = "\n".join(result.reports[0].issues)
+
+            self.assertIn("ожидается RGB или RGBA", issues)
+            self.assertIn("не похоже на обычную tangent-space", issues)
 
 
 class NodeGraphExecutorPerformanceTests(unittest.TestCase):
@@ -611,16 +1048,24 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
         )
         mix = create_graph_node(NodeType.MIX_IMAGE)
         blend = create_graph_node(NodeType.BLEND_IMAGE)
+        normal_map = create_graph_node(NodeType.NORMAL_MAP)
         split = create_graph_node(NodeType.SPLIT_RGBA)
         combine = create_graph_node(NodeType.COMBINE_RGBA)
         set_alpha = create_graph_node(NodeType.SET_ALPHA)
         graph = NodeGraph(
-            nodes=[a, b, mix, blend, split, combine, set_alpha],
+            nodes=[a, b, mix, blend, normal_map, split, combine, set_alpha],
             connections=[
                 GraphConnection(make_connection_id(), a.node_id, "image", mix.node_id, "a"),
                 GraphConnection(make_connection_id(), b.node_id, "image", mix.node_id, "b"),
                 GraphConnection(make_connection_id(), a.node_id, "image", blend.node_id, "a"),
                 GraphConnection(make_connection_id(), b.node_id, "image", blend.node_id, "b"),
+                GraphConnection(
+                    make_connection_id(),
+                    a.node_id,
+                    "image",
+                    normal_map.node_id,
+                    "image",
+                ),
                 GraphConnection(make_connection_id(), a.node_id, "image", split.node_id, "image"),
                 GraphConnection(make_connection_id(), a.node_id, "r", combine.node_id, "r"),
                 GraphConnection(make_connection_id(), a.node_id, "g", combine.node_id, "g"),
@@ -632,7 +1077,7 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
         )
         executor = NodeGraphExecutor()
 
-        for node in (mix, blend, split, combine, set_alpha):
+        for node in (mix, blend, normal_map, split, combine, set_alpha):
             with self.subTest(node_type=node.node_type):
                 image, _meta = executor.render_display_node(
                     graph,
@@ -642,6 +1087,83 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
                 )
                 self.assertEqual("RGBA", image.mode)
                 self.assertEqual((1024, 1024), image.size)
+
+    def test_normal_map_node_flips_green_and_preserves_alpha(self) -> None:
+        source = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 64,
+                "green": 32,
+                "blue": 255,
+                "alpha": 77,
+                "width": 1,
+                "height": 1,
+            },
+        )
+        normal_map = create_graph_node(
+            NodeType.NORMAL_MAP,
+            properties={"flip_green": True},
+        )
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        graph = NodeGraph(
+            nodes=[source, normal_map, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(), source.node_id, "image", normal_map.node_id, "image"
+                ),
+                GraphConnection(
+                    make_connection_id(), normal_map.node_id, "out", output.node_id, "image"
+                ),
+            ],
+        )
+
+        image = NodeGraphExecutor().render_output_node(graph, output)
+
+        self.assertEqual((64, 223, 255, 77), image.getpixel((0, 0)))
+
+    def test_normal_map_node_reconstructs_normalizes_and_adjusts_strength(self) -> None:
+        source = create_graph_node(
+            NodeType.COLOR,
+            properties={
+                "red": 255,
+                "green": 128,
+                "blue": 0,
+                "alpha": 41,
+                "width": 1,
+                "height": 1,
+            },
+        )
+        normal_map = create_graph_node(
+            NodeType.NORMAL_MAP,
+            properties={"reconstruct_blue": True, "strength": 0},
+        )
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        graph = NodeGraph(
+            nodes=[source, normal_map, output],
+            connections=[
+                GraphConnection(
+                    make_connection_id(), source.node_id, "image", normal_map.node_id, "image"
+                ),
+                GraphConnection(
+                    make_connection_id(), normal_map.node_id, "out", output.node_id, "image"
+                ),
+            ],
+        )
+
+        flat = NodeGraphExecutor().render_output_node(graph, output).getpixel((0, 0))
+        self.assertLessEqual(abs(flat[0] - 128), 1)
+        self.assertLessEqual(abs(flat[1] - 128), 1)
+        self.assertEqual(255, flat[2])
+        self.assertEqual(41, flat[3])
+
+        normal_map.properties.update(
+            {"reconstruct_blue": False, "normalize": True, "strength": 100}
+        )
+        normalized = NodeGraphExecutor().render_output_node(graph, output).getpixel((0, 0))
+        self.assertLessEqual(abs(normalized[0] - 218), 2)
+        self.assertLessEqual(abs(normalized[1] - 128), 2)
+        self.assertLessEqual(abs(normalized[2] - 37), 2)
+        self.assertEqual(41, normalized[3])
 
     def test_blend_image_applies_mask_to_rgba_result(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1385,6 +1907,42 @@ class NodePropertiesPanelTests(unittest.TestCase):
         self.panel.output_alpha_input_mode_combo.setCurrentIndex(1)
         self.assertEqual("replace", changes[-1]["alpha_input_mode"])
 
+    def test_normal_map_node_shows_and_updates_processing_controls(self) -> None:
+        node = create_graph_node(
+            NodeType.NORMAL_MAP,
+            properties={
+                "flip_green": True,
+                "reconstruct_blue": True,
+                "normalize": True,
+                "strength": 175,
+            },
+        )
+        changes: list[dict[str, object]] = []
+        self.panel.node_changed.connect(
+            lambda _node, _title, properties, _needs_rebuild, _preview_mode: changes.append(
+                properties
+            )
+        )
+
+        self.panel.set_node(node)
+
+        self.assertFalse(self.panel.normal_flip_red_checkbox.isHidden())
+        self.assertFalse(self.panel.normal_flip_green_checkbox.isHidden())
+        self.assertFalse(self.panel.normal_reconstruct_blue_checkbox.isHidden())
+        self.assertFalse(self.panel.normal_normalize_checkbox.isHidden())
+        self.assertFalse(self.panel.normal_strength_host.isHidden())
+        self.assertTrue(self.panel.normal_flip_green_checkbox.isChecked())
+        self.assertTrue(self.panel.normal_reconstruct_blue_checkbox.isChecked())
+        self.assertTrue(self.panel.normal_normalize_checkbox.isChecked())
+        self.assertEqual(175, self.panel.normal_strength_spin.value())
+
+        self.panel.normal_flip_red_checkbox.setChecked(True)
+        self.panel.normal_strength_spin.setValue(220)
+        self.panel._flush_numeric_preview()
+
+        self.assertTrue(changes[-1]["flip_red"])
+        self.assertEqual(220, changes[-1]["strength"])
+
     def test_output_export_button_requests_current_output(self) -> None:
         output = create_graph_node(
             NodeType.OUTPUT_RGBA,
@@ -1722,6 +2280,35 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertEqual("#ffd166", selected_pen.color().name())
         self.assertGreater(selected_pen.widthF(), normal_pen.widthF())
         self.assertEqual(Qt.PenStyle.SolidLine, selected_pen.style())
+
+    def test_node_validation_outline_tracks_highest_issue_severity(self) -> None:
+        node = create_graph_node(NodeType.TEXTURE_INPUT)
+        item = GraphNodeItem(node, self.workspace._scene.texture_visual_cache)
+        warning = GraphValidationIssue(
+            GraphValidationSeverity.WARNING,
+            "Проверьте Roughness/Glossiness.",
+            node.node_id,
+            "r",
+        )
+        error = GraphValidationIssue(
+            GraphValidationSeverity.ERROR,
+            "Texture не найдена.",
+            node.node_id,
+            "path",
+        )
+
+        item.set_validation_issues((warning,))
+        self.assertIs(GraphValidationSeverity.WARNING, item._validation_severity)
+        self.assertIn("Roughness/Glossiness", item.toolTip())
+        self.assertEqual("#f2b84b", item._border_pen().color().name())
+
+        item.set_validation_issues((warning, error))
+        self.assertIs(GraphValidationSeverity.ERROR, item._validation_severity)
+        self.assertEqual("#ff6b6b", item._border_pen().color().name())
+
+        item.set_validation_issues(())
+        self.assertIsNone(item._validation_severity)
+        self.assertEqual("", item.toolTip())
 
     def test_mix_image_help_popup_can_pin_and_auto_close(self) -> None:
         mix = create_graph_node(NodeType.MIX_IMAGE)
@@ -3793,6 +4380,47 @@ class GraphEditorFoundationTests(unittest.TestCase):
             selected = window._selected_queue_item()
             self.assertIsNotNone(selected)
             self.assertEqual("b_basecolor.png", selected.path.name)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_queue_surfaces_roughness_glossiness_pair_warning(self) -> None:
+        window = MainWindow()
+        try:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                roughness_path = root / "bike_roughness.png"
+                glossiness_path = root / "bike_glossiness.png"
+                duplicate = Image.frombytes(
+                    "L",
+                    (4, 1),
+                    bytes((0, 64, 128, 255)),
+                )
+                duplicate.save(roughness_path)
+                duplicate.save(glossiness_path)
+                scanned = AssetScanner().scan_paths(
+                    (roughness_path, glossiness_path),
+                    recursive=False,
+                )
+
+                window.add_queue_items(list(scanned.items))
+
+                self.assertTrue(
+                    all(item.validation_warnings for item in window._queue_items)
+                )
+                status_texts = [
+                    window.queue_panel.table.item(row, 4).text()
+                    for row in range(window.queue_panel.table.rowCount())
+                    if window.queue_panel.table.item(row, 4) is not None
+                ]
+                self.assertTrue(
+                    all("предупрежд." in text for text in status_texts)
+                )
+                self.assertIn(
+                    "требуют внимания 1",
+                    window.queue_panel.texture_set_validation_label.text(),
+                )
         finally:
             window.close()
             window.deleteLater()

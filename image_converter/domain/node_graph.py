@@ -22,6 +22,7 @@ class NodeType(str, Enum):
     LUMINANCE = "luminance"
     MIX_IMAGE = "mix_image"
     BLEND_IMAGE = "blend_image"
+    NORMAL_MAP = "normal_map"
     SPLIT_RGBA = "split_rgba"
     COMBINE_RGBA = "combine_rgba"
     SET_ALPHA = "set_alpha"
@@ -88,6 +89,7 @@ OPERATION_NODE_TYPES = (
     NodeType.LUMINANCE,
     NodeType.MIX_IMAGE,
     NodeType.BLEND_IMAGE,
+    NodeType.NORMAL_MAP,
 )
 
 
@@ -165,6 +167,7 @@ def node_type_label(node_type: NodeType) -> str:
         NodeType.LUMINANCE: "Luminance",
         NodeType.MIX_IMAGE: "Mix Image",
         NodeType.BLEND_IMAGE: "Blend Image",
+        NodeType.NORMAL_MAP: "Normal Map",
         NodeType.SPLIT_RGBA: "Split RGBA",
         NodeType.COMBINE_RGBA: "Combine RGBA",
         NodeType.SET_ALPHA: "Apply Mask",
@@ -246,6 +249,15 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
             "resolution_height": 1024,
             "mask_filter": "bilinear",
         }
+    if node_type is NodeType.NORMAL_MAP:
+        return {
+            "enabled": True,
+            "flip_red": False,
+            "flip_green": False,
+            "reconstruct_blue": False,
+            "normalize": False,
+            "strength": 100,
+        }
     if node_type is NodeType.LUMINANCE:
         return {"enabled": True}
     if node_type is NodeType.VIEW:
@@ -296,6 +308,13 @@ def resettable_node_property_keys(node_type: NodeType) -> tuple[str, ...]:
             "resolution_width",
             "resolution_height",
             "mask_filter",
+        ),
+        NodeType.NORMAL_MAP: (
+            "flip_red",
+            "flip_green",
+            "reconstruct_blue",
+            "normalize",
+            "strength",
         ),
         NodeType.SET_ALPHA: ("mask_mode", "mask_filter"),
     }
@@ -423,6 +442,11 @@ def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
             GraphSocket("mask", "Mask", SocketDirection.INPUT, SocketType.CHANNEL),
             GraphSocket("image", "RGBA", SocketDirection.OUTPUT, SocketType.IMAGE),
         )
+    if node_type is NodeType.NORMAL_MAP:
+        return (
+            GraphSocket("image", "Normal", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("out", "Normal", SocketDirection.OUTPUT, SocketType.IMAGE),
+        )
     if node_type is NodeType.SPLIT_RGBA:
         return (
             GraphSocket("image", "RGBA", SocketDirection.INPUT, SocketType.IMAGE),
@@ -480,6 +504,8 @@ def node_bypass_socket_pair(node_type: NodeType) -> tuple[str, str] | None:
         return ("r", "out")
     if node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE):
         return ("a", "image")
+    if node_type is NodeType.NORMAL_MAP:
+        return ("image", "out")
     if node_type is NodeType.SET_ALPHA:
         return ("image", "out")
     return None

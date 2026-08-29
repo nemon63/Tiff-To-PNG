@@ -31,6 +31,8 @@ from image_converter.domain.models import TextureMapType
 from image_converter.domain.node_graph import (
     GraphConnection,
     GraphNode,
+    GraphValidationIssue,
+    GraphValidationSeverity,
     NodeGraphProject,
     NodeType,
     SocketDirection,
@@ -211,6 +213,8 @@ class GraphNodeItem(QGraphicsRectItem):
         self.reset_button_label: QGraphicsSimpleTextItem | None = None
         self.help_button_item: QGraphicsEllipseItem | None = None
         self.help_button_label: QGraphicsSimpleTextItem | None = None
+        self._validation_severity: GraphValidationSeverity | None = None
+        self._validation_messages: tuple[str, ...] = ()
         self._drag_start_position: tuple[float, float] | None = None
         sockets = socket_definitions(node.node_type)
         input_count = sum(1 for socket in sockets if socket.direction is SocketDirection.INPUT)
@@ -562,6 +566,38 @@ class GraphNodeItem(QGraphicsRectItem):
             self.subtitle_item.setText(f"#{red:02X}{green:02X}{blue:02X}{alpha:02X}")
         self.update()
 
+    def set_validation_issues(
+        self,
+        issues: Iterable[GraphValidationIssue],
+    ) -> None:
+        node_issues = tuple(issues)
+        self._validation_messages = tuple(issue.message for issue in node_issues)
+        if any(
+            issue.severity is GraphValidationSeverity.ERROR
+            for issue in node_issues
+        ):
+            self._validation_severity = GraphValidationSeverity.ERROR
+        elif node_issues:
+            self._validation_severity = GraphValidationSeverity.WARNING
+        else:
+            self._validation_severity = None
+        self.setToolTip("\n".join(self._validation_messages))
+        self.update()
+
+    def _border_pen(self) -> QPen:
+        border_color = QColor("#3A434D")
+        border_width = 1.2
+        if self._validation_severity is GraphValidationSeverity.ERROR:
+            border_color = QColor("#FF6B6B")
+            border_width = 2.0
+        elif self._validation_severity is GraphValidationSeverity.WARNING:
+            border_color = QColor("#F2B84B")
+            border_width = 1.8
+        if self.isSelected():
+            border_color = QColor("#5BA7FF")
+            border_width = 1.8
+        return QPen(border_color, border_width)
+
     def _position_thumbnail_item(self) -> None:
         if self.thumbnail_item is None or self.thumbnail_item.pixmap().isNull():
             return
@@ -740,12 +776,7 @@ class GraphNodeItem(QGraphicsRectItem):
         painter.restore()
 
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(
-            QPen(
-                QColor("#5BA7FF") if self.isSelected() else QColor("#3A434D"),
-                1.2,
-            )
-        )
+        painter.setPen(self._border_pen())
         painter.drawRoundedRect(rect, 5, 5)
 
 
@@ -804,6 +835,17 @@ class GraphScene(QGraphicsScene):
             self.node_items[node.node_id] = item
         for connection in self.project.graph.connections:
             self._add_connection_item(connection)
+
+    def set_validation_issues(
+        self,
+        issues: Iterable[GraphValidationIssue],
+    ) -> None:
+        issues_by_node: dict[str, list[GraphValidationIssue]] = {}
+        for issue in issues:
+            if issue.node_id:
+                issues_by_node.setdefault(issue.node_id, []).append(issue)
+        for node_id, item in self.node_items.items():
+            item.set_validation_issues(issues_by_node.get(node_id, ()))
 
     def _refresh_texture_visual(self, path: Path) -> None:
         path_key = self.texture_visual_cache.path_key(path)
@@ -1297,6 +1339,7 @@ class GraphView(QGraphicsView):
         image_menu = menu.addMenu("Image")
         self._add_node_menu_action(image_menu, "Mix Image", NodeType.MIX_IMAGE, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Blend Image", NodeType.BLEND_IMAGE, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Normal Map", NodeType.NORMAL_MAP, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Split RGBA", NodeType.SPLIT_RGBA, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Combine RGBA", NodeType.COMBINE_RGBA, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Apply Mask", NodeType.SET_ALPHA, scene_position, wire_port)

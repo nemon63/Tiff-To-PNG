@@ -195,6 +195,13 @@ class BatchRequest:
 
 
 @dataclass(slots=True, frozen=True)
+class NormalMapStatistics:
+    mean_rgb: tuple[float, float, float]
+    negative_z_ratio: float
+    vector_length_outlier_ratio: float
+
+
+@dataclass(slots=True, frozen=True)
 class AssetMetadata:
     format_name: str
     width: int
@@ -206,6 +213,8 @@ class AssetMetadata:
     frame_count: int = 1
     warnings: tuple[str, ...] = ()
     alpha_fully_opaque: bool | None = None
+    validation_grayscale_sample: bytes | None = None
+    normal_map_statistics: NormalMapStatistics | None = None
 
     @property
     def resolution_text(self) -> str:
@@ -248,6 +257,7 @@ class QueueItem:
     message: str = ""
     map_type_override: TextureMapType | None = None
     packed_layout_override: ChannelPackLayout | None = None
+    validation_warnings: tuple[str, ...] = ()
 
     @property
     def path(self) -> Path:

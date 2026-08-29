@@ -34,7 +34,18 @@ PACK_LAYOUT_SUFFIXES: dict[ChannelPackLayout, tuple[str, ...]] = {
 MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
     (
         TextureMapType.BASECOLOR,
-        ("basecolor", "base_color", "albedo", "alb", "diffuse", "diff", "dif", "color", "col"),
+        (
+            "basecolor",
+            "base_color",
+            "albedo",
+            "alb",
+            "diffuse",
+            "diff",
+            "dif",
+            "df",
+            "color",
+            "col",
+        ),
     ),
     (
         TextureMapType.NORMAL,

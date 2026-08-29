@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from collections import OrderedDict, defaultdict
@@ -27,6 +28,7 @@ from image_converter.domain.node_graph import (
     socket_definitions,
 )
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
+from image_converter.services.material_validation import graph_roughness_glossiness_issues
 from image_converter.services.pipeline import RESAMPLING_LANCZOS
 
 Logger = Callable[[str], None]
@@ -72,6 +74,48 @@ def _remap_lut(
         normalized = min(max((value - in_min) * scale, 0.0), 1.0)
         lut.append(round(out_min + normalized * (out_max - out_min)))
     return tuple(lut)
+
+
+@lru_cache(maxsize=8)
+def _normal_map_lut(
+    flip_red: bool,
+    flip_green: bool,
+    reconstruct_blue: bool,
+    normalize_vectors: bool,
+    strength_percent: int,
+) -> ImageFilter.Color3DLUT:
+    strength = strength_percent / 100.0
+    should_normalize = normalize_vectors or reconstruct_blue or strength_percent != 100
+
+    def transform(red: float, green: float, blue: float) -> tuple[float, float, float]:
+        x = red * 2.0 - 1.0
+        y = green * 2.0 - 1.0
+        z = blue * 2.0 - 1.0
+        if flip_red:
+            x = -x
+        if flip_green:
+            y = -y
+        x *= strength
+        y *= strength
+        if strength_percent == 0:
+            z = 1.0
+        elif reconstruct_blue:
+            z = math.sqrt(max(0.0, 1.0 - x * x - y * y))
+        if should_normalize:
+            length = math.sqrt(x * x + y * y + z * z)
+            if length > 1e-8:
+                x /= length
+                y /= length
+                z /= length
+            else:
+                x, y, z = 0.0, 0.0, 1.0
+        return (
+            min(max(x * 0.5 + 0.5, 0.0), 1.0),
+            min(max(y * 0.5 + 0.5, 0.0), 1.0),
+            min(max(z * 0.5 + 0.5, 0.0), 1.0),
+        )
+
+    return ImageFilter.Color3DLUT.generate(33, transform, channels=3)
 
 
 class GraphExecutionError(RuntimeError):
@@ -587,6 +631,7 @@ class NodeGraphExecutor:
                     NodeType.BLEND_IMAGE: (
                         ("a", "b") if self._node_enabled(node) else ("a",)
                     ),
+                    NodeType.NORMAL_MAP: ("image",),
                     NodeType.SPLIT_RGBA: ("image",),
                     NodeType.COMBINE_RGBA: ("r", "g", "b"),
                     NodeType.SET_ALPHA: ("image",),
@@ -769,6 +814,8 @@ class NodeGraphExecutor:
                     "Нет включенных Output nodes для экспорта.",
                 )
             )
+
+        issues.extend(graph_roughness_glossiness_issues(graph))
 
         deduped: dict[tuple[str, str, str], GraphValidationIssue] = {}
         for issue in issues:
@@ -1284,6 +1331,17 @@ class NodeGraphExecutor:
                 if alpha is None:
                     alpha = Image.new("L", target_size, 255)
                 image = Image.merge("RGBA", (*channels, alpha.convert("L")))
+            elif source_node.node_type is NodeType.NORMAL_MAP:
+                image = self._evaluate_required_image_input(
+                    graph,
+                    source_node,
+                    "image",
+                    target_size,
+                    visiting,
+                    cache,
+                ).convert("RGBA")
+                if self._node_enabled(source_node):
+                    image = self._apply_normal_map(image, source_node)
             elif source_node.node_type is NodeType.SET_ALPHA:
                 image = self._evaluate_required_image_input(
                     graph,
@@ -1995,6 +2053,10 @@ class NodeGraphExecutor:
                 return self._find_first_upstream_texture_size(
                     graph, source_node, ("image",), visiting, cache
                 )
+            if source_node.node_type is NodeType.NORMAL_MAP:
+                return self._find_first_upstream_texture_size(
+                    graph, source_node, ("image",), visiting, cache
+                )
             if source_node.node_type is NodeType.COMBINE_RGBA:
                 return self._find_first_upstream_texture_size(
                     graph, source_node, ("r", "g", "b", "a"), visiting, cache
@@ -2074,6 +2136,10 @@ class NodeGraphExecutor:
                     graph, source_node, socket_ids, visiting
                 )
             if source_node.node_type is NodeType.SPLIT_RGBA:
+                return self._find_first_upstream_color_size(
+                    graph, source_node, ("image",), visiting
+                )
+            if source_node.node_type is NodeType.NORMAL_MAP:
                 return self._find_first_upstream_color_size(
                     graph, source_node, ("image",), visiting
                 )
@@ -2276,6 +2342,17 @@ class NodeGraphExecutor:
         if opacity <= 0.0:
             return a
         return Image.blend(a, blended, opacity)
+
+    def _apply_normal_map(self, image: Image.Image, node: GraphNode) -> Image.Image:
+        strength = max(0, min(self._property_int(node, "strength", 100), 400))
+        lut = _normal_map_lut(
+            bool(node.properties.get("flip_red", False)),
+            bool(node.properties.get("flip_green", False)),
+            bool(node.properties.get("reconstruct_blue", False)),
+            bool(node.properties.get("normalize", False)),
+            strength,
+        )
+        return image.convert("RGBA").filter(lut)
 
     def _apply_image_blend(
         self,
