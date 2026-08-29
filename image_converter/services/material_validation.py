@@ -353,6 +353,19 @@ def normalized_path_key(path: Path) -> str:
     return str(path.resolve(strict=False)).casefold()
 
 
+def texture_set_items_for_item(
+    items: list[QueueItem] | tuple[QueueItem, ...],
+    selected_item: QueueItem | None,
+) -> tuple[QueueItem, ...]:
+    if selected_item is None:
+        return ()
+    selected_key = normalized_path_key(selected_item.path)
+    for group_items in _group_texture_set_items(items).values():
+        if any(normalized_path_key(item.path) == selected_key for item in group_items):
+            return tuple(group_items)
+    return (selected_item,)
+
+
 def detect_normal_map_orientation(path: Path) -> str | None:
     normalized = _normalized_stem(path.stem)
     tokens = {token for token in normalized.split("_") if token}

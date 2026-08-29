@@ -55,6 +55,7 @@ class QueuePanel(QWidget):
     open_selected_set_in_graph_requested = pyqtSignal()
     open_selected_files_in_graph_requested = pyqtSignal()
     apply_graph_to_queue_requested = pyqtSignal()
+    pbr_preview_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -127,6 +128,13 @@ class QueuePanel(QWidget):
         )
         self.apply_graph_to_queue_button.clicked.connect(self.apply_graph_to_queue_requested.emit)
         graph_actions_row.addWidget(self.apply_graph_to_queue_button)
+
+        self.pbr_preview_button = QPushButton("PBR Preview")
+        self.pbr_preview_button.setToolTip(
+            "Показать выбранный Texture Set на PBR-сфере или плоскости."
+        )
+        self.pbr_preview_button.clicked.connect(self.pbr_preview_requested.emit)
+        graph_actions_row.addWidget(self.pbr_preview_button)
         layout.addLayout(graph_actions_row)
 
         self.graph_apply_preflight_label = QLabel(
@@ -194,6 +202,7 @@ class QueuePanel(QWidget):
             self.open_set_in_graph_button,
             self.open_files_in_graph_button,
             self.apply_graph_to_queue_button,
+            self.pbr_preview_button,
             self.table,
         )
 

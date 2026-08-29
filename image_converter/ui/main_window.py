@@ -90,6 +90,7 @@ from image_converter.services.packing import (
 from image_converter.services.map_types import canonical_map_suffix
 from image_converter.services.material_validation import (
     normalized_path_key,
+    texture_set_items_for_item,
     validate_texture_sets,
 )
 from image_converter.services.presets import PresetRepository
@@ -106,6 +107,7 @@ from image_converter.ui.asset_browser import GraphAssetsPanel
 from image_converter.ui.inspector import MetadataPanel
 from image_converter.ui.log_panel import LogPanel
 from image_converter.ui.node_editor import GraphWorkspace
+from image_converter.ui.pbr_preview import PbrPreviewPanel
 from image_converter.ui.preview import DetachedPreviewWindow, PreviewPanel
 from image_converter.ui.queue_panel import QueuePanel
 from image_converter.ui.settings_panel import SettingsPanel
@@ -184,12 +186,14 @@ class MainWindow(QMainWindow):
         self.queue_panel.open_selected_set_in_graph_requested.connect(self._open_selected_set_in_graph)
         self.queue_panel.open_selected_files_in_graph_requested.connect(self._open_selected_files_in_graph)
         self.queue_panel.apply_graph_to_queue_requested.connect(self._apply_current_graph_to_queue)
+        self.queue_panel.pbr_preview_requested.connect(self._open_pbr_preview)
         self.queue_panel.table.itemSelectionChanged.connect(self._sync_status_bar_with_selection)
         self.queue_panel.table.itemSelectionChanged.connect(self._sync_workspace_selection)
         self.queue_panel.table.itemDoubleClicked.connect(self._open_selected_preview_window)
 
         self.preview_window = DetachedPreviewWindow()
         self.preview_panel = PreviewPanel(allow_detach=True)
+        self.pbr_preview_panel = PbrPreviewPanel()
         self.metadata_panel = MetadataPanel()
         self.metadata_panel.set_conversion_options(self.settings_panel.build_conversion_options())
         self.metadata_panel.map_type_override_changed.connect(self._apply_selected_map_type_override)
@@ -240,19 +244,27 @@ class MainWindow(QMainWindow):
         )
         self.inspector_dock = self._create_dock("Inspector", self.metadata_panel, "InspectorDock")
         self.preview_dock = self._create_dock("Preview", self.preview_panel, "PreviewDock")
+        self.pbr_preview_dock = self._create_dock(
+            "PBR Preview",
+            self.pbr_preview_panel,
+            "PbrPreviewDock",
+        )
         self.log_dock = self._create_dock("Log", self.log_panel, "LogDock")
         self.assets_dock.setMinimumWidth(220)
         self.node_properties_dock.setMinimumWidth(260)
         self.inspector_dock.setMinimumWidth(260)
         self.preview_dock.setMinimumWidth(240)
+        self.pbr_preview_dock.setMinimumWidth(300)
 
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.assets_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.node_properties_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.preview_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.pbr_preview_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
         self.tabifyDockWidget(self.node_properties_dock, self.inspector_dock)
         self.tabifyDockWidget(self.inspector_dock, self.preview_dock)
+        self.tabifyDockWidget(self.preview_dock, self.pbr_preview_dock)
         self.node_properties_dock.visibilityChanged.connect(self._on_node_properties_visibility_changed)
         self.node_properties_shortcut = QShortcut(QKeySequence("P"), self)
         self.node_properties_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -263,6 +275,7 @@ class MainWindow(QMainWindow):
         self.node_properties_dock.hide()
         self.inspector_dock.hide()
         self.preview_dock.hide()
+        self.pbr_preview_dock.hide()
         self.log_dock.hide()
         self.resizeDocks(
             [self.assets_dock, self.node_properties_dock],
@@ -312,6 +325,7 @@ class MainWindow(QMainWindow):
             self.node_properties_dock,
             self.inspector_dock,
             self.preview_dock,
+            self.pbr_preview_dock,
             self.log_dock,
         ):
             self.view_menu.addAction(dock.toggleViewAction())
@@ -329,6 +343,7 @@ class MainWindow(QMainWindow):
             self.node_properties_dock,
             self.inspector_dock,
             self.preview_dock,
+            self.pbr_preview_dock,
             self.log_dock,
         ):
             dock.setFloating(False)
@@ -337,9 +352,11 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.node_properties_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.preview_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.pbr_preview_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
         self.tabifyDockWidget(self.node_properties_dock, self.inspector_dock)
         self.tabifyDockWidget(self.inspector_dock, self.preview_dock)
+        self.tabifyDockWidget(self.preview_dock, self.pbr_preview_dock)
         self.log_dock.hide()
         self.resizeDocks(
             [self.assets_dock, self.node_properties_dock],
@@ -1015,6 +1032,7 @@ class MainWindow(QMainWindow):
                 self._alpha_analysis_controller.shutdown(wait_ms=100),
                 self._thumbnail_controller.shutdown(wait_ms=100),
                 self.preview_panel.shutdown_background_jobs(wait_ms=100),
+                self.pbr_preview_panel.shutdown_background_jobs(wait_ms=100),
                 self.preview_window.shutdown_background_jobs(wait_ms=100),
                 self.graph_workspace.shutdown_background_jobs(wait_ms=100),
             )
@@ -1755,8 +1773,19 @@ class MainWindow(QMainWindow):
         self._request_lazy_alpha_analysis(item)
         self.metadata_panel.set_queue_item(item)
         self.preview_panel.set_queue_item(item)
+        self.pbr_preview_panel.set_texture_set(
+            texture_set_items_for_item(self._queue_items, item)
+        )
         if self.preview_window.isVisible():
             self.preview_window.set_queue_item(item)
+
+    def _open_pbr_preview(self) -> None:
+        item = self._selected_queue_item()
+        self.pbr_preview_panel.set_texture_set(
+            texture_set_items_for_item(self._queue_items, item)
+        )
+        self.pbr_preview_dock.show()
+        self.pbr_preview_dock.raise_()
 
     def _request_lazy_alpha_analysis(self, item: QueueItem | None) -> None:
         if item is None or item.metadata is None:

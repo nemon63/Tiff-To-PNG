@@ -55,6 +55,7 @@ from image_converter.services.colorspace import item_preflight_warnings
 from image_converter.services.material_validation import (
     detect_normal_map_orientation,
     graph_roughness_glossiness_issues,
+    texture_set_items_for_item,
     texture_set_pair_warnings,
     validate_texture_sets,
 )
@@ -64,6 +65,10 @@ from image_converter.services.node_graph_executor import (
     NodeGraphPreviewCache,
 )
 from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
+from image_converter.services.pbr_preview import (
+    PbrPreviewService,
+    PbrTextureSource,
+)
 from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
 from image_converter.services.presets import SYSTEM_PRESETS
 from image_converter.services.settings import AppSettingsRepository
@@ -601,6 +606,77 @@ class MaterialValidationTests(unittest.TestCase):
 
             self.assertIn("ожидается RGB или RGBA", issues)
             self.assertIn("не похоже на обычную tangent-space", issues)
+
+
+class PbrPreviewTests(unittest.TestCase):
+    def test_texture_set_selection_does_not_mix_materials_in_same_folder(self) -> None:
+        root = Path("D:/textures")
+        metadata = AssetMetadata("PNG", 8, 8, "RGB", False, 64)
+        bike_base = QueueItem(
+            BatchSource(root / "bike_basecolor.png", root),
+            AssetKind.IMAGE,
+            replace(metadata, map_type=TextureMapType.BASECOLOR),
+        )
+        bike_normal = QueueItem(
+            BatchSource(root / "bike_normal.png", root),
+            AssetKind.IMAGE,
+            replace(metadata, map_type=TextureMapType.NORMAL),
+        )
+        car_base = QueueItem(
+            BatchSource(root / "car_basecolor.png", root),
+            AssetKind.IMAGE,
+            replace(metadata, map_type=TextureMapType.BASECOLOR),
+        )
+
+        selected = texture_set_items_for_item(
+            (bike_base, bike_normal, car_base),
+            bike_normal,
+        )
+
+        self.assertEqual(
+            {"bike_basecolor.png", "bike_normal.png"},
+            {item.path.name for item in selected},
+        )
+
+    def test_pbr_preview_prepares_orm_channels_for_gpu(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orm_path = root / "bike_orm.png"
+            Image.new("RGB", (8, 8), (64, 128, 240)).save(orm_path)
+            source = PbrTextureSource(
+                orm_path,
+                TextureMapType.UNKNOWN,
+                ChannelPackLayout.ORM,
+            )
+            material = PbrPreviewService().load((source,))
+
+            self.assertEqual(
+                (128, 240, 64, 255),
+                material.properties.getpixel((4, 4)),
+            )
+
+    def test_pbr_preview_converts_directx_normal_for_display(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normal_path = root / "bike_normal_dx.png"
+            Image.new("RGB", (8, 8), (128, 32, 255)).save(normal_path)
+            source = PbrTextureSource(normal_path, TextureMapType.NORMAL)
+
+            material = PbrPreviewService().load((source,))
+
+            self.assertEqual((128, 32, 255), material.normal.getpixel((4, 4)))
+            self.assertTrue(material.normal_is_directx)
+
+    def test_pbr_preview_inverts_separate_smoothness(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            smoothness_path = root / "bike_smoothness.png"
+            Image.new("L", (8, 8), 200).save(smoothness_path)
+            source = PbrTextureSource(smoothness_path, TextureMapType.SMOOTHNESS)
+
+            material = PbrPreviewService().load((source,))
+
+            self.assertEqual(55, material.properties.getpixel((4, 4))[0])
 
 
 class NodeGraphExecutorPerformanceTests(unittest.TestCase):
@@ -3139,6 +3215,44 @@ class GraphEditorFoundationTests(unittest.TestCase):
             self.assertLessEqual(window.minimumSizeHint().width(), 1200)
             self.assertLessEqual(window.top_toolbar.minimumSizeHint().width(), 900)
             self.assertLessEqual(window.preview_panel.minimumSizeHint().width(), 260)
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_pbr_preview_is_available_from_queue_and_view_menu(self) -> None:
+        window = MainWindow()
+        try:
+            self.assertEqual("PBR Preview", window.queue_panel.pbr_preview_button.text())
+            self.assertEqual("PBR Preview", window.pbr_preview_dock.windowTitle())
+            self.assertIn(
+                window.pbr_preview_dock.toggleViewAction(),
+                window.view_menu.actions(),
+            )
+            self.assertEqual(2, window.pbr_preview_panel.geometry_combo.count())
+            self.assertEqual(6, window.pbr_preview_panel.solo_combo.count())
+            self.assertEqual(
+                "PbrOpenGLWidget",
+                type(window.pbr_preview_panel.gl_preview).__name__,
+            )
+            window.pbr_preview_panel.gl_preview.set_light_orientation(75.0, 30.0)
+            self.assertEqual(75.0, window.pbr_preview_panel.gl_preview._light_rotation)
+            self.assertEqual(30.0, window.pbr_preview_panel.gl_preview._light_elevation)
+            window.pbr_preview_panel.gl_preview.set_object_rotation(45.0, -20.0)
+            self.assertEqual(45.0, window.pbr_preview_panel.gl_preview._rotation_yaw)
+            self.assertEqual(-20.0, window.pbr_preview_panel.gl_preview._rotation_pitch)
+            window.pbr_preview_panel.gl_preview.reset_object_rotation()
+            self.assertEqual(0.0, window.pbr_preview_panel.gl_preview._rotation_yaw)
+            self.assertEqual(0.0, window.pbr_preview_panel.gl_preview._rotation_pitch)
+            window.pbr_preview_panel.gl_preview.set_zoom(1.5)
+            self.assertEqual(1.5, window.pbr_preview_panel.gl_preview.zoom)
+            window.pbr_preview_panel.gl_preview.set_pan(0.25, -0.4)
+            self.assertEqual(0.25, window.pbr_preview_panel.gl_preview._pan_x)
+            self.assertEqual(-0.4, window.pbr_preview_panel.gl_preview._pan_y)
+            window.pbr_preview_panel.gl_preview.reset_object_view()
+            self.assertEqual(1.0, window.pbr_preview_panel.gl_preview.zoom)
+            self.assertEqual(0.0, window.pbr_preview_panel.gl_preview._pan_x)
+            self.assertEqual(0.0, window.pbr_preview_panel.gl_preview._pan_y)
         finally:
             window.setParent(None)
             window.deleteLater()
