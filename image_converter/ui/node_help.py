@@ -301,6 +301,33 @@ NODE_HELP_CONTENT: dict[NodeType, NodeHelpContent] = {
         ),
         note="Используйте display flag, чтобы вывести эту ноду в Preview.",
     ),
+    NodeType.PBR_SHADER: NodeHelpContent(
+        title="PBR Shader",
+        summary="Собирает карты материала и отправляет их в интерактивный GPU PBR Preview.",
+        details=(
+            ("Base Color / Normal / Emissive", "Полноцветные карты материала."),
+            (
+                "Packed / Mask",
+                "Декодируется как Unity URP/HDRP либо Unreal ORM/MRA/RMA по Workflow.",
+            ),
+            (
+                "AO / Roughness / Smoothness / Metallic / Opacity",
+                "Отдельные каналы имеют приоритет над Packed / Mask.",
+            ),
+            (
+                "Normal Input",
+                "From Workflow использует OpenGL Y+ для Unity и DirectX Y− для Unreal.",
+            ),
+            (
+                "Normal Check",
+                "Слева показывает ожидаемый workflow, справа тот же материал с Flip Green.",
+            ),
+        ),
+        note=(
+            "Roughness и Smoothness нельзя подключать одновременно. Display flag и двойной "
+            "клик открывают PBR Preview; upstream-изменения обновляют его автоматически."
+        ),
+    ),
     NodeType.OUTPUT_RGBA: NodeHelpContent(
         title="Output",
         summary="Формирует и экспортирует итоговое RGB или RGBA-изображение.",

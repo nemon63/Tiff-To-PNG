@@ -116,6 +116,7 @@ from image_converter.services.node_graph_executor import (
 from image_converter.services.node_graph_project import NodeGraphProjectRepository
 from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.packing import PACK_LAYOUTS, PackSourceCandidate
+from image_converter.services.pbr_preview import PbrMaterialData
 from image_converter.application.path_search import (
     MissingTextureSearchController,
     MissingTextureSearchRequest,
@@ -277,19 +278,37 @@ class GraphPreviewWorker(QObject):
         try:
             executor = NodeGraphExecutor()
             preview_cache = self._preview_cache or NodeGraphPreviewCache(max_side=self._max_side)
-            image, meta = executor.render_display_node(
-                self._project.graph,
-                self._node,
-                preview_cache=preview_cache,
-                max_side=self._max_side,
-            )
-            if self._mode_label:
+            if self._node.node_type is NodeType.PBR_SHADER:
+                result = executor.render_pbr_material_node(
+                    self._project.graph,
+                    self._node,
+                    preview_cache=preview_cache,
+                    max_side=self._max_side,
+                )
+                meta = f"{result.workflow_label} · {result.normal_status}"
+            else:
+                result, meta = executor.render_display_node(
+                    self._project.graph,
+                    self._node,
+                    preview_cache=preview_cache,
+                    max_side=self._max_side,
+                )
+            if self._mode_label and not isinstance(result, PbrMaterialData):
                 filename = str(self._node.properties.get("filename", "")).strip()
                 if self._node.properties.get("output_path"):
                     filename = Path(str(self._node.properties.get("output_path"))).name
                 suffix = f" · {filename}" if filename else ""
-                meta = f"Output preview · {image.width}x{image.height} · {self._mode_label}{suffix}"
-            self.finished.emit(self._generation, image, self._node.title, meta, self._node.node_id)
+                meta = (
+                    f"Output preview · {result.width}x{result.height} · "
+                    f"{self._mode_label}{suffix}"
+                )
+            self.finished.emit(
+                self._generation,
+                result,
+                self._node.title,
+                meta,
+                self._node.node_id,
+            )
         except (GraphExecutionError, OSError, ValueError) as exc:
             self.failed.emit(
                 self._generation,
@@ -305,6 +324,7 @@ class GraphWorkspace(QWidget):
     export_requested = pyqtSignal()
     output_export_requested = pyqtSignal(object)
     preview_image_requested = pyqtSignal(object, str, str, str)
+    pbr_material_requested = pyqtSignal(object, str, str, str)
     preview_failed = pyqtSignal(str, str, str)
     status_message = pyqtSignal(str)
     watched_paths_changed = pyqtSignal(tuple)
@@ -960,6 +980,9 @@ class GraphWorkspace(QWidget):
 
     def add_output_node(self) -> None:
         self.add_node_of_type(NodeType.OUTPUT_RGBA)
+
+    def add_pbr_shader_node(self) -> None:
+        self.add_node_of_type(NodeType.PBR_SHADER)
 
     def auto_layout_nodes(self) -> None:
         nodes = list(self.project.graph.nodes)
@@ -2365,6 +2388,9 @@ class GraphWorkspace(QWidget):
         if node.node_type is NodeType.OUTPUT_RGBA:
             self._preview_output_node(node)
             return
+        if node.node_type is NodeType.PBR_SHADER:
+            self._preview_display_node(node)
+            return
         if node.node_type is NodeType.VIEW:
             self._preview_view_node(node)
 
@@ -2599,7 +2625,10 @@ class GraphWorkspace(QWidget):
             if pending is not None:
                 self._restart_pending_preview(pending)
             return
-        self.preview_image_requested.emit(image, title, meta, node_id)
+        if isinstance(image, PbrMaterialData):
+            self.pbr_material_requested.emit(image, title, meta, node_id)
+        else:
+            self.preview_image_requested.emit(image, title, meta, node_id)
         if pending is not None:
             self._restart_pending_preview(pending)
 

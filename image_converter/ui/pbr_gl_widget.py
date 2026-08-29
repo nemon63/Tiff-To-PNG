@@ -22,6 +22,7 @@ from image_converter.services.pbr_preview import (
     PBR_SOLO_BEAUTY,
     PBR_SOLO_METALLIC,
     PBR_SOLO_NORMAL,
+    PBR_SOLO_NORMAL_CHECK,
     PBR_SOLO_ROUGHNESS,
     PbrMaterialData,
 )
@@ -154,7 +155,10 @@ void main()
     vec3 normalSample = texture2D(uNormal, uv).rgb;
     vec4 properties = texture2D(uProperties, uv);
     vec3 emissiveSample = texture2D(uEmissive, uv).rgb;
-    if (uDirectXNormal == 1)
+    bool flipGreen = uDirectXNormal == 1;
+    if (uSolo == 6 && vPosition.x > 0.0)
+        flipGreen = !flipGreen;
+    if (flipGreen)
         normalSample.g = 1.0 - normalSample.g;
 
     vec3 color;
@@ -210,7 +214,10 @@ void main()
     }
 
     float opacity = properties.a * baseSample.a;
-    gl_FragColor = vec4(mix(background, color, opacity), 1.0);
+    vec3 finalColor = mix(background, color, opacity);
+    if (uSolo == 6 && abs(vPosition.x) < 0.0035)
+        finalColor = vec3(0.22, 0.68, 1.0);
+    gl_FragColor = vec4(finalColor, 1.0);
 }
 """
 
@@ -228,6 +235,7 @@ class PbrOpenGLWidget(QOpenGLWidget):
         PBR_SOLO_ROUGHNESS: 3,
         PBR_SOLO_METALLIC: 4,
         PBR_SOLO_AO: 5,
+        PBR_SOLO_NORMAL_CHECK: 6,
     }
 
     def __init__(self, parent=None):

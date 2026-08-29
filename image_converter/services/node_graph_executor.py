@@ -23,12 +23,20 @@ from image_converter.domain.node_graph import (
     NodeType,
     OutputAlphaInputMode,
     OutputMode,
+    PbrWorkflow,
     SocketDirection,
     SocketType,
     socket_definitions,
 )
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
-from image_converter.services.material_validation import graph_roughness_glossiness_issues
+from image_converter.services.material_validation import (
+    NORMAL_ORIENTATION_DIRECTX,
+    graph_normal_orientation_issues,
+    graph_roughness_glossiness_issues,
+    pbr_expected_normal_orientation,
+    trace_pbr_normal_orientation,
+)
+from image_converter.services.pbr_preview import PbrMaterialData
 from image_converter.services.pipeline import RESAMPLING_LANCZOS
 
 Logger = Callable[[str], None]
@@ -493,6 +501,220 @@ class NodeGraphExecutor:
 
         return self._compose_output_image(graph, output_node, target_size, cache)
 
+    def render_pbr_material_node(
+        self,
+        graph: NodeGraph,
+        shader_node: GraphNode,
+        *,
+        preview_cache: NodeGraphPreviewCache | None = None,
+        fallback_size: tuple[int, int] = (512, 512),
+        max_side: int = 2048,
+    ) -> PbrMaterialData:
+        self._prepare_lookup(graph)
+        if shader_node.node_type is not NodeType.PBR_SHADER:
+            raise GraphExecutionError(f"{shader_node.title}: node is not a PBR Shader.")
+        cache = preview_cache or NodeGraphPreviewCache(max_side=max_side)
+        connections = {
+            socket_id: self._incoming_connection(
+                graph,
+                target_node_id=shader_node.node_id,
+                target_socket_id=socket_id,
+            )
+            for socket_id in (
+                "basecolor",
+                "normal",
+                "emissive",
+                "packed",
+                "ao",
+                "roughness",
+                "smoothness",
+                "metallic",
+                "opacity",
+            )
+        }
+        if not any(connections.values()):
+            raise GraphExecutionError("PBR Shader не содержит подключённых карт.")
+        if connections["roughness"] is not None and connections["smoothness"] is not None:
+            raise GraphExecutionError(
+                "подключены одновременно Roughness и Smoothness; оставьте один вход"
+            )
+
+        reference = next(
+            connection
+            for socket_id in (
+                "basecolor",
+                "normal",
+                "packed",
+                "emissive",
+                "roughness",
+                "smoothness",
+                "metallic",
+                "ao",
+                "opacity",
+            )
+            if (connection := connections[socket_id]) is not None
+        )
+        target_size = self._preview_target_size(
+            graph,
+            reference,
+            cache,
+            fallback_size,
+            max_side,
+        )
+
+        def image_input(socket_id: str) -> Image.Image | None:
+            connection = connections[socket_id]
+            if connection is None:
+                return None
+            return self._evaluate_image_socket(
+                graph,
+                connection,
+                target_size,
+                set(),
+                cache,
+            )
+
+        def channel_input(socket_id: str) -> Image.Image | None:
+            connection = connections[socket_id]
+            if connection is None:
+                return None
+            return self._evaluate_channel_socket_cached(
+                graph,
+                connection,
+                target_size,
+                set(),
+                cache,
+            ).convert("L")
+
+        try:
+            workflow = PbrWorkflow(
+                str(shader_node.properties.get("workflow", PbrWorkflow.TRADITIONAL.value))
+            )
+        except ValueError:
+            workflow = PbrWorkflow.TRADITIONAL
+
+        basecolor = image_input("basecolor")
+        normal = image_input("normal")
+        emissive = image_input("emissive")
+        packed = image_input("packed")
+        if packed is not None and workflow is PbrWorkflow.TRADITIONAL:
+            raise GraphExecutionError(
+                "Packed / Mask подключён, но Traditional workflow не задаёт схему каналов"
+            )
+
+        roughness: Image.Image | None = None
+        metallic: Image.Image | None = None
+        ao: Image.Image | None = None
+        if packed is not None:
+            red, green, blue, alpha = packed.convert("RGBA").split()
+            if workflow is PbrWorkflow.UNITY_URP:
+                metallic, roughness = red, ImageOps.invert(alpha)
+            elif workflow is PbrWorkflow.UNITY_HDRP:
+                metallic, ao, roughness = red, green, ImageOps.invert(alpha)
+            elif workflow is PbrWorkflow.UNREAL_ORM:
+                ao, roughness, metallic = red, green, blue
+            elif workflow is PbrWorkflow.UNREAL_MRA:
+                metallic, roughness, ao = red, green, blue
+            elif workflow is PbrWorkflow.UNREAL_RMA:
+                roughness, metallic, ao = red, green, blue
+
+        explicit_roughness = channel_input("roughness")
+        explicit_smoothness = channel_input("smoothness")
+        if explicit_roughness is not None:
+            roughness = explicit_roughness
+        elif explicit_smoothness is not None:
+            roughness = ImageOps.invert(explicit_smoothness)
+        explicit_metallic = channel_input("metallic")
+        explicit_ao = channel_input("ao")
+        if explicit_metallic is not None:
+            metallic = explicit_metallic
+        if explicit_ao is not None:
+            ao = explicit_ao
+        opacity = channel_input("opacity")
+
+        if basecolor is None:
+            basecolor = Image.new("RGBA", target_size, (160, 160, 160, 255))
+        else:
+            basecolor = basecolor.convert("RGBA")
+        if normal is None:
+            normal = Image.new("RGB", target_size, (128, 128, 255))
+        else:
+            normal = normal.convert("RGB")
+        if emissive is None:
+            emissive = Image.new("RGB", target_size, (0, 0, 0))
+        else:
+            emissive = emissive.convert("RGB")
+        if roughness is None:
+            roughness = Image.new("L", target_size, 128)
+        if metallic is None:
+            metallic = Image.new("L", target_size, 0)
+        if ao is None:
+            ao = Image.new("L", target_size, 255)
+        if opacity is None:
+            opacity = Image.new("L", target_size, 255)
+
+        expected = pbr_expected_normal_orientation(shader_node)
+        detected, source_path = trace_pbr_normal_orientation(graph, shader_node)
+        resolved = expected or detected
+        if expected is not None and detected is not None and expected != detected:
+            normal_status = (
+                f"Conflict: workflow expects {self._normal_orientation_label(expected)}, "
+                f"branch is {self._normal_orientation_label(detected)}"
+            )
+        elif detected is not None:
+            normal_status = (
+                f"Detected {self._normal_orientation_label(detected)}"
+                + (f" from {source_path.name}" if source_path is not None else "")
+            )
+        elif expected is not None:
+            normal_status = (
+                f"Expected {self._normal_orientation_label(expected)}; source orientation unknown"
+            )
+        else:
+            normal_status = "Normal orientation unknown; use Normal Check"
+
+        workflow_label = self._pbr_workflow_label(workflow)
+        used_labels = tuple(
+            label
+            for socket_id, label in (
+                ("basecolor", "Base Color"),
+                ("normal", "Normal"),
+                ("emissive", "Emissive"),
+                ("packed", f"{workflow_label} Packed"),
+                ("ao", "AO override"),
+                ("roughness", "Roughness override"),
+                ("smoothness", "Smoothness override"),
+                ("metallic", "Metallic override"),
+                ("opacity", "Opacity"),
+            )
+            if connections[socket_id] is not None
+        )
+        return PbrMaterialData(
+            basecolor=basecolor,
+            normal=normal,
+            properties=Image.merge("RGBA", (roughness, metallic, ao, opacity)),
+            emissive=emissive,
+            normal_is_directx=resolved == NORMAL_ORIENTATION_DIRECTX,
+            used_labels=used_labels,
+            workflow_label=workflow_label,
+            normal_status=normal_status,
+        )
+
+    @staticmethod
+    def _pbr_workflow_label(workflow: PbrWorkflow) -> str:
+        return {
+            PbrWorkflow.TRADITIONAL: "Traditional",
+            PbrWorkflow.UNITY_URP: "Unity URP",
+            PbrWorkflow.UNITY_HDRP: "Unity HDRP",
+            PbrWorkflow.UNREAL_ORM: "Unreal ORM",
+            PbrWorkflow.UNREAL_MRA: "Unreal MRA",
+            PbrWorkflow.UNREAL_RMA: "Unreal RMA",
+        }[workflow]
+
+    @staticmethod
+    def _normal_orientation_label(orientation: str) -> str:
+        return "DirectX Y−" if orientation == NORMAL_ORIENTATION_DIRECTX else "OpenGL Y+"
+
     def render_view_node(
         self,
         graph: NodeGraph,
@@ -563,9 +785,12 @@ class NodeGraphExecutor:
         self._prepare_lookup(graph)
         nodes_by_id = {node.node_id: node for node in graph.nodes}
         node_ids = set(nodes_by_id)
+        preview_nodes = [
+            node for node in graph.nodes if node.node_type is NodeType.PBR_SHADER
+        ]
         active_node_ids = self._nodes_upstream_of_outputs(
             graph,
-            self._enabled_output_nodes(graph),
+            (*self._enabled_output_nodes(graph), *preview_nodes),
         )
         validation_size_cache = NodeGraphPreviewCache(max_bytes=8 * 1024 * 1024)
 
@@ -620,6 +845,26 @@ class NodeGraphExecutor:
                             "this Output.",
                             node.node_id,
                             ",".join(overrides),
+                        )
+                    )
+            if node.node_type is NodeType.PBR_SHADER:
+                roughness = self._incoming_connection(
+                    graph,
+                    target_node_id=node.node_id,
+                    target_socket_id="roughness",
+                )
+                smoothness = self._incoming_connection(
+                    graph,
+                    target_node_id=node.node_id,
+                    target_socket_id="smoothness",
+                )
+                if roughness is not None and smoothness is not None:
+                    issues.append(
+                        GraphValidationIssue(
+                            GraphValidationSeverity.ERROR,
+                            f"{node.title}: Roughness и Smoothness подключены одновременно.",
+                            node.node_id,
+                            "roughness,smoothness",
                         )
                     )
             required_inputs = ()
@@ -688,6 +933,17 @@ class NodeGraphExecutor:
                     NodeType.MIX_IMAGE: ("a", "b", "mask"),
                     NodeType.BLEND_IMAGE: ("a", "b", "mask"),
                     NodeType.SET_ALPHA: ("image", "alpha"),
+                    NodeType.PBR_SHADER: (
+                        "basecolor",
+                        "normal",
+                        "emissive",
+                        "packed",
+                        "ao",
+                        "roughness",
+                        "smoothness",
+                        "metallic",
+                        "opacity",
+                    ),
                     NodeType.OUTPUT_RGBA: ("image", "r", "g", "b", "a"),
                 }.get(node.node_type, ())
                 input_sizes: list[tuple[str, tuple[int, int]]] = []
@@ -816,6 +1072,7 @@ class NodeGraphExecutor:
             )
 
         issues.extend(graph_roughness_glossiness_issues(graph))
+        issues.extend(graph_normal_orientation_issues(graph))
 
         deduped: dict[tuple[str, str, str], GraphValidationIssue] = {}
         for issue in issues:

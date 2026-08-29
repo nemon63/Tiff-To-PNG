@@ -27,6 +27,8 @@ from image_converter.domain.node_graph import (
     OutputAlphaInputMode,
     OutputMode,
     OutputProfile,
+    PbrNormalConvention,
+    PbrWorkflow,
     TextureDataRole,
     TextureNodeColorSpace,
     node_has_enable_flag,
@@ -411,6 +413,34 @@ class NodePropertiesPanel(QWidget):
         self.output_path_host.setLayout(output_path_row)
         self.form.addRow("Output File", self.output_path_host)
 
+        self.pbr_workflow_combo = QComboBox()
+        for label, value in (
+            ("Traditional / Separate Maps", PbrWorkflow.TRADITIONAL.value),
+            ("Unity URP", PbrWorkflow.UNITY_URP.value),
+            ("Unity HDRP", PbrWorkflow.UNITY_HDRP.value),
+            ("Unreal ORM", PbrWorkflow.UNREAL_ORM.value),
+            ("Unreal MRA", PbrWorkflow.UNREAL_MRA.value),
+            ("Unreal RMA", PbrWorkflow.UNREAL_RMA.value),
+        ):
+            self.pbr_workflow_combo.addItem(label, value)
+        self.pbr_workflow_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Workflow", self.pbr_workflow_combo)
+
+        self.pbr_normal_convention_combo = QComboBox()
+        self.pbr_normal_convention_combo.addItem(
+            "From Workflow", PbrNormalConvention.WORKFLOW.value
+        )
+        self.pbr_normal_convention_combo.addItem(
+            "OpenGL Y+", PbrNormalConvention.OPENGL.value
+        )
+        self.pbr_normal_convention_combo.addItem(
+            "DirectX Y−", PbrNormalConvention.DIRECTX.value
+        )
+        self.pbr_normal_convention_combo.currentIndexChanged.connect(
+            self._apply_changes
+        )
+        self.form.addRow("Normal Input", self.pbr_normal_convention_combo)
+
         self.output_profile_combo = QComboBox()
         for label, value in (
             ("Generic RGBA", OutputProfile.GENERIC_RGBA.value),
@@ -577,6 +607,19 @@ class NodePropertiesPanel(QWidget):
                 self.output_profile_combo,
                 str(node.properties.get("profile", OutputProfile.GENERIC_RGBA.value)),
             )
+            self._set_combo_value(
+                self.pbr_workflow_combo,
+                str(node.properties.get("workflow", PbrWorkflow.TRADITIONAL.value)),
+            )
+            self._set_combo_value(
+                self.pbr_normal_convention_combo,
+                str(
+                    node.properties.get(
+                        "normal_convention",
+                        PbrNormalConvention.WORKFLOW.value,
+                    )
+                ),
+            )
             self.enabled_checkbox.setChecked(bool(node.properties.get("enabled", True)))
             mode_value = str(node.properties.get("mode", OutputMode.RGBA.value))
             self._set_combo_value(self.mode_combo, mode_value, fallback_index=1)
@@ -641,6 +684,11 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.mask_mode_combo, node_type is NodeType.SET_ALPHA)
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.output_path_host, node_type is NodeType.OUTPUT_RGBA)
+        self._set_row_visible(self.pbr_workflow_combo, node_type is NodeType.PBR_SHADER)
+        self._set_row_visible(
+            self.pbr_normal_convention_combo,
+            node_type is NodeType.PBR_SHADER,
+        )
         self._set_row_visible(self.output_profile_combo, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.profile_actions_host, node_type is NodeType.OUTPUT_RGBA)
         self._set_row_visible(self.profile_summary_label, node_type is NodeType.OUTPUT_RGBA)
@@ -680,6 +728,10 @@ class NodePropertiesPanel(QWidget):
             NodeType.OUTPUT_RGBA: (
                 "Image supplies the RGBA base. R, G and B replace individual base channels. "
                 "A multiplies Image alpha by default, so existing transparency is preserved."
+            ),
+            NodeType.PBR_SHADER: (
+                "Builds an interactive GPU material preview from separate or packed maps. "
+                "Workflow controls packed channels and Normal Map orientation."
             ),
         }.get(node_type, "")
 
@@ -1034,6 +1086,15 @@ class NodePropertiesPanel(QWidget):
             )
             next_properties["mask_filter"] = str(
                 self.mask_filter_combo.currentData() or "bilinear"
+            )
+        elif self._node.node_type is NodeType.PBR_SHADER:
+            next_properties["workflow"] = str(
+                self.pbr_workflow_combo.currentData()
+                or PbrWorkflow.TRADITIONAL.value
+            )
+            next_properties["normal_convention"] = str(
+                self.pbr_normal_convention_combo.currentData()
+                or PbrNormalConvention.WORKFLOW.value
             )
         elif self._node.node_type is NodeType.OUTPUT_RGBA:
             filename_text = self.filename_edit.text().strip() or "packed.png"

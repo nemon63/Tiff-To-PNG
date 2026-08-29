@@ -23,6 +23,7 @@ PBR_SOLO_NORMAL = "normal"
 PBR_SOLO_ROUGHNESS = "roughness"
 PBR_SOLO_METALLIC = "metallic"
 PBR_SOLO_AO = "ao"
+PBR_SOLO_NORMAL_CHECK = "normal_check"
 
 PBR_NORMAL_AUTO = "auto"
 PBR_NORMAL_OPENGL = "opengl"
@@ -54,6 +55,8 @@ class PbrMaterialData:
     emissive: Image.Image
     normal_is_directx: bool
     used_labels: tuple[str, ...]
+    workflow_label: str = ""
+    normal_status: str = ""
 
     @property
     def size(self) -> tuple[int, int]:

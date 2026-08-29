@@ -296,6 +296,10 @@ class GraphNodeItem(QGraphicsRectItem):
                 self.color_swatch_item.setBrush(self._node_color())
                 subtitle_text = self._node_color_hex()
                 subtitle_x = 60
+            elif self.node.node_type is NodeType.PBR_SHADER:
+                subtitle_text = str(
+                    self.node.properties.get("workflow", "traditional")
+                ).replace("_", " ")
             self.subtitle_item = QGraphicsSimpleTextItem(subtitle_text, self)
             self.subtitle_item.setBrush(QColor("#8E9AA8"))
             self.subtitle_item.setPos(subtitle_x, TITLE_HEIGHT + 6)
@@ -539,6 +543,12 @@ class GraphNodeItem(QGraphicsRectItem):
                 self.subtitle_item.setText(self._node_color_hex())
                 if self.color_swatch_item is not None:
                     self.color_swatch_item.setBrush(self._node_color())
+            elif self.node.node_type is NodeType.PBR_SHADER:
+                self.subtitle_item.setText(
+                    str(self.node.properties.get("workflow", "traditional")).replace(
+                        "_", " "
+                    )
+                )
             else:
                 self.subtitle_item.setText(self.node.node_type.value)
 
@@ -1352,6 +1362,13 @@ class GraphView(QGraphicsView):
             self._add_node_menu_action(utility_menu, "View", NodeType.VIEW, scene_position, wire_port)
 
             output_menu = menu.addMenu("Output")
+            self._add_node_menu_action(
+                output_menu,
+                "PBR Shader",
+                NodeType.PBR_SHADER,
+                scene_position,
+                wire_port,
+            )
             self._add_node_menu_action(output_menu, "Output RGBA", NodeType.OUTPUT_RGBA, scene_position, wire_port)
 
         menu.addSeparator()

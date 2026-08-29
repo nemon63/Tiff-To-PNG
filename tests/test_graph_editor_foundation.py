@@ -54,6 +54,7 @@ from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.colorspace import item_preflight_warnings
 from image_converter.services.material_validation import (
     detect_normal_map_orientation,
+    graph_normal_orientation_issues,
     graph_roughness_glossiness_issues,
     texture_set_items_for_item,
     texture_set_pair_warnings,
@@ -66,6 +67,7 @@ from image_converter.services.node_graph_executor import (
 )
 from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
 from image_converter.services.pbr_preview import (
+    PBR_SOLO_NORMAL_CHECK,
     PbrPreviewService,
     PbrTextureSource,
 )
@@ -677,6 +679,90 @@ class PbrPreviewTests(unittest.TestCase):
             material = PbrPreviewService().load((source,))
 
             self.assertEqual(55, material.properties.getpixel((4, 4))[0])
+
+    def test_graph_pbr_shader_decodes_unreal_orm_and_separate_override(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_path = root / "bike_basecolor.png"
+            normal_path = root / "bike_normal_dx.png"
+            packed_path = root / "bike_orm.png"
+            roughness_path = root / "bike_roughness.png"
+            Image.new("RGB", (8, 8), (120, 80, 40)).save(base_path)
+            Image.new("RGB", (8, 8), (128, 96, 255)).save(normal_path)
+            Image.new("RGB", (8, 8), (64, 128, 240)).save(packed_path)
+            Image.new("L", (8, 8), 32).save(roughness_path)
+
+            base = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(base_path)})
+            normal = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(normal_path)})
+            packed = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(packed_path)})
+            roughness = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(roughness_path)},
+            )
+            shader = create_graph_node(
+                NodeType.PBR_SHADER,
+                properties={"workflow": "unreal_orm"},
+            )
+            graph = NodeGraph(
+                nodes=[base, normal, packed, roughness, shader],
+                connections=[
+                    GraphConnection("c1", base.node_id, "image", shader.node_id, "basecolor"),
+                    GraphConnection("c2", normal.node_id, "image", shader.node_id, "normal"),
+                    GraphConnection("c3", packed.node_id, "image", shader.node_id, "packed"),
+                    GraphConnection("c4", roughness.node_id, "r", shader.node_id, "roughness"),
+                ],
+            )
+
+            material = NodeGraphExecutor().render_pbr_material_node(graph, shader)
+
+            self.assertEqual((32, 240, 64, 255), material.properties.getpixel((4, 4)))
+            self.assertTrue(material.normal_is_directx)
+            self.assertEqual("Unreal ORM", material.workflow_label)
+
+    def test_graph_pbr_shader_warns_when_unreal_receives_opengl_normal(self) -> None:
+        normal = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            properties={"path": "D:/textures/bike_normal_gl.png"},
+        )
+        shader = create_graph_node(
+            NodeType.PBR_SHADER,
+            properties={"workflow": "unreal_orm"},
+        )
+        graph = NodeGraph(
+            nodes=[normal, shader],
+            connections=[
+                GraphConnection("c1", normal.node_id, "image", shader.node_id, "normal")
+            ],
+        )
+
+        issues = graph_normal_orientation_issues(graph)
+
+        self.assertEqual(1, len(issues))
+        self.assertIn("DirectX", issues[0].message)
+        self.assertIn("OpenGL", issues[0].message)
+
+    def test_graph_pbr_shader_tracks_flip_green_before_unity(self) -> None:
+        normal = create_graph_node(
+            NodeType.TEXTURE_INPUT,
+            properties={"path": "D:/textures/bike_normal_dx.png"},
+        )
+        flip = create_graph_node(
+            NodeType.NORMAL_MAP,
+            properties={"flip_green": True},
+        )
+        shader = create_graph_node(
+            NodeType.PBR_SHADER,
+            properties={"workflow": "unity_hdrp"},
+        )
+        graph = NodeGraph(
+            nodes=[normal, flip, shader],
+            connections=[
+                GraphConnection("c1", normal.node_id, "image", flip.node_id, "image"),
+                GraphConnection("c2", flip.node_id, "out", shader.node_id, "normal"),
+            ],
+        )
+
+        self.assertEqual((), graph_normal_orientation_issues(graph))
 
 
 class NodeGraphExecutorPerformanceTests(unittest.TestCase):
@@ -1868,6 +1954,25 @@ class NodePropertiesPanelTests(unittest.TestCase):
         self.app.processEvents()
         del self.panel
         gc.collect()
+
+    def test_pbr_shader_shows_and_updates_workflow_controls(self) -> None:
+        node = create_graph_node(NodeType.PBR_SHADER)
+        self.panel.set_node(node)
+        changes: list[dict] = []
+        self.panel.node_changed.connect(
+            lambda _node, _title, properties, _rebuild, _mode: changes.append(
+                properties
+            )
+        )
+
+        self.assertFalse(self.panel.pbr_workflow_combo.isHidden())
+        self.assertFalse(self.panel.pbr_normal_convention_combo.isHidden())
+        self.panel.pbr_workflow_combo.setCurrentIndex(3)
+        self.panel.pbr_normal_convention_combo.setCurrentIndex(2)
+
+        self.assertTrue(changes)
+        self.assertEqual("unreal_orm", changes[-1]["workflow"])
+        self.assertEqual("directx", changes[-1]["normal_convention"])
 
     def test_slider_drag_emits_draft_then_full_preview(self) -> None:
         node = create_graph_node(NodeType.LEVELS_CHANNEL)
@@ -3230,7 +3335,14 @@ class GraphEditorFoundationTests(unittest.TestCase):
                 window.view_menu.actions(),
             )
             self.assertEqual(2, window.pbr_preview_panel.geometry_combo.count())
-            self.assertEqual(6, window.pbr_preview_panel.solo_combo.count())
+            self.assertEqual(7, window.pbr_preview_panel.solo_combo.count())
+            normal_check_index = window.pbr_preview_panel.solo_combo.findData(
+                PBR_SOLO_NORMAL_CHECK
+            )
+            window.pbr_preview_panel.solo_combo.setCurrentIndex(normal_check_index)
+            self.assertFalse(window.pbr_preview_panel.normal_check_label.isHidden())
+            self.assertIn("ЛЕВАЯ ПОЛОВИНА", window.pbr_preview_panel.normal_check_label.text())
+            self.assertIn("ПРАВАЯ ПОЛОВИНА", window.pbr_preview_panel.normal_check_label.text())
             self.assertEqual(
                 "PbrOpenGLWidget",
                 type(window.pbr_preview_panel.gl_preview).__name__,

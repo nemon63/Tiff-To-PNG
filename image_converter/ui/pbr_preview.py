@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QShowEvent
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -26,6 +27,7 @@ from image_converter.services.pbr_preview import (
     PBR_SOLO_BEAUTY,
     PBR_SOLO_METALLIC,
     PBR_SOLO_NORMAL,
+    PBR_SOLO_NORMAL_CHECK,
     PBR_SOLO_ROUGHNESS,
     PbrMaterialData,
     PbrPreviewSettings,
@@ -77,6 +79,7 @@ class PbrPreviewPanel(QWidget):
             ("Beauty", PBR_SOLO_BEAUTY),
             ("Base Color", PBR_SOLO_BASECOLOR),
             ("Normal", PBR_SOLO_NORMAL),
+            ("Normal Check", PBR_SOLO_NORMAL_CHECK),
             ("Roughness", PBR_SOLO_ROUGHNESS),
             ("Metallic", PBR_SOLO_METALLIC),
             ("AO", PBR_SOLO_AO),
@@ -102,6 +105,13 @@ class PbrPreviewPanel(QWidget):
             "ЛКМ: вращение. СКМ: перемещение. Ctrl+ЛКМ: свет. Колесо: масштаб."
         )
         self.gl_preview.initialization_failed.connect(self._on_gl_failed)
+
+        self.normal_check_label = QLabel("")
+        self.normal_check_label.setObjectName("PreviewFileName")
+        self.normal_check_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.normal_check_label.setWordWrap(True)
+        self.normal_check_label.hide()
+        layout.addWidget(self.normal_check_label)
         layout.addWidget(self.gl_preview, 1)
 
         navigation_hint = QLabel(
@@ -134,6 +144,7 @@ class PbrPreviewPanel(QWidget):
         self._controller.invalidate()
         self.gl_preview.set_material(None)
         self.refresh_button.setEnabled(bool(sources))
+        self.refresh_button.setToolTip("Перечитать карты выбранного Texture Set.")
         if not sources:
             self.set_label.setText("Texture Set не выбран")
             self.meta_label.setText("Добавьте и выберите распознанные PBR-карты.")
@@ -148,6 +159,25 @@ class PbrPreviewPanel(QWidget):
 
     def current_sources(self) -> tuple[PbrTextureSource, ...]:
         return self._sources
+
+    def set_graph_material(
+        self,
+        material: PbrMaterialData,
+        title: str,
+        meta: str,
+    ) -> None:
+        self._sources = ()
+        self._source_revision = ()
+        self._controller.invalidate()
+        self._material = material
+        self.gl_preview.set_material(material)
+        self.set_label.setText(f"Graph PBR: {title}")
+        self.set_label.setToolTip(meta)
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setToolTip(
+            "Graph material обновляется display-флагом и изменениями upstream nodes."
+        )
+        self._update_summary()
 
     @staticmethod
     def _revision_for_sources(
@@ -179,6 +209,7 @@ class PbrPreviewPanel(QWidget):
         self.gl_preview.set_geometry(settings.geometry)
         self.gl_preview.set_solo(settings.solo)
         self.gl_preview.set_normal_convention(settings.normal_convention)
+        self._update_normal_check_label()
         if self._material is not None:
             self._update_summary()
 
@@ -214,8 +245,33 @@ class PbrPreviewPanel(QWidget):
         normal_label = "DirectX → OpenGL" if directx else "OpenGL"
         used = ", ".join(self._material.used_labels) or "fallback values"
         summary = f"GPU · {width}×{height} · {normal_label} · maps: {used}"
+        if self._material.workflow_label:
+            summary = f"{self._material.workflow_label} · {summary}"
+        if self._material.normal_status:
+            summary += f"\n{self._material.normal_status}"
         self.meta_label.setText(summary)
         self.meta_label.setToolTip(summary)
+        self._update_normal_check_label()
+
+    def _update_normal_check_label(self) -> None:
+        if not hasattr(self, "normal_check_label"):
+            return
+        enabled = self.solo_combo.currentData() == PBR_SOLO_NORMAL_CHECK
+        self.normal_check_label.setVisible(enabled)
+        if not enabled:
+            return
+        normal_setting = str(self.normal_combo.currentData() or PBR_NORMAL_AUTO)
+        directx = normal_setting == PBR_NORMAL_DIRECTX or (
+            normal_setting == PBR_NORMAL_AUTO
+            and bool(self._material and self._material.normal_is_directx)
+        )
+        expected = "DirectX Y−" if directx else "OpenGL Y+"
+        flipped = "OpenGL Y+" if directx else "DirectX Y−"
+        workflow = self._material.workflow_label if self._material else "Workflow"
+        self.normal_check_label.setText(
+            f"ЛЕВАЯ ПОЛОВИНА — {workflow}: {expected}    |    "
+            f"ПРАВАЯ ПОЛОВИНА — Flip Green: {flipped}"
+        )
 
     def _on_material_failed(self, generation: int, message: str) -> None:
         if generation != self._generation or generation != self._controller.generation:

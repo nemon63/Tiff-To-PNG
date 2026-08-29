@@ -27,6 +27,7 @@ class NodeType(str, Enum):
     COMBINE_RGBA = "combine_rgba"
     SET_ALPHA = "set_alpha"
     VIEW = "view"
+    PBR_SHADER = "pbr_shader"
     OUTPUT_RGBA = "output_rgba"
 
 
@@ -56,6 +57,21 @@ class OutputProfile(str, Enum):
     UNITY_HDRP = "unity_hdrp"
     UNREAL_ORM = "unreal_orm"
     METAHUMAN_REPACK = "metahuman_repack"
+
+
+class PbrWorkflow(str, Enum):
+    TRADITIONAL = "traditional"
+    UNITY_URP = "unity_urp"
+    UNITY_HDRP = "unity_hdrp"
+    UNREAL_ORM = "unreal_orm"
+    UNREAL_MRA = "unreal_mra"
+    UNREAL_RMA = "unreal_rma"
+
+
+class PbrNormalConvention(str, Enum):
+    WORKFLOW = "workflow"
+    OPENGL = "opengl"
+    DIRECTX = "directx"
 
 
 class TextureNodeColorSpace(str, Enum):
@@ -172,6 +188,7 @@ def node_type_label(node_type: NodeType) -> str:
         NodeType.COMBINE_RGBA: "Combine RGBA",
         NodeType.SET_ALPHA: "Apply Mask",
         NodeType.VIEW: "View",
+        NodeType.PBR_SHADER: "PBR Shader",
         NodeType.OUTPUT_RGBA: "Output",
     }
     return mapping[node_type]
@@ -262,6 +279,11 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
         return {"enabled": True}
     if node_type is NodeType.VIEW:
         return {}
+    if node_type is NodeType.PBR_SHADER:
+        return {
+            "workflow": PbrWorkflow.TRADITIONAL.value,
+            "normal_convention": PbrNormalConvention.WORKFLOW.value,
+        }
     if node_type is NodeType.OUTPUT_RGBA:
         return {
             "filename": "packed.png",
@@ -317,6 +339,7 @@ def resettable_node_property_keys(node_type: NodeType) -> tuple[str, ...]:
             "strength",
         ),
         NodeType.SET_ALPHA: ("mask_mode", "mask_filter"),
+        NodeType.PBR_SHADER: ("workflow", "normal_convention"),
     }
     return mapping.get(node_type, ())
 
@@ -473,6 +496,18 @@ def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
         return (
             GraphSocket("image", "Image", SocketDirection.INPUT, SocketType.IMAGE),
             GraphSocket("in", "In", SocketDirection.INPUT, SocketType.CHANNEL),
+        )
+    if node_type is NodeType.PBR_SHADER:
+        return (
+            GraphSocket("basecolor", "Base Color", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("normal", "Normal", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("emissive", "Emissive", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("packed", "Packed / Mask", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("ao", "AO", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("roughness", "Roughness", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("smoothness", "Smoothness", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("metallic", "Metallic", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("opacity", "Opacity", SocketDirection.INPUT, SocketType.CHANNEL),
         )
     if node_type is NodeType.OUTPUT_RGBA:
         return (

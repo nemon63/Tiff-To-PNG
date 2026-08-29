@@ -93,6 +93,7 @@ from image_converter.services.material_validation import (
     texture_set_items_for_item,
     validate_texture_sets,
 )
+from image_converter.services.pbr_preview import PbrMaterialData
 from image_converter.services.presets import PresetRepository
 from image_converter.services.validation import validate_request
 from image_converter.domain.constants import FILE_DIALOG_FILTER
@@ -201,6 +202,7 @@ class MainWindow(QMainWindow):
         self.graph_workspace.export_requested.connect(self._export_graph)
         self.graph_workspace.output_export_requested.connect(self._export_graph_output)
         self.graph_workspace.preview_image_requested.connect(self._show_graph_preview)
+        self.graph_workspace.pbr_material_requested.connect(self._show_graph_pbr_preview)
         self.graph_workspace.preview_failed.connect(self._show_graph_preview_error)
         self.graph_workspace.status_message.connect(self.set_status)
         self.graph_workspace.status_message.connect(self.append_log)
@@ -698,6 +700,19 @@ class MainWindow(QMainWindow):
         self.preview_panel.set_graph_preview(image, title, meta, node_id=node_id, preserve_zoom=preserve_zoom)
         self.preview_dock.show()
         self.preview_dock.raise_()
+
+    def _show_graph_pbr_preview(
+        self,
+        material: object,
+        title: str,
+        meta: str,
+        _node_id: str,
+    ) -> None:
+        if not isinstance(material, PbrMaterialData):
+            return
+        self.pbr_preview_panel.set_graph_material(material, title, meta)
+        self.pbr_preview_dock.show()
+        self.pbr_preview_dock.raise_()
 
     def _show_graph_preview_error(self, title: str, message: str, node_id: str) -> None:
         self.preview_panel.set_graph_preview_error(title, message, node_id=node_id)

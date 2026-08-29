@@ -19,6 +19,8 @@ from image_converter.domain.node_graph import (
     NodeGraph,
     NodeType,
     OutputProfile,
+    PbrNormalConvention,
+    PbrWorkflow,
 )
 from image_converter.services.map_types import (
     detect_channel_pack_layout,
@@ -347,6 +349,125 @@ def graph_roughness_glossiness_issues(
             )
 
     return tuple(issues)
+
+
+def pbr_expected_normal_orientation(node: GraphNode) -> str | None:
+    try:
+        convention = PbrNormalConvention(
+            str(node.properties.get("normal_convention", PbrNormalConvention.WORKFLOW.value))
+        )
+    except ValueError:
+        convention = PbrNormalConvention.WORKFLOW
+    if convention is PbrNormalConvention.DIRECTX:
+        return NORMAL_ORIENTATION_DIRECTX
+    if convention is PbrNormalConvention.OPENGL:
+        return NORMAL_ORIENTATION_OPENGL
+    try:
+        workflow = PbrWorkflow(
+            str(node.properties.get("workflow", PbrWorkflow.TRADITIONAL.value))
+        )
+    except ValueError:
+        workflow = PbrWorkflow.TRADITIONAL
+    if workflow in (
+        PbrWorkflow.UNREAL_ORM,
+        PbrWorkflow.UNREAL_MRA,
+        PbrWorkflow.UNREAL_RMA,
+    ):
+        return NORMAL_ORIENTATION_DIRECTX
+    if workflow in (PbrWorkflow.UNITY_URP, PbrWorkflow.UNITY_HDRP):
+        return NORMAL_ORIENTATION_OPENGL
+    return None
+
+
+def trace_pbr_normal_orientation(
+    graph: NodeGraph,
+    shader_node: GraphNode,
+) -> tuple[str | None, Path | None]:
+    nodes_by_id = {node.node_id: node for node in graph.nodes}
+    incoming = {
+        (connection.target_node_id, connection.target_socket_id): connection
+        for connection in graph.connections
+    }
+    connection = incoming.get((shader_node.node_id, "normal"))
+    if connection is None:
+        return None, None
+    return _trace_image_normal_orientation(connection, nodes_by_id, incoming, set())
+
+
+def graph_normal_orientation_issues(
+    graph: NodeGraph,
+) -> tuple[GraphValidationIssue, ...]:
+    issues: list[GraphValidationIssue] = []
+    for node in graph.nodes:
+        if node.node_type is not NodeType.PBR_SHADER:
+            continue
+        expected = pbr_expected_normal_orientation(node)
+        detected, source_path = trace_pbr_normal_orientation(graph, node)
+        if expected is None or detected is None or expected == detected:
+            continue
+        expected_label = _normal_orientation_label(expected)
+        detected_label = _normal_orientation_label(detected)
+        source_label = source_path.name if source_path is not None else "Normal branch"
+        issues.append(
+            GraphValidationIssue(
+                GraphValidationSeverity.WARNING,
+                f"{node.title}: workflow ожидает {expected_label}, но ветка "
+                f"'{source_label}' даёт {detected_label}. Добавьте или отключите "
+                "Flip Green в Normal Map node.",
+                node.node_id,
+                "normal",
+            )
+        )
+    return tuple(issues)
+
+
+def _trace_image_normal_orientation(
+    connection: GraphConnection,
+    nodes_by_id: dict[str, GraphNode],
+    incoming: dict[tuple[str, str], GraphConnection],
+    visited: set[tuple[str, str]],
+) -> tuple[str | None, Path | None]:
+    source_key = (connection.source_node_id, connection.source_socket_id)
+    if source_key in visited:
+        return None, None
+    visited.add(source_key)
+    node = nodes_by_id.get(connection.source_node_id)
+    if node is None:
+        return None, None
+    if node.node_type is NodeType.TEXTURE_INPUT:
+        path = Path(str(node.properties.get("path", "")))
+        return detect_normal_map_orientation(path), path
+    if node.node_type is NodeType.NORMAL_MAP:
+        upstream = incoming.get((node.node_id, "image"))
+        if upstream is None:
+            return None, None
+        orientation, path = _trace_image_normal_orientation(
+            upstream,
+            nodes_by_id,
+            incoming,
+            visited,
+        )
+        if (
+            orientation is not None
+            and node.properties.get("enabled", True)
+            and node.properties.get("flip_green", False)
+        ):
+            orientation = (
+                NORMAL_ORIENTATION_OPENGL
+                if orientation == NORMAL_ORIENTATION_DIRECTX
+                else NORMAL_ORIENTATION_DIRECTX
+            )
+        return orientation, path
+    if node.node_type is NodeType.SET_ALPHA:
+        upstream = incoming.get((node.node_id, "image"))
+        if upstream is not None:
+            return _trace_image_normal_orientation(
+                upstream,
+                nodes_by_id,
+                incoming,
+                visited,
+            )
+    return None, None
 
 
 def normalized_path_key(path: Path) -> str:
