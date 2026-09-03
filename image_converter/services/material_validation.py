@@ -458,6 +458,53 @@ def _trace_image_normal_orientation(
                 else NORMAL_ORIENTATION_DIRECTX
             )
         return orientation, path
+    if node.node_type is NodeType.HEIGHT_TO_NORMAL:
+        if not node.properties.get("enabled", True):
+            return None, None
+        convention = str(node.properties.get("convention", "opengl")).lower()
+        orientation = (
+            NORMAL_ORIENTATION_DIRECTX
+            if convention == "directx"
+            else NORMAL_ORIENTATION_OPENGL
+        )
+        return orientation, None
+    if node.node_type is NodeType.NORMAL_BLEND:
+        if not node.properties.get("enabled", True):
+            upstream = incoming.get((node.node_id, "base"))
+            if upstream is None:
+                return None, None
+            return _trace_image_normal_orientation(
+                upstream,
+                nodes_by_id,
+                incoming,
+                visited,
+            )
+        orientations: list[tuple[str | None, Path | None]] = []
+        for socket_id in ("base", "detail"):
+            upstream = incoming.get((node.node_id, socket_id))
+            if upstream is not None:
+                orientations.append(
+                    _trace_image_normal_orientation(
+                        upstream,
+                        nodes_by_id,
+                        incoming,
+                        set(visited),
+                    )
+                )
+        detected = {orientation for orientation, _path in orientations if orientation}
+        if len(detected) == 1:
+            source_path = next((path for _orientation, path in orientations if path), None)
+            return next(iter(detected)), source_path
+        return None, next((path for _orientation, path in orientations if path), None)
+    if node.node_type in (NodeType.TRANSFORM_2D, NodeType.RESIZE_CANVAS):
+        upstream = incoming.get((node.node_id, "image"))
+        if upstream is not None:
+            return _trace_image_normal_orientation(
+                upstream,
+                nodes_by_id,
+                incoming,
+                visited,
+            )
     if node.node_type is NodeType.SET_ALPHA:
         upstream = incoming.get((node.node_id, "image"))
         if upstream is not None:

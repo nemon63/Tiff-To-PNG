@@ -386,3 +386,67 @@ class MoveNodesCommand(GraphCommand):
             if node.node_id in positions:
                 node.position = positions[node.node_id]
         self._on_changed("positions")  # type: ignore[arg-type]
+
+
+class MoveAndRewireNodeCommand(GraphCommand):
+    """Apply a drag position and connection rewrite as one undoable gesture."""
+
+    def __init__(
+        self,
+        graph: NodeGraph,
+        on_changed: GraphChangedCallback,
+        before_positions: dict[str, tuple[float, float]],
+        after_positions: dict[str, tuple[float, float]],
+        *,
+        remove_connections: Iterable[GraphConnection],
+        add_connections: Iterable[GraphConnection] = (),
+        text: str,
+    ):
+        super().__init__(graph, on_changed, text, needs_rebuild=True)
+        self.before_positions = dict(before_positions)
+        self.after_positions = dict(after_positions)
+        self.remove_connections = list(remove_connections)
+        self.add_connections = list(add_connections)
+        self._remove_ids = {
+            connection.connection_id for connection in self.remove_connections
+        }
+        self._add_ids = {connection.connection_id for connection in self.add_connections}
+
+    def redo(self) -> None:
+        self._apply_positions(self.after_positions)
+        self.graph.connections = [
+            connection
+            for connection in self.graph.connections
+            if connection.connection_id not in self._remove_ids
+        ]
+        existing_ids = {
+            connection.connection_id for connection in self.graph.connections
+        }
+        self.graph.connections.extend(
+            connection
+            for connection in self.add_connections
+            if connection.connection_id not in existing_ids
+        )
+        self._emit_changed()
+
+    def undo(self) -> None:
+        self._apply_positions(self.before_positions)
+        self.graph.connections = [
+            connection
+            for connection in self.graph.connections
+            if connection.connection_id not in self._add_ids
+        ]
+        existing_ids = {
+            connection.connection_id for connection in self.graph.connections
+        }
+        self.graph.connections.extend(
+            connection
+            for connection in self.remove_connections
+            if connection.connection_id not in existing_ids
+        )
+        self._emit_changed()
+
+    def _apply_positions(self, positions: dict[str, tuple[float, float]]) -> None:
+        for node in self.graph.nodes:
+            if node.node_id in positions:
+                node.position = positions[node.node_id]

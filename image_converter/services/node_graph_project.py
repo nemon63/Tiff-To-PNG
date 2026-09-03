@@ -14,25 +14,46 @@ from image_converter.domain.node_graph import (
 )
 
 GRAPH_PROJECT_FILENAME = "graph.texturegraph.json"
+GRAPH_PROJECT_EXTENSION = ".texturegraph"
+GRAPH_PROJECT_FILE_FILTER = (
+    "Texture Graph Project (*.texturegraph *.texturegraph.json);;All Files (*)"
+)
 
 
 class NodeGraphProjectRepository:
-    def save(self, project: NodeGraphProject, bundle_dir: Path) -> Path:
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        project_path = bundle_dir / GRAPH_PROJECT_FILENAME
-        payload = self._serialize_project(project, bundle_dir)
+    def save(self, project: NodeGraphProject, location: Path) -> Path:
+        project_path = self.resolve_project_path(location)
+        if not project_path.suffix:
+            project_path = project_path.with_suffix(GRAPH_PROJECT_EXTENSION)
+        project_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._serialize_project(project, project_path.parent)
         project_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         return project_path
 
-    def load(self, bundle_dir: Path) -> NodeGraphProject:
-        project_path = bundle_dir / GRAPH_PROJECT_FILENAME
+    def load(self, location: Path) -> NodeGraphProject:
+        project_path = self.resolve_project_path(location)
         raw_data = json.loads(project_path.read_text(encoding="utf-8"))
         if not isinstance(raw_data, dict):
             raise ValueError("Invalid graph project file.")
-        return self._deserialize_project(raw_data, bundle_dir)
+        fallback_name = (
+            project_path.parent.name
+            if project_path.name == GRAPH_PROJECT_FILENAME
+            else project_path.stem
+        )
+        return self._deserialize_project(
+            raw_data,
+            project_path.parent,
+            fallback_name,
+        )
+
+    @staticmethod
+    def resolve_project_path(location: Path) -> Path:
+        if location.is_dir():
+            return location / GRAPH_PROJECT_FILENAME
+        return location
 
     def _serialize_project(
         self,
@@ -77,14 +98,15 @@ class NodeGraphProjectRepository:
     def _deserialize_project(
         self,
         data: dict[str, Any],
-        bundle_dir: Path,
+        project_dir: Path,
+        fallback_name: str,
     ) -> NodeGraphProject:
         graph_data = data.get("graph", {})
         if not isinstance(graph_data, dict):
             graph_data = {}
 
         nodes = [
-            self._deserialize_node(raw_node, bundle_dir)
+            self._deserialize_node(raw_node, project_dir)
             for raw_node in graph_data.get("nodes", [])
             if isinstance(raw_node, dict)
         ]
@@ -113,7 +135,7 @@ class NodeGraphProjectRepository:
             viewport_zoom=self._coerce_float(graph_data.get("viewport_zoom"), 1.0),
         )
         return NodeGraphProject(
-            name=str(data.get("name") or bundle_dir.stem),
+            name=str(data.get("name") or fallback_name),
             version=self._coerce_int(data.get("version"), 1),
             graph=graph,
         )

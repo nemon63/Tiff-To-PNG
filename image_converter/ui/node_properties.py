@@ -77,6 +77,25 @@ class NodePropertiesPanel(QWidget):
         spin.valueChanged.connect(self._on_numeric_value_changed)
         return spin
 
+    def _make_double_spin(
+        self,
+        minimum: float,
+        maximum: float,
+        *,
+        step: float = 0.1,
+        decimals: int = 2,
+        suffix: str = "",
+    ) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setSingleStep(step)
+        spin.setDecimals(decimals)
+        spin.setKeyboardTracking(False)
+        if suffix:
+            spin.setSuffix(suffix)
+        spin.valueChanged.connect(self._on_numeric_value_changed)
+        return spin
+
     def _make_slider_spin_pair(
         self,
         minimum: int,
@@ -99,6 +118,19 @@ class NodePropertiesPanel(QWidget):
 
     def _make_byte_slider_pair(self, initial: int = 0) -> tuple[QSlider, QSpinBox]:
         return self._make_slider_spin_pair(0, 255, initial=initial)
+
+    def _build_image_filter_combo(self, *, default: str = "bilinear") -> QComboBox:
+        combo = QComboBox()
+        for label, value in (
+            ("Nearest", "nearest"),
+            ("Bilinear", "bilinear"),
+            ("Bicubic", "bicubic"),
+            ("Lanczos", "lanczos"),
+        ):
+            combo.addItem(label, value)
+        self._set_combo_value(combo, default)
+        combo.currentIndexChanged.connect(self._apply_changes)
+        return combo
 
     def _build_ui(self) -> None:
         self.setObjectName("SectionPanel")
@@ -330,6 +362,147 @@ class NodePropertiesPanel(QWidget):
             self.normal_strength_spin,
         )
         self.form.addRow("Strength", self.normal_strength_host)
+
+        self.height_strength_slider, self.height_strength_spin = self._make_slider_spin_pair(
+            0,
+            1000,
+            initial=100,
+            suffix="%",
+        )
+        self.height_strength_host = self._byte_row_widget(
+            self.height_strength_slider,
+            self.height_strength_spin,
+        )
+        self.form.addRow("Strength", self.height_strength_host)
+        self.height_radius_spin = self._make_double_spin(
+            0.0,
+            32.0,
+            step=0.25,
+            suffix=" px",
+        )
+        self.form.addRow("Radius", self.height_radius_spin)
+        self.height_convention_combo = QComboBox()
+        self.height_convention_combo.addItem("OpenGL (Y+ / Unity)", "opengl")
+        self.height_convention_combo.addItem("DirectX (Y− / Unreal)", "directx")
+        self.height_convention_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Convention", self.height_convention_combo)
+
+        self.normal_blend_strength_slider, self.normal_blend_strength_spin = (
+            self._make_slider_spin_pair(0, 400, initial=100, suffix="%")
+        )
+        self.normal_blend_strength_host = self._byte_row_widget(
+            self.normal_blend_strength_slider,
+            self.normal_blend_strength_spin,
+        )
+        self.form.addRow("Detail Strength", self.normal_blend_strength_host)
+
+        self.color_exposure_spin = self._make_double_spin(
+            -10.0,
+            10.0,
+            step=0.1,
+            suffix=" stops",
+        )
+        self.form.addRow("Exposure", self.color_exposure_spin)
+        self.color_brightness_slider, self.color_brightness_spin = self._make_slider_spin_pair(
+            -100, 100, suffix="%"
+        )
+        self.color_brightness_host = self._byte_row_widget(
+            self.color_brightness_slider,
+            self.color_brightness_spin,
+        )
+        self.form.addRow("Brightness", self.color_brightness_host)
+        self.color_contrast_slider, self.color_contrast_spin = self._make_slider_spin_pair(
+            0, 400, initial=100, suffix="%"
+        )
+        self.color_contrast_host = self._byte_row_widget(
+            self.color_contrast_slider,
+            self.color_contrast_spin,
+        )
+        self.form.addRow("Contrast", self.color_contrast_host)
+        self.color_saturation_slider, self.color_saturation_spin = self._make_slider_spin_pair(
+            0, 400, initial=100, suffix="%"
+        )
+        self.color_saturation_host = self._byte_row_widget(
+            self.color_saturation_slider,
+            self.color_saturation_spin,
+        )
+        self.form.addRow("Saturation", self.color_saturation_host)
+        self.color_hue_slider, self.color_hue_spin = self._make_slider_spin_pair(
+            -180, 180, suffix="°"
+        )
+        self.color_hue_host = self._byte_row_widget(
+            self.color_hue_slider,
+            self.color_hue_spin,
+        )
+        self.form.addRow("Hue", self.color_hue_host)
+        self.color_gamma_spin = self._make_double_spin(0.05, 8.0, step=0.05)
+        self.color_gamma_spin.setValue(1.0)
+        self.form.addRow("Gamma", self.color_gamma_spin)
+
+        self.transform_flip_horizontal_checkbox = QCheckBox("Horizontal")
+        self.transform_flip_horizontal_checkbox.toggled.connect(self._apply_changes)
+        self.form.addRow("Flip", self.transform_flip_horizontal_checkbox)
+        self.transform_flip_vertical_checkbox = QCheckBox("Vertical")
+        self.transform_flip_vertical_checkbox.toggled.connect(self._apply_changes)
+        self.form.addRow("", self.transform_flip_vertical_checkbox)
+        self.transform_rotation_combo = QComboBox()
+        for angle in (0, 90, 180, 270):
+            self.transform_rotation_combo.addItem(f"{angle}° clockwise", angle)
+        self.transform_rotation_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Rotate", self.transform_rotation_combo)
+        self.transform_offset_x_spin = self._make_int_spin(-16384, 16384, suffix=" px")
+        self.transform_offset_y_spin = self._make_int_spin(-16384, 16384, suffix=" px")
+        self.transform_offset_host = self._resolution_widget(
+            self.transform_offset_x_spin,
+            self.transform_offset_y_spin,
+        )
+        self.form.addRow("Offset X / Y", self.transform_offset_host)
+        self.transform_scale_slider, self.transform_scale_spin = self._make_slider_spin_pair(
+            1, 1000, initial=100, suffix="%"
+        )
+        self.transform_scale_host = self._byte_row_widget(
+            self.transform_scale_slider,
+            self.transform_scale_spin,
+        )
+        self.form.addRow("Scale", self.transform_scale_host)
+        self.transform_address_combo = QComboBox()
+        for label, value in (("Clamp", "clamp"), ("Repeat", "repeat"), ("Mirror", "mirror")):
+            self.transform_address_combo.addItem(label, value)
+        self.transform_address_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Address", self.transform_address_combo)
+        self.transform_filter_combo = self._build_image_filter_combo()
+        self.form.addRow("Filter", self.transform_filter_combo)
+
+        self.resize_size_mode_combo = QComboBox()
+        for label, value in (
+            ("Exact", "exact"),
+            ("POT Up", "pot_up"),
+            ("POT Down", "pot_down"),
+            ("POT Nearest", "pot_nearest"),
+        ):
+            self.resize_size_mode_combo.addItem(label, value)
+        self.resize_size_mode_combo.currentIndexChanged.connect(self._on_resize_size_mode_changed)
+        self.form.addRow("Output Size", self.resize_size_mode_combo)
+        self.resize_width_spin = self._make_int_spin(1, 16384, suffix=" px")
+        self.resize_height_spin = self._make_int_spin(1, 16384, suffix=" px")
+        self.resize_resolution_host = self._resolution_widget(
+            self.resize_width_spin,
+            self.resize_height_spin,
+        )
+        self.form.addRow("Width × Height", self.resize_resolution_host)
+        self.resize_mode_combo = QComboBox()
+        for label, value in (
+            ("Stretch", "stretch"),
+            ("Fit + Transparent", "fit"),
+            ("Fill + Crop", "fill"),
+            ("Crop / Canvas", "crop"),
+            ("Pad (no upscale)", "pad"),
+        ):
+            self.resize_mode_combo.addItem(label, value)
+        self.resize_mode_combo.currentIndexChanged.connect(self._apply_changes)
+        self.form.addRow("Layout", self.resize_mode_combo)
+        self.resize_filter_combo = self._build_image_filter_combo(default="lanczos")
+        self.form.addRow("Filter", self.resize_filter_combo)
 
         self.image_resolution_source_combo = QComboBox()
         for label, value in (
@@ -577,6 +750,84 @@ class NodePropertiesPanel(QWidget):
             self.normal_strength_spin.setValue(
                 self._coerce_int(node.properties.get("strength"), 100)
             )
+            self.height_strength_spin.setValue(
+                self._coerce_int(node.properties.get("strength"), 100)
+            )
+            self.height_radius_spin.setValue(
+                self._coerce_float(node.properties.get("radius"), 1.0)
+            )
+            self._set_combo_value(
+                self.height_convention_combo,
+                str(node.properties.get("convention", "opengl")),
+            )
+            self.normal_blend_strength_spin.setValue(
+                self._coerce_int(node.properties.get("detail_strength"), 100)
+            )
+            self.color_exposure_spin.setValue(
+                self._coerce_float(node.properties.get("exposure"), 0.0)
+            )
+            self.color_brightness_spin.setValue(
+                self._coerce_int(node.properties.get("brightness"), 0)
+            )
+            self.color_contrast_spin.setValue(
+                self._coerce_int(node.properties.get("contrast"), 100)
+            )
+            self.color_saturation_spin.setValue(
+                self._coerce_int(node.properties.get("saturation"), 100)
+            )
+            self.color_hue_spin.setValue(
+                self._coerce_int(node.properties.get("hue"), 0)
+            )
+            self.color_gamma_spin.setValue(
+                self._coerce_float(node.properties.get("gamma"), 1.0)
+            )
+            self.transform_flip_horizontal_checkbox.setChecked(
+                bool(node.properties.get("flip_horizontal", False))
+            )
+            self.transform_flip_vertical_checkbox.setChecked(
+                bool(node.properties.get("flip_vertical", False))
+            )
+            self._set_combo_value(
+                self.transform_rotation_combo,
+                self._coerce_int(node.properties.get("rotation"), 0),
+            )
+            self.transform_offset_x_spin.setValue(
+                self._coerce_int(node.properties.get("offset_x"), 0)
+            )
+            self.transform_offset_y_spin.setValue(
+                self._coerce_int(node.properties.get("offset_y"), 0)
+            )
+            self.transform_scale_spin.setValue(
+                self._coerce_int(node.properties.get("scale"), 100)
+            )
+            self._set_combo_value(
+                self.transform_address_combo,
+                str(node.properties.get("address_mode", "repeat")),
+            )
+            self._set_combo_value(
+                self.transform_filter_combo,
+                str(node.properties.get("filter", "bilinear")),
+                fallback_index=1,
+            )
+            self._set_combo_value(
+                self.resize_size_mode_combo,
+                str(node.properties.get("size_mode", "exact")),
+            )
+            self.resize_width_spin.setValue(
+                self._coerce_int(node.properties.get("width"), 2048)
+            )
+            self.resize_height_spin.setValue(
+                self._coerce_int(node.properties.get("height"), 2048)
+            )
+            self._set_combo_value(
+                self.resize_mode_combo,
+                str(node.properties.get("resize_mode", "stretch")),
+            )
+            self._set_combo_value(
+                self.resize_filter_combo,
+                str(node.properties.get("filter", "lanczos")),
+                fallback_index=3,
+            )
             self._set_combo_value(
                 self.image_resolution_source_combo,
                 str(node.properties.get("resolution_source", "a")),
@@ -671,6 +922,37 @@ class NodePropertiesPanel(QWidget):
         self._set_row_visible(self.normal_reconstruct_blue_checkbox, normal_map_node)
         self._set_row_visible(self.normal_normalize_checkbox, normal_map_node)
         self._set_row_visible(self.normal_strength_host, normal_map_node)
+        height_node = node_type is NodeType.HEIGHT_TO_NORMAL
+        self._set_row_visible(self.height_strength_host, height_node)
+        self._set_row_visible(self.height_radius_spin, height_node)
+        self._set_row_visible(self.height_convention_combo, height_node)
+        self._set_row_visible(
+            self.normal_blend_strength_host,
+            node_type is NodeType.NORMAL_BLEND,
+        )
+        color_adjust_node = node_type is NodeType.COLOR_ADJUST
+        self._set_row_visible(self.color_exposure_spin, color_adjust_node)
+        self._set_row_visible(self.color_brightness_host, color_adjust_node)
+        self._set_row_visible(self.color_contrast_host, color_adjust_node)
+        self._set_row_visible(self.color_saturation_host, color_adjust_node)
+        self._set_row_visible(self.color_hue_host, color_adjust_node)
+        self._set_row_visible(self.color_gamma_spin, color_adjust_node)
+        transform_node = node_type is NodeType.TRANSFORM_2D
+        self._set_row_visible(self.transform_flip_horizontal_checkbox, transform_node)
+        self._set_row_visible(self.transform_flip_vertical_checkbox, transform_node)
+        self._set_row_visible(self.transform_rotation_combo, transform_node)
+        self._set_row_visible(self.transform_offset_host, transform_node)
+        self._set_row_visible(self.transform_scale_host, transform_node)
+        self._set_row_visible(self.transform_address_combo, transform_node)
+        self._set_row_visible(self.transform_filter_combo, transform_node)
+        resize_node = node_type is NodeType.RESIZE_CANVAS
+        self._set_row_visible(self.resize_size_mode_combo, resize_node)
+        self._set_row_visible(
+            self.resize_resolution_host,
+            resize_node and self.resize_size_mode_combo.currentData() == "exact",
+        )
+        self._set_row_visible(self.resize_mode_combo, resize_node)
+        self._set_row_visible(self.resize_filter_combo, resize_node)
         image_resolution_node = node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE)
         self._set_row_visible(self.image_resolution_source_combo, image_resolution_node)
         self._set_row_visible(
@@ -679,7 +961,13 @@ class NodePropertiesPanel(QWidget):
         )
         self._set_row_visible(
             self.mask_filter_combo,
-            node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE, NodeType.SET_ALPHA),
+            node_type
+            in (
+                NodeType.MIX_IMAGE,
+                NodeType.BLEND_IMAGE,
+                NodeType.NORMAL_BLEND,
+                NodeType.SET_ALPHA,
+            ),
         )
         self._set_row_visible(self.mask_mode_combo, node_type is NodeType.SET_ALPHA)
         self._set_row_visible(self.filename_edit, node_type is NodeType.OUTPUT_RGBA)
@@ -717,6 +1005,26 @@ class NodePropertiesPanel(QWidget):
                 "Converts tangent-space Normal Maps: flip X/Y, rebuild Blue, "
                 "normalize vectors and adjust strength. Flip Green converts DirectX ↔ OpenGL."
             ),
+            NodeType.HEIGHT_TO_NORMAL: (
+                "Creates a normalized tangent-space normal map from Height. "
+                "Choose OpenGL for Unity or DirectX for Unreal."
+            ),
+            NodeType.NORMAL_BLEND: (
+                "Combines Base and Detail normal maps with Reoriented Normal Mapping (RNM). "
+                "An optional Mask limits the detail contribution."
+            ),
+            NodeType.COLOR_ADJUST: (
+                "Adjusts exposure, brightness, contrast, saturation, hue and gamma while "
+                "preserving alpha."
+            ),
+            NodeType.TRANSFORM_2D: (
+                "Flips, rotates, offsets and scales an image with Clamp, Repeat or Mirror "
+                "addressing."
+            ),
+            NodeType.RESIZE_CANVAS: (
+                "Resizes to an exact or power-of-two output using Stretch, Fit, Fill, Crop "
+                "or Pad layout."
+            ),
             NodeType.SPLIT_RGBA: "Splits one RGBA image into separate R, G, B and A channels.",
             NodeType.COMBINE_RGBA: (
                 "Builds one RGBA image from separate R, G, B and optional A channels."
@@ -738,6 +1046,11 @@ class NodePropertiesPanel(QWidget):
     def _on_resolution_source_changed(self, *_args: object) -> None:
         if self._node is not None:
             self._sync_resolution_visibility(self._node.node_type)
+        self._apply_changes()
+
+    def _on_resize_size_mode_changed(self, *_args: object) -> None:
+        if self._node is not None:
+            self._sync_visibility(self._node.node_type)
         self._apply_changes()
 
     def _sync_resolution_visibility(self, node_type: NodeType) -> None:
@@ -1080,6 +1393,55 @@ class NodePropertiesPanel(QWidget):
             )
             next_properties["normalize"] = self.normal_normalize_checkbox.isChecked()
             next_properties["strength"] = self.normal_strength_spin.value()
+        elif self._node.node_type is NodeType.HEIGHT_TO_NORMAL:
+            next_properties["strength"] = self.height_strength_spin.value()
+            next_properties["radius"] = self.height_radius_spin.value()
+            next_properties["convention"] = str(
+                self.height_convention_combo.currentData() or "opengl"
+            )
+        elif self._node.node_type is NodeType.NORMAL_BLEND:
+            next_properties["detail_strength"] = self.normal_blend_strength_spin.value()
+            next_properties["mask_filter"] = str(
+                self.mask_filter_combo.currentData() or "bilinear"
+            )
+        elif self._node.node_type is NodeType.COLOR_ADJUST:
+            next_properties["exposure"] = self.color_exposure_spin.value()
+            next_properties["brightness"] = self.color_brightness_spin.value()
+            next_properties["contrast"] = self.color_contrast_spin.value()
+            next_properties["saturation"] = self.color_saturation_spin.value()
+            next_properties["hue"] = self.color_hue_spin.value()
+            next_properties["gamma"] = self.color_gamma_spin.value()
+        elif self._node.node_type is NodeType.TRANSFORM_2D:
+            next_properties["flip_horizontal"] = (
+                self.transform_flip_horizontal_checkbox.isChecked()
+            )
+            next_properties["flip_vertical"] = (
+                self.transform_flip_vertical_checkbox.isChecked()
+            )
+            next_properties["rotation"] = int(
+                self.transform_rotation_combo.currentData() or 0
+            )
+            next_properties["offset_x"] = self.transform_offset_x_spin.value()
+            next_properties["offset_y"] = self.transform_offset_y_spin.value()
+            next_properties["scale"] = self.transform_scale_spin.value()
+            next_properties["address_mode"] = str(
+                self.transform_address_combo.currentData() or "repeat"
+            )
+            next_properties["filter"] = str(
+                self.transform_filter_combo.currentData() or "bilinear"
+            )
+        elif self._node.node_type is NodeType.RESIZE_CANVAS:
+            next_properties["size_mode"] = str(
+                self.resize_size_mode_combo.currentData() or "exact"
+            )
+            next_properties["width"] = self.resize_width_spin.value()
+            next_properties["height"] = self.resize_height_spin.value()
+            next_properties["resize_mode"] = str(
+                self.resize_mode_combo.currentData() or "stretch"
+            )
+            next_properties["filter"] = str(
+                self.resize_filter_combo.currentData() or "lanczos"
+            )
         elif self._node.node_type is NodeType.SET_ALPHA:
             next_properties["mask_mode"] = str(
                 self.mask_mode_combo.currentData() or "replace_alpha"
@@ -1138,7 +1500,7 @@ class NodePropertiesPanel(QWidget):
             return default
 
     @staticmethod
-    def _set_combo_value(combo: QComboBox, value: str, *, fallback_index: int = 0) -> None:
+    def _set_combo_value(combo: QComboBox, value: object, *, fallback_index: int = 0) -> None:
         combo.setCurrentIndex(fallback_index)
         for index in range(combo.count()):
             if combo.itemData(index) == value:

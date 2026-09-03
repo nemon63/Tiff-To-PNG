@@ -53,7 +53,7 @@ MAP_TYPE_PATTERNS: tuple[tuple[TextureMapType, tuple[str, ...]], ...] = (
     ),
     (
         TextureMapType.ROUGHNESS,
-        ("roughness", "rough", "rgh"),
+        ("roughness", "rough", "rgh", "raf"),
     ),
     (
         TextureMapType.SMOOTHNESS,

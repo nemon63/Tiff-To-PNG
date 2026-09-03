@@ -36,6 +36,15 @@ from image_converter.services.material_validation import (
     pbr_expected_normal_orientation,
     trace_pbr_normal_orientation,
 )
+from image_converter.services.node_image_operations import (
+    blend_normals_rnm,
+    color_adjust,
+    height_to_normal,
+    resize_canvas,
+    resize_output_size,
+    transform_2d,
+    transformed_output_size,
+)
 from image_converter.services.pbr_preview import PbrMaterialData
 from image_converter.services.pipeline import RESAMPLING_LANCZOS
 
@@ -877,6 +886,13 @@ class NodeGraphExecutor:
                         ("a", "b") if self._node_enabled(node) else ("a",)
                     ),
                     NodeType.NORMAL_MAP: ("image",),
+                    NodeType.HEIGHT_TO_NORMAL: ("height",),
+                    NodeType.NORMAL_BLEND: (
+                        ("base", "detail") if self._node_enabled(node) else ("base",)
+                    ),
+                    NodeType.COLOR_ADJUST: ("image",),
+                    NodeType.TRANSFORM_2D: ("image",),
+                    NodeType.RESIZE_CANVAS: ("image",),
                     NodeType.SPLIT_RGBA: ("image",),
                     NodeType.COMBINE_RGBA: ("r", "g", "b"),
                     NodeType.SET_ALPHA: ("image",),
@@ -933,6 +949,7 @@ class NodeGraphExecutor:
                     NodeType.MIX_IMAGE: ("a", "b", "mask"),
                     NodeType.BLEND_IMAGE: ("a", "b", "mask"),
                     NodeType.SET_ALPHA: ("image", "alpha"),
+                    NodeType.NORMAL_BLEND: ("base", "detail", "mask"),
                     NodeType.PBR_SHADER: (
                         "basecolor",
                         "normal",
@@ -1599,6 +1616,131 @@ class NodeGraphExecutor:
                 ).convert("RGBA")
                 if self._node_enabled(source_node):
                     image = self._apply_normal_map(image, source_node)
+            elif source_node.node_type is NodeType.HEIGHT_TO_NORMAL:
+                height = self._evaluate_required_channel_input(
+                    graph,
+                    source_node,
+                    "height",
+                    target_size,
+                    visiting,
+                    cache,
+                ).convert("L")
+                if self._node_enabled(source_node):
+                    image = height_to_normal(height, source_node)
+                else:
+                    image = Image.merge(
+                        "RGBA",
+                        (height, height, height, Image.new("L", target_size, 255)),
+                    )
+            elif source_node.node_type is NodeType.NORMAL_BLEND:
+                base = self._evaluate_required_image_input(
+                    graph,
+                    source_node,
+                    "base",
+                    target_size,
+                    visiting,
+                    cache,
+                ).convert("RGBA")
+                if not self._node_enabled(source_node):
+                    image = base
+                else:
+                    detail = self._evaluate_required_image_input(
+                        graph,
+                        source_node,
+                        "detail",
+                        target_size,
+                        visiting,
+                        cache,
+                    ).convert("RGBA")
+                    mask = self._evaluate_optional_mask_input(
+                        graph,
+                        source_node,
+                        "mask",
+                        target_size,
+                        visiting,
+                        cache,
+                        self._mask_resampling(source_node),
+                    )
+                    image = blend_normals_rnm(base, detail, source_node, mask)
+            elif source_node.node_type is NodeType.COLOR_ADJUST:
+                image = self._evaluate_required_image_input(
+                    graph,
+                    source_node,
+                    "image",
+                    target_size,
+                    visiting,
+                    cache,
+                ).convert("RGBA")
+                if self._node_enabled(source_node):
+                    image = color_adjust(image, source_node)
+            elif source_node.node_type is NodeType.TRANSFORM_2D:
+                enabled = self._node_enabled(source_node)
+                rotation = (
+                    self._property_int(source_node, "rotation", 0) % 360
+                    if enabled
+                    else 0
+                )
+                input_size = (
+                    (target_size[1], target_size[0])
+                    if rotation in (90, 270)
+                    else target_size
+                )
+                source = self._evaluate_required_image_input(
+                    graph,
+                    source_node,
+                    "image",
+                    input_size,
+                    visiting,
+                    cache,
+                ).convert("RGBA")
+                if not enabled:
+                    image = source
+                else:
+                    input_connection = self._incoming_connection(
+                        graph,
+                        target_node_id=source_node.node_id,
+                        target_socket_id="image",
+                    )
+                    natural_input = (
+                        self._connection_natural_size(graph, input_connection, cache)
+                        if input_connection is not None
+                        else input_size
+                    ) or input_size
+                    natural_output = transformed_output_size(natural_input, source_node)
+                    offset_scale = (
+                        target_size[0] / max(1, natural_output[0]),
+                        target_size[1] / max(1, natural_output[1]),
+                    )
+                    image = transform_2d(
+                        source,
+                        source_node,
+                        target_size,
+                        offset_scale=offset_scale,
+                    )
+            elif source_node.node_type is NodeType.RESIZE_CANVAS:
+                input_connection = self._incoming_connection(
+                    graph,
+                    target_node_id=source_node.node_id,
+                    target_socket_id="image",
+                )
+                if input_connection is None:
+                    raise GraphExecutionError(f"{source_node.title}: input IMAGE is not connected.")
+                natural_input = self._connection_natural_size(
+                    graph,
+                    input_connection,
+                    cache,
+                ) or target_size
+                source = self._evaluate_image_socket(
+                    graph,
+                    input_connection,
+                    natural_input,
+                    visiting,
+                    cache,
+                ).convert("RGBA")
+                if not self._node_enabled(source_node):
+                    image = source.resize(target_size, RESAMPLING_LANCZOS)
+                else:
+                    image = resize_canvas(source, target_size, source_node)
             elif source_node.node_type is NodeType.SET_ALPHA:
                 image = self._evaluate_required_image_input(
                     graph,
@@ -2314,6 +2456,32 @@ class NodeGraphExecutor:
                 return self._find_first_upstream_texture_size(
                     graph, source_node, ("image",), visiting, cache
                 )
+            if source_node.node_type is NodeType.HEIGHT_TO_NORMAL:
+                return self._find_first_upstream_texture_size(
+                    graph, source_node, ("height",), visiting, cache
+                )
+            if source_node.node_type is NodeType.NORMAL_BLEND:
+                return self._find_first_upstream_texture_size(
+                    graph, source_node, ("base", "detail"), visiting, cache
+                )
+            if source_node.node_type is NodeType.COLOR_ADJUST:
+                return self._find_first_upstream_texture_size(
+                    graph, source_node, ("image",), visiting, cache
+                )
+            if source_node.node_type is NodeType.TRANSFORM_2D:
+                size = self._find_first_upstream_texture_size(
+                    graph, source_node, ("image",), visiting, cache
+                )
+                if size is None or not self._node_enabled(source_node):
+                    return size
+                return transformed_output_size(size, source_node)
+            if source_node.node_type is NodeType.RESIZE_CANVAS:
+                size = self._find_first_upstream_texture_size(
+                    graph, source_node, ("image",), visiting, cache
+                )
+                if size is None or not self._node_enabled(source_node):
+                    return size
+                return resize_output_size(size, source_node)
             if source_node.node_type is NodeType.COMBINE_RGBA:
                 return self._find_first_upstream_texture_size(
                     graph, source_node, ("r", "g", "b", "a"), visiting, cache
@@ -2400,6 +2568,32 @@ class NodeGraphExecutor:
                 return self._find_first_upstream_color_size(
                     graph, source_node, ("image",), visiting
                 )
+            if source_node.node_type is NodeType.HEIGHT_TO_NORMAL:
+                return self._find_first_upstream_color_size(
+                    graph, source_node, ("height",), visiting
+                )
+            if source_node.node_type is NodeType.NORMAL_BLEND:
+                return self._find_first_upstream_color_size(
+                    graph, source_node, ("base", "detail"), visiting
+                )
+            if source_node.node_type is NodeType.COLOR_ADJUST:
+                return self._find_first_upstream_color_size(
+                    graph, source_node, ("image",), visiting
+                )
+            if source_node.node_type is NodeType.TRANSFORM_2D:
+                size = self._find_first_upstream_color_size(
+                    graph, source_node, ("image",), visiting
+                )
+                if size is None or not self._node_enabled(source_node):
+                    return size
+                return transformed_output_size(size, source_node)
+            if source_node.node_type is NodeType.RESIZE_CANVAS:
+                size = self._find_first_upstream_color_size(
+                    graph, source_node, ("image",), visiting
+                )
+                if size is None or not self._node_enabled(source_node):
+                    return size
+                return resize_output_size(size, source_node)
             if source_node.node_type is NodeType.COMBINE_RGBA:
                 return self._find_first_upstream_color_size(
                     graph, source_node, ("r", "g", "b", "a"), visiting

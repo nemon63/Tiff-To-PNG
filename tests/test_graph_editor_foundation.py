@@ -71,7 +71,11 @@ from image_converter.services.pbr_preview import (
     PbrPreviewService,
     PbrTextureSource,
 )
-from image_converter.services.node_graph_project import GRAPH_PROJECT_FILENAME, NodeGraphProjectRepository
+from image_converter.services.node_graph_project import (
+    GRAPH_PROJECT_FILE_FILTER,
+    GRAPH_PROJECT_FILENAME,
+    NodeGraphProjectRepository,
+)
 from image_converter.services.presets import SYSTEM_PRESETS
 from image_converter.services.settings import AppSettingsRepository
 from image_converter.application.graph_export import GraphExportRequest
@@ -85,7 +89,11 @@ from image_converter.application.thumbnail import ThumbnailController
 from image_converter.ui.graph_commands import AddNodesCommand, MoveNodesCommand, ReplaceInputConnectionCommand
 from image_converter.ui.main_window import MainWindow
 from image_converter.ui.asset_browser import GraphAssetsPanel
-from image_converter.ui.graph_canvas import ConnectionItem, GraphNodeItem
+from image_converter.ui.graph_canvas import (
+    ConnectionItem,
+    GraphNodeItem,
+    is_disconnect_shake,
+)
 from image_converter.ui.node_help import node_help_content
 from image_converter.ui.node_editor import GraphWorkspace
 from image_converter.ui.node_editor import DRAFT_PREVIEW_MAX_SIDE, PREVIEW_MODE_DRAFT, PREVIEW_MODE_FULL
@@ -185,6 +193,11 @@ class ImageLoadingTests(unittest.TestCase):
         source = Path("bike_damaged_df.png")
 
         self.assertEqual(TextureMapType.BASECOLOR, detect_texture_map_type(source))
+
+    def test_roughness_short_alias_raf_is_detected_in_queue(self) -> None:
+        source = Path("barrels_iron_raf.png")
+
+        self.assertEqual(TextureMapType.ROUGHNESS, detect_texture_map_type(source))
 
 
 class MaterialValidationTests(unittest.TestCase):
@@ -1897,6 +1910,192 @@ class NodeGraphExecutorPerformanceTests(unittest.TestCase):
         )
 
 
+class TextureProcessingNodeTests(unittest.TestCase):
+    @staticmethod
+    def _render_image_node(
+        nodes: list,
+        connections: list[GraphConnection],
+        image_node,
+    ) -> Image.Image:
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        graph = NodeGraph(
+            nodes=[*nodes, output],
+            connections=[
+                *connections,
+                GraphConnection(
+                    make_connection_id(),
+                    image_node.node_id,
+                    socket_definitions(image_node.node_type)[-1].socket_id,
+                    output.node_id,
+                    "image",
+                ),
+            ],
+        )
+        return NodeGraphExecutor().render_output_node(graph, output)
+
+    def test_new_processing_nodes_have_defaults_sockets_and_help(self) -> None:
+        expected = {
+            NodeType.HEIGHT_TO_NORMAL: ("height", "normal"),
+            NodeType.NORMAL_BLEND: ("base", "detail", "mask", "normal"),
+            NodeType.COLOR_ADJUST: ("image", "out"),
+            NodeType.TRANSFORM_2D: ("image", "out"),
+            NodeType.RESIZE_CANVAS: ("image", "out"),
+        }
+        for node_type, socket_ids in expected.items():
+            with self.subTest(node_type=node_type):
+                node = create_graph_node(node_type)
+                self.assertEqual(
+                    socket_ids,
+                    tuple(socket.socket_id for socket in socket_definitions(node_type)),
+                )
+                self.assertTrue(node.properties)
+                self.assertIsNotNone(node_help_content(node_type))
+
+    def test_height_to_normal_switches_green_for_directx(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "height.png"
+            height = Image.new("L", (5, 5))
+            height.putdata([row * 60 for row in range(5) for _column in range(5)])
+            height.save(path)
+            texture = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(path)})
+            normal = create_graph_node(
+                NodeType.HEIGHT_TO_NORMAL,
+                properties={"radius": 0.0, "strength": 100, "convention": "opengl"},
+            )
+            connection = GraphConnection(
+                make_connection_id(), texture.node_id, "r", normal.node_id, "height"
+            )
+
+            opengl = self._render_image_node([texture, normal], [connection], normal)
+            normal.properties["convention"] = "directx"
+            directx = self._render_image_node([texture, normal], [connection], normal)
+
+            gl_pixel = opengl.getpixel((2, 2))
+            dx_pixel = directx.getpixel((2, 2))
+            self.assertAlmostEqual(gl_pixel[0], dx_pixel[0], delta=2)
+            self.assertAlmostEqual(gl_pixel[1] + dx_pixel[1], 255, delta=3)
+            self.assertGreater(gl_pixel[2], 180)
+
+    def test_normal_blend_rnm_preserves_detail_over_flat_base(self) -> None:
+        base = create_graph_node(
+            NodeType.COLOR,
+            properties={"red": 128, "green": 128, "blue": 255, "alpha": 73, "width": 2, "height": 2},
+        )
+        detail = create_graph_node(
+            NodeType.COLOR,
+            properties={"red": 180, "green": 110, "blue": 243, "alpha": 255, "width": 2, "height": 2},
+        )
+        blend = create_graph_node(NodeType.NORMAL_BLEND)
+        connections = [
+            GraphConnection(make_connection_id(), base.node_id, "image", blend.node_id, "base"),
+            GraphConnection(make_connection_id(), detail.node_id, "image", blend.node_id, "detail"),
+        ]
+
+        image = self._render_image_node([base, detail, blend], connections, blend)
+        pixel = image.getpixel((0, 0))
+
+        self.assertAlmostEqual(pixel[0], 180, delta=3)
+        self.assertAlmostEqual(pixel[1], 110, delta=3)
+        self.assertAlmostEqual(pixel[2], 243, delta=3)
+        self.assertEqual(73, pixel[3])
+
+        mask = create_graph_node(NodeType.CONSTANT_CHANNEL, properties={"value": 0})
+        masked_connections = [
+            *connections,
+            GraphConnection(make_connection_id(), mask.node_id, "out", blend.node_id, "mask"),
+        ]
+        masked = self._render_image_node(
+            [base, detail, mask, blend],
+            masked_connections,
+            blend,
+        )
+        self.assertEqual((128, 128, 255, 73), masked.getpixel((0, 0)))
+
+    def test_color_adjust_preserves_alpha(self) -> None:
+        color = create_graph_node(
+            NodeType.COLOR,
+            properties={"red": 64, "green": 32, "blue": 16, "alpha": 91, "width": 1, "height": 1},
+        )
+        adjust = create_graph_node(NodeType.COLOR_ADJUST, properties={"exposure": 1.0})
+        connection = GraphConnection(
+            make_connection_id(), color.node_id, "image", adjust.node_id, "image"
+        )
+
+        pixel = self._render_image_node([color, adjust], [connection], adjust).getpixel((0, 0))
+
+        self.assertEqual((128, 64, 32, 91), pixel)
+
+    def test_transform_repeat_offset_and_rotation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stripe.png"
+            source = Image.new("RGBA", (2, 1))
+            source.putdata([(255, 0, 0, 255), (0, 0, 255, 255)])
+            source.save(path)
+            texture = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(path)})
+            transform = create_graph_node(
+                NodeType.TRANSFORM_2D,
+                properties={"offset_x": 1, "address_mode": "repeat", "filter": "nearest"},
+            )
+            connection = GraphConnection(
+                make_connection_id(), texture.node_id, "image", transform.node_id, "image"
+            )
+
+            shifted = self._render_image_node([texture, transform], [connection], transform)
+            self.assertEqual([(0, 0, 255, 255), (255, 0, 0, 255)], list(shifted.getdata()))
+
+            transform.properties.update({"offset_x": 0, "rotation": 90})
+            rotated = self._render_image_node([texture, transform], [connection], transform)
+            self.assertEqual((1, 2), rotated.size)
+            self.assertEqual((255, 0, 0, 255), rotated.getpixel((0, 0)))
+            self.assertEqual((0, 0, 255, 255), rotated.getpixel((0, 1)))
+
+    def test_resize_canvas_exact_fit_and_power_of_two(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "source.png"
+            Image.new("RGBA", (3, 5), (20, 40, 60, 255)).save(path)
+            texture = create_graph_node(NodeType.TEXTURE_INPUT, properties={"path": str(path)})
+            resize = create_graph_node(
+                NodeType.RESIZE_CANVAS,
+                properties={
+                    "size_mode": "exact",
+                    "width": 4,
+                    "height": 4,
+                    "resize_mode": "fit",
+                    "filter": "nearest",
+                },
+            )
+            connection = GraphConnection(
+                make_connection_id(), texture.node_id, "image", resize.node_id, "image"
+            )
+
+            fitted = self._render_image_node([texture, resize], [connection], resize)
+            self.assertEqual((4, 4), fitted.size)
+            self.assertEqual(0, fitted.getpixel((0, 0))[3])
+            self.assertEqual(255, fitted.getpixel((1, 1))[3])
+
+            resize.properties.update({"size_mode": "pot_up", "resize_mode": "stretch"})
+            pot = self._render_image_node([texture, resize], [connection], resize)
+            self.assertEqual((4, 8), pot.size)
+
+    def test_new_processing_nodes_round_trip_in_project_file(self) -> None:
+        nodes = [
+            create_graph_node(NodeType.HEIGHT_TO_NORMAL, properties={"strength": 275}),
+            create_graph_node(NodeType.NORMAL_BLEND, properties={"detail_strength": 65}),
+            create_graph_node(NodeType.COLOR_ADJUST, properties={"hue": -30}),
+            create_graph_node(NodeType.TRANSFORM_2D, properties={"rotation": 270}),
+            create_graph_node(NodeType.RESIZE_CANVAS, properties={"size_mode": "pot_up"}),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "processing.texturegraph"
+            repository = NodeGraphProjectRepository()
+            repository.save(NodeGraphProject(graph=NodeGraph(nodes=nodes)), path)
+            loaded = repository.load(path)
+
+        self.assertEqual([node.node_type for node in nodes], [node.node_type for node in loaded.graph.nodes])
+        self.assertEqual(275, loaded.graph.nodes[0].properties["strength"])
+        self.assertEqual("pot_up", loaded.graph.nodes[-1].properties["size_mode"])
+
+
 class GraphAssetsPanelTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = _app()
@@ -2088,6 +2287,37 @@ class NodePropertiesPanelTests(unittest.TestCase):
         self.panel.output_alpha_input_mode_combo.setCurrentIndex(1)
         self.assertEqual("replace", changes[-1]["alpha_input_mode"])
 
+    def test_texture_processing_nodes_show_their_controls(self) -> None:
+        self.panel.set_node(
+            create_graph_node(
+                NodeType.HEIGHT_TO_NORMAL,
+                properties={"strength": 250, "radius": 2.5, "convention": "directx"},
+            )
+        )
+        self.assertFalse(self.panel.height_strength_host.isHidden())
+        self.assertEqual(250, self.panel.height_strength_spin.value())
+        self.assertEqual(2.5, self.panel.height_radius_spin.value())
+        self.assertEqual("directx", self.panel.height_convention_combo.currentData())
+
+        self.panel.set_node(create_graph_node(NodeType.NORMAL_BLEND))
+        self.assertFalse(self.panel.normal_blend_strength_host.isHidden())
+        self.assertFalse(self.panel.mask_filter_combo.isHidden())
+
+        self.panel.set_node(create_graph_node(NodeType.COLOR_ADJUST))
+        self.assertFalse(self.panel.color_exposure_spin.isHidden())
+        self.assertFalse(self.panel.color_saturation_host.isHidden())
+        self.assertTrue(self.panel.transform_offset_host.isHidden())
+
+        self.panel.set_node(create_graph_node(NodeType.TRANSFORM_2D))
+        self.assertFalse(self.panel.transform_offset_host.isHidden())
+        self.assertFalse(self.panel.transform_address_combo.isHidden())
+
+        self.panel.set_node(create_graph_node(NodeType.RESIZE_CANVAS))
+        self.assertFalse(self.panel.resize_size_mode_combo.isHidden())
+        self.assertFalse(self.panel.resize_resolution_host.isHidden())
+        self.panel.resize_size_mode_combo.setCurrentIndex(1)
+        self.assertTrue(self.panel.resize_resolution_host.isHidden())
+
     def test_normal_map_node_shows_and_updates_processing_controls(self) -> None:
         node = create_graph_node(
             NodeType.NORMAL_MAP,
@@ -2204,6 +2434,36 @@ class NodePropertiesPanelTests(unittest.TestCase):
 
 
 class ChannelPackingPlanTests(unittest.TestCase):
+    def test_raf_roughness_groups_with_metallic_for_unity_urp(self) -> None:
+        root = Path("E:/textures/barrels_iron")
+        metallic_path = root / "barrels_iron_met.png"
+        roughness_path = root / "barrels_iron_raf.png"
+        sources = [
+            BatchSource(
+                metallic_path,
+                root,
+                detect_texture_map_type(metallic_path),
+            ),
+            BatchSource(
+                roughness_path,
+                root,
+                detect_texture_map_type(roughness_path),
+            ),
+        ]
+        options = ConversionOptions(
+            packing=ChannelPackingOptions(
+                enabled=True,
+                layout=ChannelPackLayout.UNITY_URP,
+            )
+        )
+
+        jobs = build_channel_pack_jobs(sources, None, options)
+
+        self.assertEqual(1, len(jobs))
+        self.assertEqual("barrels_iron", jobs[0].group_name)
+        self.assertTrue(jobs[0].is_ready)
+        self.assertEqual("barrels_iron_metallicsmoothness.png", jobs[0].output_path.name)
+
     def test_packing_summary_lists_output_mapping_and_missing_maps(self) -> None:
         options = ConversionOptions(
             naming=NamingRules(lowercase=True),
@@ -2372,6 +2632,435 @@ class GraphEditorFoundationTests(unittest.TestCase):
         del self.workspace
         gc.collect()
 
+    def test_save_dialog_creates_visible_texturegraph_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            project_path = Path(tmp) / "barrels_iron.texturegraph"
+            with mock.patch(
+                "image_converter.ui.node_editor.QFileDialog.getSaveFileName",
+                return_value=(str(project_path), GRAPH_PROJECT_FILE_FILTER),
+            ):
+                self.workspace.save_project_dialog()
+
+            self.assertTrue(project_path.is_file())
+            self.assertEqual(project_path, self.workspace.project_path)
+            self.assertEqual(project_path.parent, self.workspace.project_dir)
+            payload = json.loads(project_path.read_text(encoding="utf-8"))
+            self.assertEqual("barrels_iron", payload["name"])
+
+    def test_save_reuses_current_path_and_save_as_always_opens_dialog(self) -> None:
+        with TemporaryDirectory() as tmp:
+            first_path = Path(tmp) / "first.texturegraph"
+            second_path = Path(tmp) / "second.texturegraph"
+            self.assertTrue(self.workspace.save_project(first_path))
+
+            with mock.patch(
+                "image_converter.ui.node_editor.QFileDialog.getSaveFileName"
+            ) as save_dialog:
+                self.assertTrue(self.workspace.save_project_dialog())
+                save_dialog.assert_not_called()
+
+            with mock.patch(
+                "image_converter.ui.node_editor.QFileDialog.getSaveFileName",
+                return_value=(str(second_path), GRAPH_PROJECT_FILE_FILTER),
+            ) as save_as_dialog:
+                self.assertTrue(self.workspace.save_project_as_dialog())
+                save_as_dialog.assert_called_once()
+
+            self.assertTrue(second_path.is_file())
+            self.assertEqual(second_path, self.workspace.project_path)
+
+    def test_load_dialog_opens_texturegraph_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            project_path = Path(tmp) / "loaded_material.texturegraph"
+            NodeGraphProjectRepository().save(
+                NodeGraphProject(name="Loaded Material"),
+                project_path,
+            )
+            with mock.patch(
+                "image_converter.ui.node_editor.QFileDialog.getOpenFileName",
+                return_value=(str(project_path), GRAPH_PROJECT_FILE_FILTER),
+            ):
+                self.workspace.load_project_dialog()
+
+            self.assertEqual(project_path, self.workspace.project_path)
+            self.assertEqual("Loaded Material", self.workspace.project.name)
+
+    def test_y_knife_mode_uses_custom_blade_cursor(self) -> None:
+        self.assertIsNone(QApplication.overrideCursor())
+        QTest.keyPress(self.workspace.view, Qt.Key.Key_Y)
+        try:
+            cursor = QApplication.overrideCursor()
+            self.assertTrue(self.workspace.view._knife_active)
+            self.assertTrue(self.workspace.view._knife_cursor_override_active)
+            self.assertIsNotNone(cursor)
+            assert cursor is not None
+            self.assertFalse(cursor.pixmap().isNull())
+            self.assertEqual(QPoint(30, 2), cursor.hotSpot())
+        finally:
+            QTest.keyRelease(self.workspace.view, Qt.Key.Key_Y)
+
+        self.assertFalse(self.workspace.view._knife_active)
+        self.assertFalse(self.workspace.view._knife_cursor_override_active)
+        self.assertIsNone(QApplication.overrideCursor())
+
+    def test_disconnect_shake_requires_fast_horizontal_reversals(self) -> None:
+        shake = [
+            (0.00, 100.0, 100.0),
+            (0.12, 145.0, 102.0),
+            (0.24, 95.0, 99.0),
+            (0.36, 150.0, 101.0),
+        ]
+        slow_shake = [
+            (0.0, 100.0, 100.0),
+            (0.5, 145.0, 100.0),
+            (1.0, 95.0, 100.0),
+            (1.5, 150.0, 100.0),
+        ]
+        vertical_motion = [
+            (0.00, 100.0, 100.0),
+            (0.12, 145.0, 180.0),
+            (0.24, 95.0, 260.0),
+            (0.36, 150.0, 340.0),
+        ]
+
+        self.assertTrue(is_disconnect_shake(shake))
+        self.assertFalse(is_disconnect_shake(slow_shake))
+        self.assertFalse(is_disconnect_shake(vertical_motion))
+
+    def test_shake_disconnect_moves_node_and_is_one_undoable_action(self) -> None:
+        source = create_graph_node(NodeType.COLOR, position=(0.0, 0.0))
+        adjust = create_graph_node(NodeType.COLOR_ADJUST, position=(240.0, 0.0))
+        output = create_graph_node(NodeType.OUTPUT_RGBA, position=(480.0, 0.0))
+        connections = [
+            GraphConnection("in", source.node_id, "image", adjust.node_id, "image"),
+            GraphConnection("out", adjust.node_id, "out", output.node_id, "image"),
+        ]
+        self.workspace.project.graph.nodes = [source, adjust, output]
+        self.workspace.project.graph.connections = connections
+        self.workspace._scene.rebuild()
+
+        self.workspace._on_node_shake_disconnect_requested(
+            adjust,
+            {adjust.node_id: (240.0, 0.0)},
+            {adjust.node_id: (275.0, 12.0)},
+        )
+
+        self.assertEqual(1, len(self.workspace.project.graph.connections))
+        bypass = self.workspace.project.graph.connections[0]
+        self.assertEqual(source.node_id, bypass.source_node_id)
+        self.assertEqual("image", bypass.source_socket_id)
+        self.assertEqual(output.node_id, bypass.target_node_id)
+        self.assertEqual("image", bypass.target_socket_id)
+        self.assertEqual((275.0, 12.0), adjust.position)
+        self.assertEqual("Shake bypass node", self.workspace.undo_stack.undoText())
+
+        self.workspace.undo_stack.undo()
+        self.assertEqual((240.0, 0.0), adjust.position)
+        self.assertEqual({"in", "out"}, {item.connection_id for item in self.workspace.project.graph.connections})
+
+    def test_shake_release_disconnects_through_scene_signal(self) -> None:
+        source = create_graph_node(NodeType.COLOR, position=(0.0, 0.0))
+        adjust = create_graph_node(NodeType.COLOR_ADJUST, position=(240.0, 0.0))
+        output = create_graph_node(NodeType.OUTPUT_RGBA, position=(480.0, 0.0))
+        input_connection = GraphConnection(
+            "in",
+            source.node_id,
+            "image",
+            adjust.node_id,
+            "image",
+        )
+        output_connection = GraphConnection(
+            "out",
+            adjust.node_id,
+            "out",
+            output.node_id,
+            "image",
+        )
+        self.workspace.project.graph.nodes = [source, adjust, output]
+        self.workspace.project.graph.connections = [
+            input_connection,
+            output_connection,
+        ]
+        self.workspace._scene.rebuild()
+        node_item = self.workspace._scene.node_items[adjust.node_id]
+
+        self.workspace._scene.begin_node_move(adjust.node_id)
+        node_item.setPos(280.0, 10.0)
+        self.assertTrue(
+            self.workspace._scene.mark_node_shake_disconnect(adjust.node_id)
+        )
+        self.assertFalse(
+            self.workspace._scene.connection_items[
+                input_connection.connection_id
+            ].isVisible()
+        )
+        self.workspace._scene.finish_node_move()
+        self.app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+
+        self.assertEqual(1, len(self.workspace.project.graph.connections))
+        bypass = self.workspace.project.graph.connections[0]
+        self.assertEqual(source.node_id, bypass.source_node_id)
+        self.assertEqual(output.node_id, bypass.target_node_id)
+        self.assertEqual((280.0, 10.0), adjust.position)
+        self.assertEqual(
+            "Shake bypass node",
+            self.workspace.undo_stack.undoText(),
+        )
+
+    def test_shake_bypass_restores_primary_path_to_every_consumer(self) -> None:
+        primary = create_graph_node(NodeType.COLOR)
+        secondary = create_graph_node(NodeType.COLOR)
+        mix = create_graph_node(NodeType.MIX_IMAGE)
+        first_output = create_graph_node(NodeType.OUTPUT_RGBA)
+        second_output = create_graph_node(NodeType.OUTPUT_RGBA)
+        connections = [
+            GraphConnection("a", primary.node_id, "image", mix.node_id, "a"),
+            GraphConnection("b", secondary.node_id, "image", mix.node_id, "b"),
+            GraphConnection(
+                "first",
+                mix.node_id,
+                "image",
+                first_output.node_id,
+                "image",
+            ),
+            GraphConnection(
+                "second",
+                mix.node_id,
+                "image",
+                second_output.node_id,
+                "image",
+            ),
+        ]
+        self.workspace.project.graph.nodes = [
+            primary,
+            secondary,
+            mix,
+            first_output,
+            second_output,
+        ]
+        self.workspace.project.graph.connections = connections
+        self.workspace._scene.rebuild()
+
+        self.workspace._on_node_shake_disconnect_requested(
+            mix,
+            {mix.node_id: mix.position},
+            {mix.node_id: (320.0, 80.0)},
+        )
+
+        bypass_connections = self.workspace.project.graph.connections
+        self.assertEqual(2, len(bypass_connections))
+        self.assertEqual(
+            {first_output.node_id, second_output.node_id},
+            {connection.target_node_id for connection in bypass_connections},
+        )
+        self.assertEqual(
+            {primary.node_id},
+            {connection.source_node_id for connection in bypass_connections},
+        )
+        self.assertNotIn(
+            secondary.node_id,
+            {connection.source_node_id for connection in bypass_connections},
+        )
+
+        self.workspace.undo_stack.undo()
+        self.assertEqual(
+            {"a", "b", "first", "second"},
+            {
+                connection.connection_id
+                for connection in self.workspace.project.graph.connections
+            },
+        )
+
+    def test_drop_existing_node_on_wire_inserts_and_undoes_as_one_action(self) -> None:
+        source = create_graph_node(NodeType.COLOR, position=(0.0, 0.0))
+        adjust = create_graph_node(NodeType.COLOR_ADJUST, position=(200.0, 160.0))
+        output = create_graph_node(NodeType.OUTPUT_RGBA, position=(500.0, 0.0))
+        original = GraphConnection(
+            "original",
+            source.node_id,
+            "image",
+            output.node_id,
+            "image",
+        )
+        self.workspace.project.graph.nodes = [source, adjust, output]
+        self.workspace.project.graph.connections = [original]
+        self.workspace._scene.rebuild()
+
+        self.workspace._on_node_wire_insert_requested(
+            adjust,
+            original,
+            {adjust.node_id: (200.0, 160.0)},
+            {adjust.node_id: (260.0, 0.0)},
+        )
+
+        self.assertEqual((260.0, 0.0), adjust.position)
+        self.assertEqual(2, len(self.workspace.project.graph.connections))
+        self.assertNotIn(
+            "original",
+            {item.connection_id for item in self.workspace.project.graph.connections},
+        )
+        self.assertTrue(
+            any(
+                item.source_node_id == source.node_id
+                and item.target_node_id == adjust.node_id
+                and item.target_socket_id == "image"
+                for item in self.workspace.project.graph.connections
+            )
+        )
+        self.assertTrue(
+            any(
+                item.source_node_id == adjust.node_id
+                and item.source_socket_id == "out"
+                and item.target_node_id == output.node_id
+                for item in self.workspace.project.graph.connections
+            )
+        )
+        self.assertEqual("Insert existing node in wire", self.workspace.undo_stack.undoText())
+
+        self.workspace.undo_stack.undo()
+        self.assertEqual((200.0, 160.0), adjust.position)
+        self.assertEqual(["original"], [item.connection_id for item in self.workspace.project.graph.connections])
+
+    def test_drop_on_wire_refuses_a_cycle_and_keeps_the_move(self) -> None:
+        source = create_graph_node(NodeType.COLOR_ADJUST, position=(0.0, 0.0))
+        adjust = create_graph_node(NodeType.COLOR_ADJUST, position=(200.0, 160.0))
+        output = create_graph_node(NodeType.OUTPUT_RGBA, position=(500.0, 0.0))
+        original = GraphConnection(
+            "original",
+            source.node_id,
+            "out",
+            output.node_id,
+            "image",
+        )
+        back_edge = GraphConnection(
+            "back",
+            adjust.node_id,
+            "out",
+            source.node_id,
+            "image",
+        )
+        self.workspace.project.graph.nodes = [source, adjust, output]
+        self.workspace.project.graph.connections = [original, back_edge]
+        self.workspace._scene.rebuild()
+
+        self.workspace._on_node_wire_insert_requested(
+            adjust,
+            original,
+            {adjust.node_id: (200.0, 160.0)},
+            {adjust.node_id: (260.0, 0.0)},
+        )
+
+        self.assertEqual({"original", "back"}, {item.connection_id for item in self.workspace.project.graph.connections})
+        self.assertEqual((260.0, 0.0), adjust.position)
+        self.assertEqual("Move nodes", self.workspace.undo_stack.undoText())
+
+    def test_compatible_wire_highlights_when_node_overlaps_it(self) -> None:
+        source = create_graph_node(NodeType.COLOR, position=(0.0, 0.0))
+        adjust = create_graph_node(NodeType.COLOR_ADJUST, position=(200.0, 200.0))
+        output = create_graph_node(NodeType.OUTPUT_RGBA, position=(600.0, 0.0))
+        connection = GraphConnection(
+            "wire",
+            source.node_id,
+            "image",
+            output.node_id,
+            "image",
+        )
+        self.workspace.project.graph.nodes = [source, adjust, output]
+        self.workspace.project.graph.connections = [connection]
+        self.workspace._scene.rebuild()
+        node_item = self.workspace._scene.node_items[adjust.node_id]
+        wire_item = self.workspace._scene.connection_items[connection.connection_id]
+        midpoint = wire_item.path().pointAtPercent(0.5)
+        node_item.setPos(midpoint - node_item.rect().center())
+
+        self.workspace._scene.begin_node_move(adjust.node_id)
+        self.workspace._scene.update_node_drop_target(adjust.node_id)
+
+        self.assertEqual("wire", self.workspace._scene.drop_target_connection_id)
+        self.assertTrue(wire_item._drop_target)
+
+    def test_drop_release_rewires_through_scene_signal(self) -> None:
+        source = create_graph_node(NodeType.COLOR, position=(0.0, 0.0))
+        adjust = create_graph_node(NodeType.COLOR_ADJUST, position=(200.0, 180.0))
+        output = create_graph_node(NodeType.OUTPUT_RGBA, position=(600.0, 0.0))
+        original = GraphConnection(
+            "wire",
+            source.node_id,
+            "image",
+            output.node_id,
+            "image",
+        )
+        self.workspace.project.graph.nodes = [source, adjust, output]
+        self.workspace.project.graph.connections = [original]
+        self.workspace._scene.rebuild()
+        node_item = self.workspace._scene.node_items[adjust.node_id]
+        wire_item = self.workspace._scene.connection_items[original.connection_id]
+        midpoint = wire_item.path().pointAtPercent(0.5)
+
+        self.workspace._scene.begin_node_move(adjust.node_id)
+        node_item.setPos(midpoint - node_item.rect().center())
+        self.workspace._scene.update_node_drop_target(adjust.node_id)
+        self.workspace._scene.finish_node_move()
+        self.app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
+
+        self.assertEqual(2, len(self.workspace.project.graph.connections))
+        self.assertTrue(
+            any(
+                item.source_node_id == source.node_id
+                and item.target_node_id == adjust.node_id
+                for item in self.workspace.project.graph.connections
+            )
+        )
+        self.assertTrue(
+            any(
+                item.source_node_id == adjust.node_id
+                and item.target_node_id == output.node_id
+                for item in self.workspace.project.graph.connections
+            )
+        )
+        self.assertEqual(
+            "Insert existing node in wire",
+            self.workspace.undo_stack.undoText(),
+        )
+
+    def test_disconnecting_shader_input_preserves_upstream_preview_cache(self) -> None:
+        texture = create_graph_node(NodeType.TEXTURE_INPUT)
+        shader = create_graph_node(NodeType.PBR_SHADER)
+        connection = GraphConnection(
+            make_connection_id(),
+            texture.node_id,
+            "image",
+            shader.node_id,
+            "basecolor",
+        )
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [texture, shader],
+                [connection],
+            )
+        )
+        cache_key = (texture.node_id, (8, 8))
+        self.workspace._preview_cache.put_image(
+            "texture-preview",
+            cache_key,
+            Image.new("RGBA", (8, 8), (32, 64, 96, 255)),
+        )
+
+        with mock.patch.object(
+            self.workspace._preview_cache,
+            "clear",
+            wraps=self.workspace._preview_cache.clear,
+        ) as clear_cache:
+            self.workspace._on_connection_delete_requested(connection)
+
+        self.assertEqual(0, clear_cache.call_count)
+        self.assertIsNotNone(
+            self.workspace._preview_cache.get_image("texture-preview", cache_key)
+        )
+        self.assertEqual([], self.workspace.project.graph.connections)
+
     def test_move_undo_redo_keeps_scene_items_without_rebuild(self) -> None:
         node = create_graph_node(NodeType.CONSTANT_CHANNEL, position=(10.0, 20.0))
         self.workspace._push_graph_command(
@@ -2401,6 +3090,24 @@ class GraphEditorFoundationTests(unittest.TestCase):
         self.assertIs(original_item, self.workspace._scene.node_items[node.node_id])
         self.assertEqual((120.0, 80.0), node.position)
         self.assertTrue(original_item.isSelected())
+
+    def test_main_window_uses_standard_file_menu_for_graph_projects(self) -> None:
+        window = MainWindow()
+        try:
+            self.assertEqual("Файл", window.file_menu.title())
+            self.assertEqual("Ctrl+N", window.new_graph_action.shortcut().toString())
+            self.assertEqual("Ctrl+O", window.open_graph_action.shortcut().toString())
+            self.assertEqual("Ctrl+S", window.save_graph_action.shortcut().toString())
+            self.assertEqual(
+                "Ctrl+Shift+S",
+                window.save_graph_as_action.shortcut().toString(),
+            )
+            self.assertFalse(hasattr(window.graph_workspace, "save_button"))
+            self.assertFalse(hasattr(window.graph_workspace, "recent_button"))
+        finally:
+            window.graph_workspace.shutdown_background_jobs(wait_ms=100)
+            window.deleteLater()
+            self.app.processEvents()
 
     def test_every_node_has_help_without_header_or_body_overlaps(self) -> None:
         for node_type in NodeType:

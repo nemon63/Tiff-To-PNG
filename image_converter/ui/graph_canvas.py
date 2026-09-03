@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import partial
 from pathlib import Path
+from time import monotonic
 
-from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QPainter,
@@ -15,6 +18,7 @@ from PyQt6.QtGui import (
     QPixmap,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsPathItem,
@@ -40,6 +44,7 @@ from image_converter.domain.node_graph import (
     TextureDataRole,
     incoming_connection,
     make_connection_id,
+    node_bypass_socket_pair,
     node_has_enable_flag,
     node_has_resettable_parameters,
     socket_definitions,
@@ -66,6 +71,44 @@ TEXTURE_META_X = 94
 TEXTURE_PORT_CENTER_Y = TITLE_HEIGHT + 34
 TEXTURE_PORT_SPACING = 20
 TEXTURE_PORT_LABEL_X_PAD = 34
+SHAKE_WINDOW_SECONDS = 0.8
+SHAKE_MIN_STEP_PX = 5
+SHAKE_MIN_REVERSALS = 2
+SHAKE_MIN_TRAVEL_PX = 90
+SHAKE_MIN_SPAN_PX = 28
+SHAKE_HORIZONTAL_BIAS = 1.35
+
+
+def is_disconnect_shake(samples: list[tuple[float, float, float]]) -> bool:
+    if len(samples) < 4:
+        return False
+    recent = [sample for sample in samples if samples[-1][0] - sample[0] <= SHAKE_WINDOW_SECONDS]
+    if len(recent) < 4:
+        return False
+    horizontal_travel = 0.0
+    vertical_travel = 0.0
+    directions: list[int] = []
+    for previous, current in zip(recent, recent[1:], strict=False):
+        delta_x = current[1] - previous[1]
+        delta_y = current[2] - previous[2]
+        horizontal_travel += abs(delta_x)
+        vertical_travel += abs(delta_y)
+        if abs(delta_x) >= SHAKE_MIN_STEP_PX:
+            direction = 1 if delta_x > 0 else -1
+            if not directions or directions[-1] != direction:
+                directions.append(direction)
+    reversals = max(0, len(directions) - 1)
+    horizontal_span = max(sample[1] for sample in recent) - min(
+        sample[1] for sample in recent
+    )
+    return (
+        reversals >= SHAKE_MIN_REVERSALS
+        and horizontal_travel >= SHAKE_MIN_TRAVEL_PX
+        and horizontal_span >= SHAKE_MIN_SPAN_PX
+        and horizontal_travel >= vertical_travel * SHAKE_HORIZONTAL_BIAS
+    )
+
+
 class ConnectionItem(QGraphicsPathItem):
     def __init__(
         self,
@@ -84,6 +127,7 @@ class ConnectionItem(QGraphicsPathItem):
             if source_port.socket_type is SocketType.IMAGE
             else QColor("#5BA7FF")
         )
+        self._drop_target = False
         # Keep the item's bounds large enough for the thicker selected wire.
         self.setPen(QPen(self._wire_color, 4.0))
         self.update_path()
@@ -115,12 +159,22 @@ class ConnectionItem(QGraphicsPathItem):
 
     def _display_pen(self) -> QPen:
         pen = QPen(
-            QColor("#FFD166") if self.isSelected() else self._wire_color,
-            3.5 if self.isSelected() else 2.0,
+            QColor("#62E6A7")
+            if self._drop_target
+            else QColor("#FFD166")
+            if self.isSelected()
+            else self._wire_color,
+            4.5 if self._drop_target else 3.5 if self.isSelected() else 2.0,
         )
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         return pen
+
+    def set_drop_target(self, enabled: bool) -> None:
+        if self._drop_target == enabled:
+            return
+        self._drop_target = enabled
+        self.update()
 
     def mousePressEvent(self, event) -> None:
         if (
@@ -216,6 +270,9 @@ class GraphNodeItem(QGraphicsRectItem):
         self._validation_severity: GraphValidationSeverity | None = None
         self._validation_messages: tuple[str, ...] = ()
         self._drag_start_position: tuple[float, float] | None = None
+        self._drag_screen_start: QPoint | None = None
+        self._shake_samples: list[tuple[float, float, float]] = []
+        self._shake_disconnect_detected = False
         sockets = socket_definitions(node.node_type)
         input_count = sum(1 for socket in sockets if socket.direction is SocketDirection.INPUT)
         output_count = sum(1 for socket in sockets if socket.direction is SocketDirection.OUTPUT)
@@ -729,9 +786,46 @@ class GraphNodeItem(QGraphicsRectItem):
                     event.accept()
                     return
             self._drag_start_position = self.node.position
+            screen_position = event.screenPos()
+            self._drag_screen_start = QPoint(screen_position)
+            self._shake_samples = [
+                (monotonic(), float(screen_position.x()), float(screen_position.y()))
+            ]
+            self._shake_disconnect_detected = False
             if isinstance(scene, GraphScene):
                 scene.begin_node_move(self.node.node_id)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        if self._drag_start_position is None:
+            return
+        scene = self.scene()
+        if not isinstance(scene, GraphScene):
+            return
+        screen_position = event.screenPos()
+        if self._drag_screen_start is not None:
+            drag_distance = (screen_position - self._drag_screen_start).manhattanLength()
+            if drag_distance >= 6:
+                scene.update_node_drop_target(self.node.node_id)
+        if self._shake_disconnect_detected:
+            return
+        now = monotonic()
+        sample = (now, float(screen_position.x()), float(screen_position.y()))
+        if self._shake_samples:
+            previous = self._shake_samples[-1]
+            if abs(sample[1] - previous[1]) + abs(sample[2] - previous[2]) < 2:
+                return
+        self._shake_samples.append(sample)
+        self._shake_samples = [
+            candidate
+            for candidate in self._shake_samples
+            if now - candidate[0] <= SHAKE_WINDOW_SECONDS
+        ]
+        if is_disconnect_shake(self._shake_samples):
+            self._shake_disconnect_detected = scene.mark_node_shake_disconnect(
+                self.node.node_id
+            )
 
     def mouseReleaseEvent(self, event) -> None:
         super().mouseReleaseEvent(event)
@@ -742,6 +836,9 @@ class GraphNodeItem(QGraphicsRectItem):
         next_position = (float(self.pos().x()), float(self.pos().y()))
         previous_position = self._drag_start_position
         self._drag_start_position = None
+        self._drag_screen_start = None
+        self._shake_samples = []
+        self._shake_disconnect_detected = False
         scene = self.scene()
         if isinstance(scene, GraphScene):
             scene.finish_node_move()
@@ -800,6 +897,8 @@ class GraphScene(QGraphicsScene):
     node_double_clicked = pyqtSignal(object)
     node_enable_flag_clicked = pyqtSignal(object)
     node_help_requested = pyqtSignal(object, object)
+    node_shake_disconnect_requested = pyqtSignal(object, object, object)
+    node_wire_insert_requested = pyqtSignal(object, object, object, object)
     node_moved = pyqtSignal(object, object, object)
     nodes_moved = pyqtSignal(object, object)
     node_render_flag_clicked = pyqtSignal(object)
@@ -822,6 +921,9 @@ class GraphScene(QGraphicsScene):
         self.drag_start_scene_pos: QPointF | None = None
         self.drag_wire: QGraphicsPathItem | None = None
         self.move_start_positions: dict[str, tuple[float, float]] = {}
+        self.active_move_node_id: str | None = None
+        self.shake_disconnect_node_id: str | None = None
+        self.drop_target_connection_id: str | None = None
         self.editing_enabled = True
         self._pending_selection_active = False
         self._pending_selection_node_id: str | None = None
@@ -838,6 +940,9 @@ class GraphScene(QGraphicsScene):
         self.drag_start_scene_pos = None
         self.drag_wire = None
         self.move_start_positions = {}
+        self.active_move_node_id = None
+        self.shake_disconnect_node_id = None
+        self.drop_target_connection_id = None
         for node in self.project.graph.nodes:
             item = GraphNodeItem(node, self.texture_visual_cache)
             item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, self.editing_enabled)
@@ -1053,6 +1158,113 @@ class GraphScene(QGraphicsScene):
             for node_id, item in self.node_items.items()
             if node_id in selected_ids
         }
+        self.active_move_node_id = active_node_id
+        self.shake_disconnect_node_id = None
+        self._set_drop_target_connection(None)
+
+    def mark_node_shake_disconnect(self, node_id: str) -> bool:
+        if node_id != self.active_move_node_id:
+            return False
+        connection_ids = self.connection_ids_by_node.get(node_id, set())
+        if not connection_ids:
+            return False
+        self.shake_disconnect_node_id = node_id
+        self._set_drop_target_connection(None)
+        for connection_id in connection_ids:
+            item = self.connection_items.get(connection_id)
+            if item is not None:
+                item.setVisible(False)
+        self.status_message.emit("Shake disconnect: release to detach the node.")
+        return True
+
+    def update_node_drop_target(self, node_id: str) -> None:
+        if (
+            node_id != self.active_move_node_id
+            or self.shake_disconnect_node_id is not None
+        ):
+            self._set_drop_target_connection(None)
+            return
+        node_item = self.node_items.get(node_id)
+        if node_item is None:
+            self._set_drop_target_connection(None)
+            return
+        node_path = QPainterPath()
+        node_path.addRoundedRect(node_item.sceneBoundingRect(), 5.0, 5.0)
+        candidates = [
+            connection_item
+            for connection_item in self.connection_items.values()
+            if self._connection_accepts_node(connection_item, node_item)
+            and connection_item.mapToScene(connection_item.shape()).intersects(node_path)
+        ]
+        if not candidates:
+            self._set_drop_target_connection(None)
+            return
+        center = node_item.sceneBoundingRect().center()
+        candidate = min(
+            candidates,
+            key=lambda item: self._connection_distance_squared(item, center),
+        )
+        candidate_id = candidate.connection.connection_id
+        target_changed = self.drop_target_connection_id != candidate_id
+        self._set_drop_target_connection(candidate_id)
+        if target_changed:
+            self.status_message.emit(
+                f"Release to insert {node_item.node.title} into the highlighted wire."
+            )
+
+    def _set_drop_target_connection(self, connection_id: str | None) -> None:
+        if self.drop_target_connection_id == connection_id:
+            return
+        previous = self.connection_items.get(self.drop_target_connection_id or "")
+        if previous is not None:
+            previous.set_drop_target(False)
+        self.drop_target_connection_id = connection_id
+        current = self.connection_items.get(connection_id or "")
+        if current is not None:
+            current.set_drop_target(True)
+
+    @staticmethod
+    def _connection_accepts_node(
+        connection_item: ConnectionItem,
+        node_item: GraphNodeItem,
+    ) -> bool:
+        connection = connection_item.connection
+        if node_item.node.node_id in (
+            connection.source_node_id,
+            connection.target_node_id,
+        ):
+            return False
+        bypass_pair = node_bypass_socket_pair(node_item.node.node_type)
+        if bypass_pair is None:
+            return False
+        socket_by_id = {
+            socket.socket_id: socket
+            for socket in socket_definitions(node_item.node.node_type)
+        }
+        input_socket = socket_by_id.get(bypass_pair[0])
+        output_socket = socket_by_id.get(bypass_pair[1])
+        if input_socket is None or output_socket is None:
+            return False
+        wire_type = connection_item.source_port.socket_type
+        return (
+            connection_item.target_port.socket_type is wire_type
+            and input_socket.direction is SocketDirection.INPUT
+            and output_socket.direction is SocketDirection.OUTPUT
+            and input_socket.socket_type is wire_type
+            and output_socket.socket_type is wire_type
+        )
+
+    @staticmethod
+    def _connection_distance_squared(
+        connection_item: ConnectionItem,
+        point: QPointF,
+    ) -> float:
+        path = connection_item.path()
+        return min(
+            (path.pointAtPercent(index / 20.0).x() - point.x()) ** 2
+            + (path.pointAtPercent(index / 20.0).y() - point.y()) ** 2
+            for index in range(21)
+        )
 
     def finish_node_move(self) -> None:
         if not self.move_start_positions:
@@ -1070,12 +1282,54 @@ class GraphScene(QGraphicsScene):
             for node_id, position in after_positions.items()
             if before_positions.get(node_id) != position
         }
-        if changed_after:
+        active_node_id = self.active_move_node_id
+        shake_disconnect = self.shake_disconnect_node_id == active_node_id
+        drop_target_id = self.drop_target_connection_id
+        self.active_move_node_id = None
+        self.shake_disconnect_node_id = None
+        self._set_drop_target_connection(None)
+        if shake_disconnect and active_node_id is not None:
+            node_item = self.node_items.get(active_node_id)
+            node = node_item.node if node_item is not None else None
+            if node is not None:
+                QTimer.singleShot(
+                    0,
+                    partial(
+                        self.node_shake_disconnect_requested.emit,
+                        node,
+                        before_positions,
+                        after_positions,
+                    ),
+                )
+        elif drop_target_id is not None and active_node_id is not None:
+            node_item = self.node_items.get(active_node_id)
+            connection_item = self.connection_items.get(drop_target_id)
+            node = node_item.node if node_item is not None else None
+            connection = (
+                connection_item.connection if connection_item is not None else None
+            )
+            if node is not None and connection is not None:
+                QTimer.singleShot(
+                    0,
+                    partial(
+                        self.node_wire_insert_requested.emit,
+                        node,
+                        connection,
+                        before_positions,
+                        after_positions,
+                    ),
+                )
+        elif changed_after:
             changed_before = {
                 node_id: before_positions[node_id]
                 for node_id in changed_after
             }
             self.nodes_moved.emit(changed_before, changed_after)
+        if shake_disconnect:
+            for connection_id in self.connection_ids_by_node.get(active_node_id or "", set()):
+                item = self.connection_items.get(connection_id)
+                if item is not None:
+                    item.setVisible(True)
         if pending_selection_active:
             self._flush_pending_selection()
 
@@ -1162,6 +1416,8 @@ class GraphView(QGraphicsView):
         self._pan_scroll: tuple[int, int] = (0, 0)
         self._knife_active = False
         self._knife_start: QPointF | None = None
+        self._knife_cursor = self._create_knife_cursor()
+        self._knife_cursor_override_active = False
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -1243,7 +1499,7 @@ class GraphView(QGraphicsView):
                 scene.cut_connections_by_path(path)
             self._knife_start = None
             self._knife_active = False
-            self.unsetCursor()
+            self._set_knife_cursor_active(False)
             event.accept()
             return
         if event.button() == Qt.MouseButton.MiddleButton and self._pan_start is not None:
@@ -1266,7 +1522,7 @@ class GraphView(QGraphicsView):
                 event.ignore()
                 return
             self._knife_active = True
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._set_knife_cursor_active(True)
             scene = self.scene()
             if isinstance(scene, GraphScene):
                 scene.status_message.emit("Y-drag: cut wires.")
@@ -1277,10 +1533,55 @@ class GraphView(QGraphicsView):
     def keyReleaseEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Y and self._knife_start is None:
             self._knife_active = False
-            self.unsetCursor()
+            self._set_knife_cursor_active(False)
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        if self._knife_active or self._knife_cursor_override_active:
+            self._knife_start = None
+            self._knife_active = False
+            self._set_knife_cursor_active(False)
+        super().focusOutEvent(event)
+
+    def _set_knife_cursor_active(self, active: bool) -> None:
+        if active:
+            if not self._knife_cursor_override_active:
+                QApplication.setOverrideCursor(self._knife_cursor)
+                self._knife_cursor_override_active = True
+            return
+
+        if self._knife_cursor_override_active:
+            QApplication.restoreOverrideCursor()
+            self._knife_cursor_override_active = False
+
+    @staticmethod
+    def _create_knife_cursor() -> QCursor:
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        painter.setPen(QPen(QColor("#0C1117"), 7.0, Qt.PenStyle.SolidLine))
+        painter.drawLine(QPointF(5.0, 27.0), QPointF(18.0, 14.0))
+        painter.setPen(QPen(QColor("#4A5B6D"), 4.0, Qt.PenStyle.SolidLine))
+        painter.drawLine(QPointF(5.0, 27.0), QPointF(18.0, 14.0))
+
+        blade = QPainterPath(QPointF(16.0, 17.0))
+        blade.lineTo(QPointF(27.0, 4.0))
+        blade.lineTo(QPointF(30.0, 2.0))
+        blade.lineTo(QPointF(27.0, 9.0))
+        blade.lineTo(QPointF(20.0, 18.0))
+        blade.closeSubpath()
+        painter.setPen(QPen(QColor("#111820"), 1.5))
+        painter.setBrush(QColor("#E6EDF5"))
+        painter.drawPath(blade)
+
+        painter.setPen(QPen(QColor("#67B1FF"), 1.2))
+        painter.drawLine(QPointF(19.0, 15.0), QPointF(28.0, 4.0))
+        painter.end()
+        return QCursor(pixmap, 30, 2)
 
     def dragEnterEvent(self, event) -> None:
         if self._extract_texture_path(event.mimeData()):
@@ -1350,6 +1651,11 @@ class GraphView(QGraphicsView):
         self._add_node_menu_action(image_menu, "Mix Image", NodeType.MIX_IMAGE, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Blend Image", NodeType.BLEND_IMAGE, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Normal Map", NodeType.NORMAL_MAP, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Height to Normal", NodeType.HEIGHT_TO_NORMAL, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Normal Blend", NodeType.NORMAL_BLEND, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Color Adjust", NodeType.COLOR_ADJUST, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Transform 2D", NodeType.TRANSFORM_2D, scene_position, wire_port)
+        self._add_node_menu_action(image_menu, "Resize / Canvas", NodeType.RESIZE_CANVAS, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Split RGBA", NodeType.SPLIT_RGBA, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Combine RGBA", NodeType.COMBINE_RGBA, scene_position, wire_port)
         self._add_node_menu_action(image_menu, "Apply Mask", NodeType.SET_ALPHA, scene_position, wire_port)

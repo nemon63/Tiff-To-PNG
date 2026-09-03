@@ -261,6 +261,72 @@ NODE_HELP_CONTENT: dict[NodeType, NodeHelpContent] = {
             "корректную длину вектора. Если нода отключена, изображение проходит без изменений."
         ),
     ),
+    NodeType.HEIGHT_TO_NORMAL: NodeHelpContent(
+        title="Height to Normal",
+        summary="Создаёт tangent-space Normal Map из grayscale-карты высот.",
+        details=(
+            ("Height", "Исходная карта высот: чёрный ниже, белый выше."),
+            ("Strength", "Сила наклона нормалей; 0% создаёт плоскую нормаль."),
+            ("Radius", "Предварительно сглаживает Height перед вычислением производных."),
+            ("Convention", "OpenGL создаёт Y+, DirectX — инвертированный зелёный канал Y−."),
+            ("Normal", "Готовая нормализованная RGB normal map."),
+        ),
+        note="Для Unreal обычно выбирайте DirectX, для Unity — OpenGL.",
+    ),
+    NodeType.NORMAL_BLEND: NodeHelpContent(
+        title="Normal Blend",
+        summary="Корректно объединяет основную и detail normal map методом RNM.",
+        details=(
+            ("Base", "Основная tangent-space normal map."),
+            ("Detail", "Detail normal map, переориентируемая относительно Base."),
+            ("Mask", "Необязательно ограничивает detail: 0 оставляет Base, 255 применяет RNM."),
+            ("Detail Strength", "Масштабирует X/Y detail-нормали перед смешиванием."),
+            ("Normal", "Нормализованный результат с альфой Base."),
+        ),
+        note=(
+            "Обычный Blend Image для normal map математически неверен. "
+            "Обе карты должны использовать одну ориентацию Y."
+        ),
+    ),
+    NodeType.COLOR_ADJUST: NodeHelpContent(
+        title="Color Adjust",
+        summary="Выполняет основные цветовые коррекции Base Color или Emissive в одной ноде.",
+        details=(
+            ("Exposure", "Экспозиция в стопах: +1 удваивает яркость."),
+            ("Brightness", "Линейно сдвигает яркость от −100 до +100."),
+            ("Contrast", "100% без изменений; меньше снижает, больше усиливает контраст."),
+            ("Saturation", "0% даёт grayscale, 100% сохраняет исходную насыщенность."),
+            ("Hue", "Сдвигает оттенок на −180…+180 градусов."),
+            ("Gamma", "Корректирует средние тона; 1.0 без изменений."),
+        ),
+        note="Альфа-канал всегда сохраняется без изменений.",
+    ),
+    NodeType.TRANSFORM_2D: NodeHelpContent(
+        title="Transform 2D",
+        summary="Трансформирует текстуру внутри её canvas без изменения рабочего процесса графа.",
+        details=(
+            ("Flip", "Отражает изображение по горизонтали или вертикали."),
+            ("Rotate", "Поворачивает на 0°, 90°, 180° или 270° по часовой стрелке."),
+            ("Offset", "Сдвигает изображение по X/Y в пикселях."),
+            ("Scale", "Масштабирует изображение относительно центра canvas."),
+            ("Address", "Clamp растягивает края, Repeat повторяет, Mirror чередует отражённые тайлы."),
+            ("Filter", "Фильтр масштабирования текстуры."),
+        ),
+        note="Поворот 90° или 270° меняет местами естественную ширину и высоту результата.",
+    ),
+    NodeType.RESIZE_CANVAS: NodeHelpContent(
+        title="Resize / Canvas",
+        summary="Приводит карту к точному или Power-of-Two размеру с контролем кадрирования.",
+        details=(
+            ("Output Size", "Exact использует Width/Height; POT выбирает степень двойки от входа."),
+            ("Stretch", "Заполняет размер с возможным изменением пропорций."),
+            ("Fit", "Вписывает всё изображение и добавляет прозрачные поля."),
+            ("Fill", "Заполняет canvas без искажения и обрезает лишнее по центру."),
+            ("Crop", "Не масштабирует: обрезает или дополняет прозрачным canvas."),
+            ("Pad", "Уменьшает только слишком большую карту и добавляет прозрачные поля."),
+            ("Filter", "Nearest, Bilinear, Bicubic или Lanczos."),
+        ),
+    ),
     NodeType.SPLIT_RGBA: NodeHelpContent(
         title="Split RGBA",
         summary="Разделяет одно RGBA-изображение на четыре grayscale-канала.",

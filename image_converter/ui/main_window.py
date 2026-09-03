@@ -159,6 +159,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setDockNestingEnabled(True)
+        self.file_menu = self.menuBar().addMenu("Файл")
         self.mode_menu = self.menuBar().addMenu("Режим")
         self.view_menu = self.menuBar().addMenu("Вид")
 
@@ -209,6 +210,9 @@ class MainWindow(QMainWindow):
         self.graph_workspace.assets_changed.connect(self._on_graph_assets_changed)
         self.graph_workspace.template_changed.connect(self._refresh_graph_apply_preflight)
         self.graph_workspace.watched_paths_changed.connect(self._on_graph_watched_paths_changed)
+        self.graph_workspace.recent_projects_changed.connect(
+            self._rebuild_recent_graph_menu
+        )
         self.log_panel = LogPanel()
         self._graph_auto_export_timer = QTimer(self)
         self._graph_auto_export_timer.setInterval(250)
@@ -272,6 +276,7 @@ class MainWindow(QMainWindow):
         self.node_properties_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.node_properties_shortcut.activated.connect(self._show_node_properties_dock)
 
+        self._register_file_actions()
         self._register_mode_actions()
         self._register_view_docks()
         self.node_properties_dock.hide()
@@ -380,6 +385,95 @@ class MainWindow(QMainWindow):
         self.mode_action_group.addAction(self.graph_mode_action)
         self.mode_menu.addAction(self.batch_mode_action)
         self.mode_menu.addAction(self.graph_mode_action)
+
+    def _register_file_actions(self) -> None:
+        self.new_graph_action = QAction("Новый граф", self)
+        self.new_graph_action.setShortcut(QKeySequence("Ctrl+N"))
+        self.new_graph_action.triggered.connect(self._new_graph_project)
+        self.file_menu.addAction(self.new_graph_action)
+
+        self.open_graph_action = QAction("Открыть граф…", self)
+        self.open_graph_action.setShortcut(QKeySequence("Ctrl+O"))
+        self.open_graph_action.triggered.connect(self._open_graph_project)
+        self.file_menu.addAction(self.open_graph_action)
+
+        self.recent_graph_menu = self.file_menu.addMenu("Недавние графы")
+        self._rebuild_recent_graph_menu(self.graph_workspace.recent_project_paths())
+        self.file_menu.addSeparator()
+
+        self.save_graph_action = QAction("Сохранить граф", self)
+        self.save_graph_action.setShortcut(QKeySequence("Ctrl+S"))
+        self.save_graph_action.triggered.connect(self._save_graph_project)
+        self.file_menu.addAction(self.save_graph_action)
+
+        self.save_graph_as_action = QAction("Сохранить граф как…", self)
+        self.save_graph_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.save_graph_as_action.triggered.connect(self._save_graph_project_as)
+        self.file_menu.addAction(self.save_graph_as_action)
+        self.file_menu.addSeparator()
+
+        self.exit_action = QAction("Выход", self)
+        self.exit_action.setShortcut(QKeySequence("Alt+F4"))
+        self.exit_action.triggered.connect(self.close)
+        self.file_menu.addAction(self.exit_action)
+
+    def _new_graph_project(self) -> None:
+        if not self._confirm_unsaved_graph():
+            return
+        self.graph_workspace.new_project()
+        self._set_workspace_mode(WORKSPACE_GRAPH)
+
+    def _open_graph_project(self) -> None:
+        if not self._confirm_unsaved_graph():
+            return
+        if self.graph_workspace.load_project_dialog():
+            self._set_workspace_mode(WORKSPACE_GRAPH)
+
+    def _open_recent_graph(self, project_path: Path) -> None:
+        if not self._confirm_unsaved_graph():
+            return
+        if self.graph_workspace.load_project(project_path):
+            self._set_workspace_mode(WORKSPACE_GRAPH)
+
+    def _save_graph_project(self) -> None:
+        self.graph_workspace.save_project_dialog()
+
+    def _save_graph_project_as(self) -> None:
+        self.graph_workspace.save_project_as_dialog()
+
+    def _rebuild_recent_graph_menu(self, paths: object = ()) -> None:
+        if not hasattr(self, "recent_graph_menu"):
+            return
+        self.recent_graph_menu.clear()
+        project_paths = tuple(Path(str(path)) for path in paths)
+        if not project_paths:
+            empty_action = self.recent_graph_menu.addAction("Нет недавних графов")
+            empty_action.setEnabled(False)
+            return
+        for project_path in project_paths:
+            action = self.recent_graph_menu.addAction(project_path.name)
+            action.setStatusTip(str(project_path))
+            action.triggered.connect(
+                lambda _checked=False, path=project_path: self._open_recent_graph(path)
+            )
+
+    def _confirm_unsaved_graph(self) -> bool:
+        if not self.graph_workspace.has_unsaved_changes():
+            return True
+        button = QMessageBox.question(
+            self,
+            "Граф не сохранён",
+            "В графе есть несохранённые изменения. Сохранить их?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if button is QMessageBox.StandardButton.Cancel:
+            return False
+        if button is QMessageBox.StandardButton.Save:
+            return self.graph_workspace.save_project_dialog()
+        return True
 
     def _build_top_toolbar(self) -> QFrame:
         toolbar = QFrame()
@@ -891,6 +985,15 @@ class MainWindow(QMainWindow):
             self.auto_watch_button.setEnabled(not running)
         if hasattr(self, "auto_export_button"):
             self.auto_export_button.setEnabled(not running)
+        for action_name in (
+            "new_graph_action",
+            "open_graph_action",
+            "save_graph_action",
+            "save_graph_as_action",
+        ):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(not running)
 
     def is_running(self) -> bool:
         return self._is_running
@@ -1023,24 +1126,9 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
-        if self.graph_workspace.has_unsaved_changes():
-            button = QMessageBox.question(
-                self,
-                "Graph не сохранен",
-                "В графе есть несохраненные изменения. Сохранить проект перед закрытием?",
-                QMessageBox.StandardButton.Save
-                | QMessageBox.StandardButton.Discard
-                | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Save,
-            )
-            if button is QMessageBox.StandardButton.Cancel:
-                event.ignore()
-                return
-            if button is QMessageBox.StandardButton.Save:
-                self.graph_workspace.save_project_dialog()
-                if self.graph_workspace.has_unsaved_changes():
-                    event.ignore()
-                    return
+        if not self._confirm_unsaved_graph():
+            event.ignore()
+            return
         background_jobs_stopped = all(
             (
                 self._asset_scan_controller.shutdown(wait_ms=100),

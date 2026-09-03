@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -10,6 +10,7 @@ from PyQt6.QtCore import (
     QObject,
     QPointF,
     QSize,
+    QStandardPaths,
     Qt,
     QThread,
     QTimer,
@@ -27,12 +28,10 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QMenu,
     QPushButton,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -68,6 +67,7 @@ from image_converter.ui.graph_commands import (
     AddNodesCommand,
     DeleteItemsCommand,
     InsertNodeInConnectionCommand,
+    MoveAndRewireNodeCommand,
     MoveNodesCommand,
     RemoveConnectionsCommand,
     ReplaceInputConnectionCommand,
@@ -113,7 +113,12 @@ from image_converter.services.node_graph_executor import (
     NodeGraphExecutor,
     NodeGraphPreviewCache,
 )
-from image_converter.services.node_graph_project import NodeGraphProjectRepository
+from image_converter.services.node_graph_project import (
+    GRAPH_PROJECT_EXTENSION,
+    GRAPH_PROJECT_FILE_FILTER,
+    GRAPH_PROJECT_FILENAME,
+    NodeGraphProjectRepository,
+)
 from image_converter.services.map_types import detect_texture_map_type
 from image_converter.services.packing import PACK_LAYOUTS, PackSourceCandidate
 from image_converter.services.pbr_preview import PbrMaterialData
@@ -330,10 +335,12 @@ class GraphWorkspace(QWidget):
     watched_paths_changed = pyqtSignal(tuple)
     assets_changed = pyqtSignal(tuple)
     template_changed = pyqtSignal()
+    recent_projects_changed = pyqtSignal(tuple)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.project = NodeGraphProject()
+        self.project_path: Path | None = None
         self.project_dir: Path | None = None
         self._assets: list[QueueItem] = []
         self._clipboard_nodes: list[GraphNode] = []
@@ -399,6 +406,12 @@ class GraphWorkspace(QWidget):
         self._scene.node_enable_flag_clicked.connect(self._on_enable_flag_clicked)
         self._scene.node_moved.connect(self._on_node_moved)
         self._scene.nodes_moved.connect(self._on_nodes_moved)
+        self._scene.node_shake_disconnect_requested.connect(
+            self._on_node_shake_disconnect_requested
+        )
+        self._scene.node_wire_insert_requested.connect(
+            self._on_node_wire_insert_requested
+        )
         self._scene.node_render_flag_clicked.connect(self._on_render_flag_clicked)
         self._scene.node_reset_clicked.connect(self._on_node_reset_clicked)
         self._scene.node_properties_selection_changed.connect(self._on_properties_node_selected)
@@ -427,22 +440,13 @@ class GraphWorkspace(QWidget):
 
         menu_hint = QLabel("Right-click graph to add nodes")
         menu_hint.setObjectName("SummaryText")
+        menu_hint.setToolTip(
+            "Shake a connected node to detach it. "
+            "Drop a compatible node on a highlighted wire to insert it."
+        )
         project_row.addWidget(menu_hint)
         project_row.addStretch(1)
 
-        self.new_button = QPushButton("New")
-        self.new_button.clicked.connect(self.new_project)
-        project_row.addWidget(self.new_button)
-        self.load_button = QPushButton("Load")
-        self.load_button.clicked.connect(self.load_project_dialog)
-        project_row.addWidget(self.load_button)
-        self.save_button = QPushButton("Save")
-        self.save_button.clicked.connect(self.save_project_dialog)
-        project_row.addWidget(self.save_button)
-        self.recent_button = QToolButton()
-        self.recent_button.setText("Recent")
-        self.recent_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        project_row.addWidget(self.recent_button)
         self.export_button = QPushButton("Export Graph")
         self.export_button.setObjectName("PrimaryButton")
         self.export_button.clicked.connect(self.export_requested.emit)
@@ -517,7 +521,6 @@ class GraphWorkspace(QWidget):
         self.validation_table.itemSelectionChanged.connect(self._select_validation_issue_node)
 
         root_layout.addWidget(self.view, 1)
-        self._rebuild_recent_menu()
 
     def build_properties_widget(self) -> QWidget:
         panel = QFrame()
@@ -552,9 +555,6 @@ class GraphWorkspace(QWidget):
         self._scene.set_editing_enabled(enabled)
         self.properties_panel.setEnabled(enabled)
         for control in (
-            self.new_button,
-            self.load_button,
-            self.recent_button,
             self.delete_button,
             self.layout_button,
             self.remap_button,
@@ -663,16 +663,17 @@ class GraphWorkspace(QWidget):
     def apply_recent_projects(self, paths: Iterable[str]) -> None:
         self._recent_project_dirs = []
         for raw_path in paths:
-            path = Path(raw_path)
+            path = self._repository.resolve_project_path(Path(raw_path))
             if path.exists() and path not in self._recent_project_dirs:
                 self._recent_project_dirs.append(path)
-        self._rebuild_recent_menu()
+        self.recent_projects_changed.emit(self.recent_project_paths())
 
     def recent_project_paths(self) -> tuple[str, ...]:
         return tuple(str(path) for path in self._recent_project_dirs[:8])
 
     def new_project(self) -> None:
         self.project = NodeGraphProject()
+        self.project_path = None
         self.project_dir = None
         self._last_preview_node_id = None
         self._last_preview_mode_label = ""
@@ -691,52 +692,81 @@ class GraphWorkspace(QWidget):
         self._rebuild_asset_watchers()
         self.status_message.emit("New graph project.")
 
-    def load_project_dialog(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Load .texturegraph project")
+    def load_project_dialog(self) -> bool:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Load Graph Project",
+            str(self._project_dialog_directory()),
+            GRAPH_PROJECT_FILE_FILTER,
+        )
         if not path:
-            return
-        self.load_project(Path(path))
+            return False
+        return self.load_project(Path(path))
 
-    def save_project_dialog(self) -> None:
-        path = str(self.project_dir or "")
-        if not path:
-            path = QFileDialog.getExistingDirectory(self, "Save .texturegraph project")
-        if not path:
-            return
-        self.save_project(Path(path))
+    def save_project_dialog(self) -> bool:
+        if self.project_path is None:
+            return self.save_project_as_dialog()
+        return self.save_project(self.project_path)
 
-    def save_project(self, bundle_dir: Path) -> None:
+    def save_project_as_dialog(self) -> bool:
+        suggested_name = f"{self.project.name or 'Untitled Graph'}{GRAPH_PROJECT_EXTENSION}"
+        suggested_path = self.project_path or (
+            self._project_dialog_directory() / suggested_name
+        )
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Graph Project",
+            str(suggested_path),
+            GRAPH_PROJECT_FILE_FILTER,
+        )
+        if not path:
+            return False
+        project_path = Path(path)
+        if not project_path.suffix:
+            project_path = project_path.with_suffix(GRAPH_PROJECT_EXTENSION)
+        return self.save_project(project_path)
+
+    def save_project(self, location: Path) -> bool:
+        project_path = self._repository.resolve_project_path(location)
+        if not project_path.suffix:
+            project_path = project_path.with_suffix(GRAPH_PROJECT_EXTENSION)
+        previous_name = self.project.name
+        self.project.name = self._project_name_from_path(project_path)
         try:
-            self._repository.save(self.project, bundle_dir)
+            project_path = self._repository.save(self.project, project_path)
         except Exception as exc:
+            self.project.name = previous_name
             self.status_message.emit(f"Graph save failed: {exc}")
-            return
-        self.project_dir = bundle_dir
-        self.project.name = bundle_dir.stem
-        self._remember_recent_project(bundle_dir)
+            return False
+        self.project_path = project_path
+        self.project_dir = project_path.parent
+        self._remember_recent_project(project_path)
         self.undo_stack.setClean()
         self._update_project_label()
-        self.status_message.emit(f"Saved graph: {bundle_dir}")
+        self.status_message.emit(f"Saved graph file: {project_path}")
+        return True
 
     def autosave_project(self) -> None:
-        if not self.has_unsaved_changes() or self.project_dir is None:
+        if not self.has_unsaved_changes() or self.project_path is None:
             return
-        autosave_dir = self.project_dir / ".autosave.texturegraph"
+        autosave_path = self.project_path.with_suffix(".autosave.texturegraph")
         try:
-            self._repository.save(self.project, autosave_dir)
+            self._repository.save(self.project, autosave_path)
         except Exception as exc:
             self.status_message.emit(f"Graph autosave failed: {exc}")
             return
-        self.status_message.emit(f"Autosaved graph: {autosave_dir}")
+        self.status_message.emit(f"Autosaved graph file: {autosave_path}")
 
-    def load_project(self, bundle_dir: Path) -> None:
+    def load_project(self, location: Path) -> bool:
+        project_path = self._repository.resolve_project_path(location)
         try:
-            self.project = self._repository.load(bundle_dir)
+            self.project = self._repository.load(project_path)
         except Exception as exc:
             self.status_message.emit(f"Graph load failed: {exc}")
-            return
-        self.project_dir = bundle_dir
-        self._remember_recent_project(bundle_dir)
+            return False
+        self.project_path = project_path
+        self.project_dir = project_path.parent
+        self._remember_recent_project(project_path)
         self._last_preview_node_id = None
         self._last_preview_mode_label = ""
         self._preview_generation += 1
@@ -752,6 +782,21 @@ class GraphWorkspace(QWidget):
         self._refresh_validation()
         self._rebuild_asset_watchers()
         self.status_message.emit(f"Loaded graph: {self.project.name}")
+        return True
+
+    @staticmethod
+    def _project_name_from_path(project_path: Path) -> str:
+        if project_path.name == GRAPH_PROJECT_FILENAME:
+            return project_path.parent.name or "Graph"
+        return project_path.stem or "Graph"
+
+    def _project_dialog_directory(self) -> Path:
+        if self.project_dir is not None:
+            return self.project_dir
+        documents = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation
+        )
+        return Path(documents) if documents else Path.cwd()
 
     def remap_missing_texture_paths(self) -> None:
         missing_nodes = [
@@ -829,7 +874,7 @@ class GraphWorkspace(QWidget):
         self._preview_active_display_node()
 
     def _schedule_autosave(self) -> None:
-        if self.project_dir is not None and self.has_unsaved_changes():
+        if self.project_path is not None and self.has_unsaved_changes():
             self._autosave_timer.start()
 
     def _remember_recent_project(self, bundle_dir: Path) -> None:
@@ -842,22 +887,7 @@ class GraphWorkspace(QWidget):
         ]
         self._recent_project_dirs.insert(0, resolved)
         self._recent_project_dirs = self._recent_project_dirs[:8]
-        self._rebuild_recent_menu()
-
-    def _rebuild_recent_menu(self) -> None:
-        if not hasattr(self, "recent_button"):
-            return
-        menu = QMenu(self.recent_button)
-        if not self._recent_project_dirs:
-            empty_action = menu.addAction("No recent projects")
-            empty_action.setEnabled(False)
-        for bundle_dir in self._recent_project_dirs:
-            action = menu.addAction(bundle_dir.name)
-            action.setToolTip(str(bundle_dir))
-            action.triggered.connect(
-                lambda _checked=False, path=bundle_dir: self.load_project(path)
-            )
-        self.recent_button.setMenu(menu)
+        self.recent_projects_changed.emit(self.recent_project_paths())
 
     def add_texture_node_from_selected_asset(self) -> None:
         if not self._assets:
@@ -1090,6 +1120,12 @@ class GraphWorkspace(QWidget):
             NodeType.LUMINANCE,
             NodeType.MIX_IMAGE,
             NodeType.BLEND_IMAGE,
+            NodeType.NORMAL_MAP,
+            NodeType.HEIGHT_TO_NORMAL,
+            NodeType.NORMAL_BLEND,
+            NodeType.COLOR_ADJUST,
+            NodeType.TRANSFORM_2D,
+            NodeType.RESIZE_CANVAS,
             NodeType.SPLIT_RGBA,
             NodeType.COMBINE_RGBA,
             NodeType.SET_ALPHA,
@@ -1218,7 +1254,12 @@ class GraphWorkspace(QWidget):
             self._scene.select_node_ids(selected_ids)
         self._update_project_label()
 
-    def _on_graph_command_changed(self, needs_rebuild: bool | str = True) -> None:
+    def _on_graph_command_changed(
+        self,
+        needs_rebuild: bool | str = True,
+        *,
+        preview_dirty_node_ids: Iterable[str] = (),
+    ) -> None:
         selected_ids = self._scene.selected_node_ids()
         if not selected_ids and self.properties_panel._node is not None:
             selected_ids = [self.properties_panel._node.node_id]
@@ -1230,10 +1271,20 @@ class GraphWorkspace(QWidget):
             self._schedule_autosave()
             self.template_changed.emit()
             return
+        dirty_node_ids = tuple(dict.fromkeys(preview_dirty_node_ids))
         if needs_rebuild:
-            self._preview_cache.clear()
-            if self._preview_inflight_generation:
-                self._preview_full_reset_pending = True
+            if dirty_node_ids:
+                for node_id in dirty_node_ids:
+                    self._preview_cache.invalidate_node_and_downstream(
+                        self.project.graph,
+                        node_id,
+                    )
+                if self._preview_inflight_generation:
+                    self._preview_dirty_node_ids.update(dirty_node_ids)
+            else:
+                self._preview_cache.clear()
+                if self._preview_inflight_generation:
+                    self._preview_full_reset_pending = True
         else:
             selected_node = self._scene.selected_node() or self.properties_panel._node
             if selected_node is not None:
@@ -1273,14 +1324,23 @@ class GraphWorkspace(QWidget):
             return
         if not node_ids and not connection_ids:
             return
+        connection_id_set = set(connection_ids)
+        connection_target_ids = {
+            connection.target_node_id
+            for connection in self.project.graph.connections
+            if connection.connection_id in connection_id_set
+        }
         replacement_connections = self._dissolve_replacement_connections(
             node_ids,
             connection_ids,
         )
+        on_changed = self._on_graph_command_changed
+        if not node_ids and connection_target_ids:
+            on_changed = self._targeted_graph_change_callback(connection_target_ids)
         self._push_graph_command(
             DeleteItemsCommand(
                 self.project.graph,
-                self._on_graph_command_changed,
+                on_changed,
                 node_ids=node_ids,
                 connection_ids=connection_ids,
                 replacement_connections=replacement_connections,
@@ -1436,7 +1496,9 @@ class GraphWorkspace(QWidget):
         self._push_graph_command(
             ReplaceInputConnectionCommand(
                 self.project.graph,
-                self._on_graph_command_changed,
+                self._targeted_graph_change_callback(
+                    (connection.target_node_id,)
+                ),
                 connection,
                 remove_connections=remove_connections,
             ),
@@ -1453,10 +1515,22 @@ class GraphWorkspace(QWidget):
         self._push_graph_command(
             RemoveConnectionsCommand(
                 self.project.graph,
-                self._on_graph_command_changed,
+                self._targeted_graph_change_callback(
+                    (connection.target_node_id,)
+                ),
                 [connection],
                 text="Delete connection",
             )
+        )
+
+    def _targeted_graph_change_callback(
+        self,
+        node_ids: Iterable[str],
+    ) -> Callable[[bool], None]:
+        dirty_node_ids = tuple(dict.fromkeys(node_ids))
+        return lambda needs_rebuild: self._on_graph_command_changed(
+            needs_rebuild,
+            preview_dirty_node_ids=dirty_node_ids,
         )
 
     def _on_connection_insert_node_requested(
@@ -1511,6 +1585,289 @@ class GraphWorkspace(QWidget):
     def _on_wire_node_requested(self, port: PortItem, scene_position: object) -> None:
         if isinstance(scene_position, QPointF):
             self.view.open_node_menu(scene_position, wire_port=port)
+
+    def _on_node_shake_disconnect_requested(
+        self,
+        node: GraphNode,
+        before_positions: object,
+        after_positions: object,
+    ) -> None:
+        if not isinstance(before_positions, dict) or not isinstance(after_positions, dict):
+            return
+        connections = [
+            connection
+            for connection in self.project.graph.connections
+            if node.node_id
+            in (connection.source_node_id, connection.target_node_id)
+        ]
+        if not connections:
+            self._on_nodes_moved(before_positions, after_positions)
+            return
+        bypass_connections = self._shake_bypass_connections(node, connections)
+        self._push_graph_command(
+            MoveAndRewireNodeCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                before_positions,
+                after_positions,
+                remove_connections=connections,
+                add_connections=bypass_connections,
+                text=(
+                    "Shake bypass node"
+                    if bypass_connections
+                    else "Shake disconnect node"
+                ),
+            ),
+            select_node_ids=list(after_positions),
+        )
+        if bypass_connections:
+            self.status_message.emit(
+                f"{node.title}: bypassed and restored "
+                f"{len(bypass_connections)} wire(s)."
+            )
+        else:
+            self.status_message.emit(
+                f"{node.title}: disconnected {len(connections)} wire(s)."
+            )
+
+    def _shake_bypass_connections(
+        self,
+        node: GraphNode,
+        removed_connections: Iterable[GraphConnection],
+    ) -> list[GraphConnection]:
+        bypass_pair = node_bypass_socket_pair(node.node_type)
+        if bypass_pair is None:
+            return []
+        input_socket_id, output_socket_id = bypass_pair
+        removed = list(removed_connections)
+        incoming = next(
+            (
+                connection
+                for connection in removed
+                if connection.target_node_id == node.node_id
+                and connection.target_socket_id == input_socket_id
+            ),
+            None,
+        )
+        if incoming is None:
+            return []
+        outgoing = [
+            connection
+            for connection in removed
+            if connection.source_node_id == node.node_id
+            and connection.source_socket_id == output_socket_id
+        ]
+        if not outgoing:
+            return []
+
+        source_socket = self._connection_source_socket(incoming)
+        if source_socket is None:
+            return []
+        removed_ids = {connection.connection_id for connection in removed}
+        existing_routes = {
+            (
+                connection.source_node_id,
+                connection.source_socket_id,
+                connection.target_node_id,
+                connection.target_socket_id,
+            )
+            for connection in self.project.graph.connections
+            if connection.connection_id not in removed_ids
+        }
+        bypass_connections: list[GraphConnection] = []
+        for outgoing_connection in outgoing:
+            target_socket = self._connection_target_socket(outgoing_connection)
+            if (
+                target_socket is None
+                or source_socket.socket_type is not target_socket.socket_type
+            ):
+                continue
+            route = (
+                incoming.source_node_id,
+                incoming.source_socket_id,
+                outgoing_connection.target_node_id,
+                outgoing_connection.target_socket_id,
+            )
+            if route in existing_routes:
+                continue
+            bypass_connections.append(
+                GraphConnection(
+                    make_connection_id(),
+                    route[0],
+                    route[1],
+                    route[2],
+                    route[3],
+                )
+            )
+            existing_routes.add(route)
+        return bypass_connections
+
+    def _on_node_wire_insert_requested(
+        self,
+        node: GraphNode,
+        connection: GraphConnection,
+        before_positions: object,
+        after_positions: object,
+    ) -> None:
+        if not isinstance(before_positions, dict) or not isinstance(after_positions, dict):
+            return
+        current_connection = next(
+            (
+                candidate
+                for candidate in self.project.graph.connections
+                if candidate.connection_id == connection.connection_id
+            ),
+            None,
+        )
+        bypass_pair = node_bypass_socket_pair(node.node_type)
+        if current_connection is None or bypass_pair is None:
+            self._on_nodes_moved(before_positions, after_positions)
+            return
+        input_socket_id, output_socket_id = bypass_pair
+        socket_by_id = {
+            socket.socket_id: socket for socket in socket_definitions(node.node_type)
+        }
+        input_socket = socket_by_id.get(input_socket_id)
+        output_socket = socket_by_id.get(output_socket_id)
+        source_socket = self._connection_source_socket(current_connection)
+        target_socket = self._connection_target_socket(current_connection)
+        if (
+            input_socket is None
+            or output_socket is None
+            or source_socket is None
+            or target_socket is None
+            or input_socket.socket_type is not source_socket.socket_type
+            or output_socket.socket_type is not target_socket.socket_type
+        ):
+            self._on_nodes_moved(before_positions, after_positions)
+            self.status_message.emit(
+                f"{node.title}: socket types do not match this wire."
+            )
+            return
+
+        replaced_input_connections = [
+            candidate
+            for candidate in self.project.graph.connections
+            if candidate.target_node_id == node.node_id
+            and candidate.target_socket_id == input_socket_id
+        ]
+        removed = list(
+            {
+                item.connection_id: item
+                for item in (current_connection, *replaced_input_connections)
+            }.values()
+        )
+        added = [
+            GraphConnection(
+                make_connection_id(),
+                current_connection.source_node_id,
+                current_connection.source_socket_id,
+                node.node_id,
+                input_socket_id,
+            ),
+            GraphConnection(
+                make_connection_id(),
+                node.node_id,
+                output_socket_id,
+                current_connection.target_node_id,
+                current_connection.target_socket_id,
+            ),
+        ]
+        proposed_connections = [
+            candidate
+            for candidate in self.project.graph.connections
+            if candidate.connection_id
+            not in {removed_connection.connection_id for removed_connection in removed}
+        ]
+        proposed_connections.extend(added)
+        if self._connections_contain_cycle(proposed_connections):
+            self._on_nodes_moved(before_positions, after_positions)
+            self.status_message.emit(
+                f"{node.title}: insertion canceled because it would create a cycle."
+            )
+            return
+
+        self._push_graph_command(
+            MoveAndRewireNodeCommand(
+                self.project.graph,
+                self._on_graph_command_changed,
+                before_positions,
+                after_positions,
+                remove_connections=removed,
+                add_connections=added,
+                text="Insert existing node in wire",
+            ),
+            select_node_ids=list(after_positions),
+        )
+        self.status_message.emit(f"{node.title}: inserted into wire.")
+
+    def _connection_source_socket(self, connection: GraphConnection):
+        node = next(
+            (
+                candidate
+                for candidate in self.project.graph.nodes
+                if candidate.node_id == connection.source_node_id
+            ),
+            None,
+        )
+        if node is None:
+            return None
+        return next(
+            (
+                socket
+                for socket in socket_definitions(node.node_type)
+                if socket.socket_id == connection.source_socket_id
+            ),
+            None,
+        )
+
+    def _connection_target_socket(self, connection: GraphConnection):
+        node = next(
+            (
+                candidate
+                for candidate in self.project.graph.nodes
+                if candidate.node_id == connection.target_node_id
+            ),
+            None,
+        )
+        if node is None:
+            return None
+        return next(
+            (
+                socket
+                for socket in socket_definitions(node.node_type)
+                if socket.socket_id == connection.target_socket_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _connections_contain_cycle(connections: Iterable[GraphConnection]) -> bool:
+        outgoing: dict[str, set[str]] = {}
+        node_ids: set[str] = set()
+        for connection in connections:
+            outgoing.setdefault(connection.source_node_id, set()).add(
+                connection.target_node_id
+            )
+            node_ids.add(connection.source_node_id)
+            node_ids.add(connection.target_node_id)
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node_id: str) -> bool:
+            if node_id in visiting:
+                return True
+            if node_id in visited:
+                return False
+            visiting.add(node_id)
+            for target_id in outgoing.get(node_id, ()):
+                if visit(target_id):
+                    return True
+            visiting.remove(node_id)
+            visited.add(node_id)
+            return False
+
+        return any(visit(node_id) for node_id in node_ids if node_id not in visited)
 
     def _on_node_moved(
         self,

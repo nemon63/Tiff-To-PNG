@@ -23,6 +23,11 @@ class NodeType(str, Enum):
     MIX_IMAGE = "mix_image"
     BLEND_IMAGE = "blend_image"
     NORMAL_MAP = "normal_map"
+    HEIGHT_TO_NORMAL = "height_to_normal"
+    NORMAL_BLEND = "normal_blend"
+    COLOR_ADJUST = "color_adjust"
+    TRANSFORM_2D = "transform_2d"
+    RESIZE_CANVAS = "resize_canvas"
     SPLIT_RGBA = "split_rgba"
     COMBINE_RGBA = "combine_rgba"
     SET_ALPHA = "set_alpha"
@@ -106,6 +111,11 @@ OPERATION_NODE_TYPES = (
     NodeType.MIX_IMAGE,
     NodeType.BLEND_IMAGE,
     NodeType.NORMAL_MAP,
+    NodeType.HEIGHT_TO_NORMAL,
+    NodeType.NORMAL_BLEND,
+    NodeType.COLOR_ADJUST,
+    NodeType.TRANSFORM_2D,
+    NodeType.RESIZE_CANVAS,
 )
 
 
@@ -184,6 +194,11 @@ def node_type_label(node_type: NodeType) -> str:
         NodeType.MIX_IMAGE: "Mix Image",
         NodeType.BLEND_IMAGE: "Blend Image",
         NodeType.NORMAL_MAP: "Normal Map",
+        NodeType.HEIGHT_TO_NORMAL: "Height to Normal",
+        NodeType.NORMAL_BLEND: "Normal Blend",
+        NodeType.COLOR_ADJUST: "Color Adjust",
+        NodeType.TRANSFORM_2D: "Transform 2D",
+        NodeType.RESIZE_CANVAS: "Resize / Canvas",
         NodeType.SPLIT_RGBA: "Split RGBA",
         NodeType.COMBINE_RGBA: "Combine RGBA",
         NodeType.SET_ALPHA: "Apply Mask",
@@ -275,6 +290,50 @@ def default_node_properties(node_type: NodeType) -> dict[str, Any]:
             "normalize": False,
             "strength": 100,
         }
+    if node_type is NodeType.HEIGHT_TO_NORMAL:
+        return {
+            "enabled": True,
+            "strength": 100,
+            "radius": 1.0,
+            "convention": "opengl",
+        }
+    if node_type is NodeType.NORMAL_BLEND:
+        return {
+            "enabled": True,
+            "detail_strength": 100,
+            "mask_filter": "bilinear",
+        }
+    if node_type is NodeType.COLOR_ADJUST:
+        return {
+            "enabled": True,
+            "exposure": 0.0,
+            "brightness": 0,
+            "contrast": 100,
+            "saturation": 100,
+            "hue": 0,
+            "gamma": 1.0,
+        }
+    if node_type is NodeType.TRANSFORM_2D:
+        return {
+            "enabled": True,
+            "flip_horizontal": False,
+            "flip_vertical": False,
+            "rotation": 0,
+            "offset_x": 0,
+            "offset_y": 0,
+            "scale": 100,
+            "address_mode": "repeat",
+            "filter": "bilinear",
+        }
+    if node_type is NodeType.RESIZE_CANVAS:
+        return {
+            "enabled": True,
+            "size_mode": "exact",
+            "width": 2048,
+            "height": 2048,
+            "resize_mode": "stretch",
+            "filter": "lanczos",
+        }
     if node_type is NodeType.LUMINANCE:
         return {"enabled": True}
     if node_type is NodeType.VIEW:
@@ -337,6 +396,33 @@ def resettable_node_property_keys(node_type: NodeType) -> tuple[str, ...]:
             "reconstruct_blue",
             "normalize",
             "strength",
+        ),
+        NodeType.HEIGHT_TO_NORMAL: ("strength", "radius", "convention"),
+        NodeType.NORMAL_BLEND: ("detail_strength", "mask_filter"),
+        NodeType.COLOR_ADJUST: (
+            "exposure",
+            "brightness",
+            "contrast",
+            "saturation",
+            "hue",
+            "gamma",
+        ),
+        NodeType.TRANSFORM_2D: (
+            "flip_horizontal",
+            "flip_vertical",
+            "rotation",
+            "offset_x",
+            "offset_y",
+            "scale",
+            "address_mode",
+            "filter",
+        ),
+        NodeType.RESIZE_CANVAS: (
+            "size_mode",
+            "width",
+            "height",
+            "resize_mode",
+            "filter",
         ),
         NodeType.SET_ALPHA: ("mask_mode", "mask_filter"),
         NodeType.PBR_SHADER: ("workflow", "normal_convention"),
@@ -470,6 +556,23 @@ def socket_definitions(node_type: NodeType) -> tuple[GraphSocket, ...]:
             GraphSocket("image", "Normal", SocketDirection.INPUT, SocketType.IMAGE),
             GraphSocket("out", "Normal", SocketDirection.OUTPUT, SocketType.IMAGE),
         )
+    if node_type is NodeType.HEIGHT_TO_NORMAL:
+        return (
+            GraphSocket("height", "Height", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("normal", "Normal", SocketDirection.OUTPUT, SocketType.IMAGE),
+        )
+    if node_type is NodeType.NORMAL_BLEND:
+        return (
+            GraphSocket("base", "Base", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("detail", "Detail", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("mask", "Mask", SocketDirection.INPUT, SocketType.CHANNEL),
+            GraphSocket("normal", "Normal", SocketDirection.OUTPUT, SocketType.IMAGE),
+        )
+    if node_type in (NodeType.COLOR_ADJUST, NodeType.TRANSFORM_2D, NodeType.RESIZE_CANVAS):
+        return (
+            GraphSocket("image", "Image", SocketDirection.INPUT, SocketType.IMAGE),
+            GraphSocket("out", "RGBA", SocketDirection.OUTPUT, SocketType.IMAGE),
+        )
     if node_type is NodeType.SPLIT_RGBA:
         return (
             GraphSocket("image", "RGBA", SocketDirection.INPUT, SocketType.IMAGE),
@@ -540,6 +643,12 @@ def node_bypass_socket_pair(node_type: NodeType) -> tuple[str, str] | None:
     if node_type in (NodeType.MIX_IMAGE, NodeType.BLEND_IMAGE):
         return ("a", "image")
     if node_type is NodeType.NORMAL_MAP:
+        return ("image", "out")
+    if node_type is NodeType.HEIGHT_TO_NORMAL:
+        return None
+    if node_type is NodeType.NORMAL_BLEND:
+        return ("base", "normal")
+    if node_type in (NodeType.COLOR_ADJUST, NodeType.TRANSFORM_2D, NodeType.RESIZE_CANVAS):
         return ("image", "out")
     if node_type is NodeType.SET_ALPHA:
         return ("image", "out")
