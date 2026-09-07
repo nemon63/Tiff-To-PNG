@@ -343,6 +343,7 @@ class GraphWorkspace(QWidget):
     output_export_requested = pyqtSignal(object)
     preview_image_requested = pyqtSignal(object, str, str, str)
     pbr_material_requested = pyqtSignal(object, str, str, str)
+    pbr_preview_cleared = pyqtSignal()
     preview_failed = pyqtSignal(str, str, str)
     status_message = pyqtSignal(str)
     watched_paths_changed = pyqtSignal(tuple)
@@ -699,13 +700,7 @@ class GraphWorkspace(QWidget):
         self.project = NodeGraphProject()
         self.project_path = None
         self.project_dir = None
-        self._last_preview_node_id = None
-        self._last_preview_mode_label = ""
-        self._preview_generation += 1
-        self._preview_inflight_generation = 0
-        self._pending_preview_request = None
-        self._last_preview_quality_request = PREVIEW_MODE_FULL
-        self._preview_cache.clear()
+        self._reset_preview_for_project_change()
         self.undo_stack.clear()
         self._scene.project = self.project
         self._scene.rebuild()
@@ -791,13 +786,7 @@ class GraphWorkspace(QWidget):
         self.project_path = project_path
         self.project_dir = project_path.parent
         self._remember_recent_project(project_path)
-        self._last_preview_node_id = None
-        self._last_preview_mode_label = ""
-        self._preview_generation += 1
-        self._preview_inflight_generation = 0
-        self._pending_preview_request = None
-        self._last_preview_quality_request = PREVIEW_MODE_FULL
-        self._preview_cache.clear()
+        self._reset_preview_for_project_change()
         self.undo_stack.clear()
         self._scene.project = self.project
         self._scene.rebuild()
@@ -805,8 +794,24 @@ class GraphWorkspace(QWidget):
         self._update_project_label()
         self._refresh_validation()
         self._rebuild_asset_watchers()
+        self._preview_active_display_node()
         self.status_message.emit(f"Loaded graph: {self.project.name}")
         return True
+
+    def _reset_preview_for_project_change(self) -> None:
+        self._last_preview_node_id = None
+        self._last_preview_mode_label = ""
+        self._preview_generation += 1
+        if self._preview_active_worker is not None:
+            self._preview_active_worker.cancel()
+        self._preview_active_worker = None
+        self._preview_inflight_generation = 0
+        self._pending_preview_request = None
+        self._last_preview_quality_request = PREVIEW_MODE_FULL
+        self._preview_dirty_node_ids.clear()
+        self._preview_full_reset_pending = False
+        self._preview_cache.clear()
+        self.pbr_preview_cleared.emit()
 
     @staticmethod
     def _project_name_from_path(project_path: Path) -> str:
@@ -3027,6 +3032,8 @@ class GraphWorkspace(QWidget):
         meta: str,
         node_id: str,
     ) -> None:
+        if generation != self._preview_inflight_generation:
+            return
         self._preview_inflight_generation = 0
         self._preview_active_worker = None
         self._reapply_pending_preview_invalidation()
@@ -3050,6 +3057,8 @@ class GraphWorkspace(QWidget):
         message: str,
         node_id: str,
     ) -> None:
+        if generation != self._preview_inflight_generation:
+            return
         self._preview_inflight_generation = 0
         self._preview_active_worker = None
         self._reapply_pending_preview_invalidation()
@@ -3065,6 +3074,8 @@ class GraphWorkspace(QWidget):
             self._restart_pending_preview(pending)
 
     def _on_preview_worker_canceled(self, generation: int) -> None:
+        if generation != self._preview_inflight_generation:
+            return
         self._preview_inflight_generation = 0
         self._preview_active_worker = None
         self._reapply_pending_preview_invalidation()

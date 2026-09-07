@@ -69,6 +69,7 @@ from image_converter.services.node_graph_executor import (
 from image_converter.services.packing import build_channel_pack_jobs, summarize_channel_pack_jobs
 from image_converter.services.pbr_preview import (
     PBR_SOLO_NORMAL_CHECK,
+    PbrMaterialData,
     PbrPreviewService,
     PbrTextureSource,
 )
@@ -2797,6 +2798,65 @@ class GraphEditorFoundationTests(unittest.TestCase):
 
             self.assertEqual(project_path, self.workspace.project_path)
             self.assertEqual("Loaded Material", self.workspace.project.name)
+
+    def test_load_project_clears_pbr_preview_and_requests_new_display(self) -> None:
+        with TemporaryDirectory() as tmp:
+            project_path = Path(tmp) / "loaded_material.texturegraph"
+            NodeGraphProjectRepository().save(
+                NodeGraphProject(name="Loaded Material"),
+                project_path,
+            )
+            pbr_cleared: list[bool] = []
+            self.workspace.pbr_preview_cleared.connect(
+                lambda: pbr_cleared.append(True)
+            )
+
+            with mock.patch.object(
+                self.workspace,
+                "_preview_active_display_node",
+            ) as request_display:
+                self.assertTrue(self.workspace.load_project(project_path))
+
+            self.assertEqual([True], pbr_cleared)
+            request_display.assert_called_once()
+
+    def test_loading_graph_clears_stale_graph_pbr_material_in_window(self) -> None:
+        window = MainWindow()
+        try:
+            material = PbrMaterialData(
+                basecolor=Image.new("RGBA", (4, 4), (255, 0, 0, 255)),
+                normal=Image.new("RGB", (4, 4), (128, 128, 255)),
+                properties=Image.new("RGBA", (4, 4), (128, 0, 255, 255)),
+                emissive=Image.new("RGB", (4, 4), (0, 0, 0)),
+                normal_is_directx=False,
+                used_labels=("Base Color",),
+            )
+            window._show_graph_pbr_preview(
+                material,
+                "Old Shader",
+                "Old scene",
+                "old-shader",
+            )
+            self.assertIs(window.pbr_preview_panel._material, material)
+
+            with TemporaryDirectory() as tmp:
+                project_path = Path(tmp) / "new_scene.texturegraph"
+                NodeGraphProjectRepository().save(
+                    NodeGraphProject(name="New Scene"),
+                    project_path,
+                )
+                self.assertTrue(window.graph_workspace.load_project(project_path))
+
+            self.assertIsNone(window.pbr_preview_panel._material)
+            self.assertIsNone(window.pbr_preview_panel.gl_preview.material)
+            self.assertEqual(
+                "Graph PBR не выбран",
+                window.pbr_preview_panel.set_label.text(),
+            )
+        finally:
+            window.setParent(None)
+            window.deleteLater()
+            self.app.processEvents()
 
     def test_y_knife_mode_uses_custom_blade_cursor(self) -> None:
         self.assertIsNone(QApplication.overrideCursor())

@@ -179,6 +179,23 @@ class PbrPreviewPanel(QWidget):
         )
         self._update_summary()
 
+    def clear_graph_material(self) -> None:
+        """Clear a material supplied by Graph Workbench without touching queue preview."""
+        if self._sources:
+            return
+        self._controller.invalidate()
+        self._material = None
+        self.gl_preview.set_material(None)
+        self.set_label.setText("Graph PBR не выбран")
+        self.set_label.setToolTip("")
+        self.meta_label.setText(
+            "Выберите PBR Shader с display-флагом или откройте PBR Preview из очереди."
+        )
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setToolTip(
+            "Graph material появится после выбора PBR Shader."
+        )
+
     @staticmethod
     def _revision_for_sources(
         sources: tuple[PbrTextureSource, ...],

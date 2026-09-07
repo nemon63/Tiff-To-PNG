@@ -204,6 +204,9 @@ class MainWindow(QMainWindow):
         self.graph_workspace.output_export_requested.connect(self._export_graph_output)
         self.graph_workspace.preview_image_requested.connect(self._show_graph_preview)
         self.graph_workspace.pbr_material_requested.connect(self._show_graph_pbr_preview)
+        self.graph_workspace.pbr_preview_cleared.connect(
+            self.pbr_preview_panel.clear_graph_material
+        )
         self.graph_workspace.preview_failed.connect(self._show_graph_preview_error)
         self.graph_workspace.status_message.connect(self.set_status)
         self.graph_workspace.status_message.connect(self.append_log)
