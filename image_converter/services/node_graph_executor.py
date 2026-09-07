@@ -139,6 +139,10 @@ class GraphExecutionError(RuntimeError):
     pass
 
 
+class GraphExecutionCancelled(GraphExecutionError):
+    pass
+
+
 @dataclass(slots=True, frozen=True)
 class NodeGraphLookup:
     node_by_id: dict[str, GraphNode]
@@ -262,11 +266,13 @@ class NodeGraphPreviewCache:
         *,
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_size_entries: int = DEFAULT_MAX_SIZE_ENTRIES,
+        interactive_preview: bool = False,
     ) -> None:
         self.max_side = max_side
         self.fallback_size = fallback_size
         self.max_bytes = max(0, max_bytes)
         self.max_size_entries = max(1, max_size_entries)
+        self.interactive_preview = interactive_preview
         self._images: OrderedDict[tuple[str, object], tuple[Image.Image, int]] = OrderedDict()
         self.texture_sizes: OrderedDict[str, tuple[int, int] | None] = OrderedDict()
         self.current_bytes = 0
@@ -366,8 +372,17 @@ class NodeGraphExecutor:
         ".tga": "TGA",
     }
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
         self._lookup: NodeGraphLookup | None = None
+        self._cancel_requested = cancel_requested
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_requested is not None and self._cancel_requested():
+            raise GraphExecutionCancelled("Preview render canceled.")
 
     def _prepare_lookup(self, graph: NodeGraph) -> NodeGraphLookup:
         self._lookup = NodeGraphLookup.build(graph)
@@ -396,6 +411,7 @@ class NodeGraphExecutor:
         fallback_size: tuple[int, int] | None = None,
         max_side: int | None = None,
     ) -> tuple[Image.Image, str]:
+        self._check_cancelled()
         self._prepare_lookup(graph)
         cache = preview_cache or NodeGraphPreviewCache()
         resolved_fallback = fallback_size or cache.fallback_size
@@ -519,6 +535,7 @@ class NodeGraphExecutor:
         fallback_size: tuple[int, int] = (512, 512),
         max_side: int = 2048,
     ) -> PbrMaterialData:
+        self._check_cancelled()
         self._prepare_lookup(graph)
         if shader_node.node_type is not NodeType.PBR_SHADER:
             raise GraphExecutionError(f"{shader_node.title}: node is not a PBR Shader.")
@@ -572,6 +589,7 @@ class NodeGraphExecutor:
         )
 
         def image_input(socket_id: str) -> Image.Image | None:
+            self._check_cancelled()
             connection = connections[socket_id]
             if connection is None:
                 return None
@@ -584,6 +602,7 @@ class NodeGraphExecutor:
             )
 
         def channel_input(socket_id: str) -> Image.Image | None:
+            self._check_cancelled()
             connection = connections[socket_id]
             if connection is None:
                 return None
@@ -1496,6 +1515,7 @@ class NodeGraphExecutor:
         visiting: set[tuple[str, str]],
         cache: NodeGraphPreviewCache | None = None,
     ) -> Image.Image:
+        self._check_cancelled()
         key = (connection.source_node_id, connection.source_socket_id)
         cache_key = (connection.source_node_id, connection.source_socket_id, target_size)
         if cache is not None:
@@ -1770,6 +1790,7 @@ class NodeGraphExecutor:
 
         if image.size != target_size:
             image = image.resize(target_size, RESAMPLING_LANCZOS)
+        self._check_cancelled()
         result = image.convert("RGBA").copy()
         if cache is not None:
             cache.put_image("image", cache_key, result.copy())
@@ -1893,18 +1914,23 @@ class NodeGraphExecutor:
         if connection is None:
             return None
         source_size = self._connection_natural_size(graph, connection, cache) or target_size
+        evaluation_size = (
+            target_size
+            if cache is not None and cache.interactive_preview
+            else source_size
+        )
         if cache is None:
             mask = self._evaluate_channel_socket(
                 graph,
                 connection,
-                source_size,
+                evaluation_size,
                 visiting,
             )
         else:
             mask = self._evaluate_channel_socket_cached(
                 graph,
                 connection,
-                source_size,
+                evaluation_size,
                 visiting,
                 cache,
             )
@@ -1920,6 +1946,7 @@ class NodeGraphExecutor:
         target_size: tuple[int, int],
         visiting: set[tuple[str, str]],
     ) -> Image.Image:
+        self._check_cancelled()
         key = (connection.source_node_id, connection.source_socket_id)
         if key in visiting:
             raise GraphExecutionError("Graph contains a cycle.")
@@ -2318,6 +2345,7 @@ class NodeGraphExecutor:
         if channel.size != target_size:
             channel = channel.resize(target_size, RESAMPLING_LANCZOS)
         result = channel.copy()
+        self._check_cancelled()
         cache.put_image("channel", cache_key, result)
         return result.copy()
 
@@ -2368,6 +2396,8 @@ class NodeGraphExecutor:
         fallback_size: tuple[int, int],
         cache: NodeGraphPreviewCache | None,
     ) -> tuple[int, int]:
+        if cache is not None and cache.interactive_preview:
+            return fallback_size
         resolution_source = str(
             node.properties.get("resolution_source", "a")
         ).lower()

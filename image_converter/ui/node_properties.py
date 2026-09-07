@@ -36,6 +36,7 @@ from image_converter.domain.node_graph import (
 )
 from image_converter.ui.node_editor_constants import (
     GRAPH_EXPORT_FILE_FILTER,
+    INTERACTIVE_PREVIEW_INTERVAL_MS,
     NUMERIC_PREVIEW_DEBOUNCE_MS,
     PREVIEW_MODE_DRAFT,
     PREVIEW_MODE_FULL,
@@ -44,6 +45,8 @@ class NodePropertiesPanel(QWidget):
     node_changed = pyqtSignal(object, object, object, bool, object)
     transient_preview_requested = pyqtSignal(object, object, object)
     preview_refresh_requested = pyqtSignal(object, object)
+    interactive_edit_started = pyqtSignal()
+    interactive_edit_finished = pyqtSignal()
     output_profile_apply_requested = pyqtSignal(object)
     output_inputs_clear_requested = pyqtSignal(object)
     node_reset_requested = pyqtSignal(object)
@@ -54,10 +57,15 @@ class NodePropertiesPanel(QWidget):
         self._node: GraphNode | None = None
         self._suppress = False
         self._slider_drag_active = False
+        self._interactive_change_pending = False
         self._numeric_preview_timer = QTimer(self)
         self._numeric_preview_timer.setSingleShot(True)
         self._numeric_preview_timer.setInterval(NUMERIC_PREVIEW_DEBOUNCE_MS)
         self._numeric_preview_timer.timeout.connect(self._flush_numeric_preview)
+        self._interactive_preview_timer = QTimer(self)
+        self._interactive_preview_timer.setSingleShot(True)
+        self._interactive_preview_timer.setInterval(INTERACTIVE_PREVIEW_INTERVAL_MS)
+        self._interactive_preview_timer.timeout.connect(self._flush_interactive_preview)
         self._build_ui()
         self.set_node(None)
 
@@ -680,11 +688,14 @@ class NodePropertiesPanel(QWidget):
         layout.addStretch(1)
 
     def set_node(self, node: GraphNode | None) -> None:
+        was_interactive_edit = self._slider_drag_active
         self._node = node
         self._suppress = True
         try:
             self._numeric_preview_timer.stop()
+            self._interactive_preview_timer.stop()
             self._slider_drag_active = False
+            self._interactive_change_pending = False
             self.empty_label.setVisible(node is None)
             self.form_host.setVisible(node is not None)
             self.reset_parameters_button.setVisible(
@@ -886,6 +897,8 @@ class NodePropertiesPanel(QWidget):
             self._sync_visibility(node.node_type)
         finally:
             self._suppress = False
+        if was_interactive_edit:
+            self.interactive_edit_finished.emit()
 
     def _sync_visibility(self, node_type: NodeType) -> None:
         self._set_row_visible(self.node_help_label, bool(self._node_help_text(node_type)))
@@ -1293,7 +1306,7 @@ class NodePropertiesPanel(QWidget):
             return
         if self._slider_drag_active:
             self._numeric_preview_timer.stop()
-            self._emit_node_change(PREVIEW_MODE_DRAFT)
+            self._queue_interactive_preview()
             return
         self._numeric_preview_timer.start()
 
@@ -1304,18 +1317,43 @@ class NodePropertiesPanel(QWidget):
         if self._suppress:
             return
         self._slider_drag_active = True
+        self._interactive_change_pending = False
         self._numeric_preview_timer.stop()
+        self.interactive_edit_started.emit()
 
     def _on_slider_drag_finished(self) -> None:
         was_dragging = self._slider_drag_active
         self._slider_drag_active = False
+        self._interactive_preview_timer.stop()
+        self._interactive_change_pending = False
         if self._suppress or self._node is None or not was_dragging:
             return
-        self.preview_refresh_requested.emit(self._node, PREVIEW_MODE_FULL)
+        changed = self._emit_node_change(PREVIEW_MODE_FULL)
+        self.interactive_edit_finished.emit()
+        if not changed:
+            self.preview_refresh_requested.emit(self._node, PREVIEW_MODE_FULL)
 
-    def _emit_node_change(self, preview_mode: str) -> None:
-        if self._suppress or self._node is None:
+    def _queue_interactive_preview(self) -> None:
+        self._interactive_change_pending = True
+        if self._interactive_preview_timer.isActive():
             return
+        self._flush_interactive_preview()
+        self._interactive_preview_timer.start()
+
+    def _flush_interactive_preview(self) -> None:
+        if (
+            self._suppress
+            or self._node is None
+            or not self._slider_drag_active
+            or not self._interactive_change_pending
+        ):
+            return
+        self._interactive_change_pending = False
+        self._emit_node_change(PREVIEW_MODE_DRAFT)
+
+    def _emit_node_change(self, preview_mode: str) -> bool:
+        if self._suppress or self._node is None:
+            return False
         previous_title = self._node.title
         previous_path = str(self._node.properties.get("path", ""))
         next_title = self.title_edit.text().strip() or self._node.title
@@ -1479,11 +1517,12 @@ class NodePropertiesPanel(QWidget):
             next_properties["resolution_width"] = self.resolution_width_spin.value()
             next_properties["resolution_height"] = self.resolution_height_spin.value()
         if next_title == self._node.title and next_properties == self._node.properties:
-            return
+            return False
         needs_rebuild = previous_title != next_title
         if self._node.node_type is NodeType.TEXTURE_INPUT:
             needs_rebuild = needs_rebuild or previous_path != str(next_properties.get("path", ""))
         self.node_changed.emit(self._node, next_title, next_properties, needs_rebuild, preview_mode)
+        return True
 
     @staticmethod
     def _coerce_int(value: object, default: int) -> int:

@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import Event
 
 from PyQt6.QtCore import (
     QFileSystemWatcher,
@@ -108,6 +109,7 @@ from image_converter.ui.node_editor_constants import (
 )
 from image_converter.ui.node_properties import NodePropertiesPanel
 from image_converter.services.node_graph_executor import (
+    GraphExecutionCancelled,
     GraphExecutionError,
     GraphExportSummary,
     NodeGraphExecutor,
@@ -259,6 +261,7 @@ class OutputProfilePlan:
 class GraphPreviewWorker(QObject):
     finished = pyqtSignal(int, object, str, str, str)
     failed = pyqtSignal(int, str, str, str)
+    canceled = pyqtSignal(int)
     completed = pyqtSignal()
 
     def __init__(
@@ -278,10 +281,16 @@ class GraphPreviewWorker(QObject):
         self._mode_label = mode_label
         self._max_side = max_side
         self._preview_cache = preview_cache
+        self._cancel_event = Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:
         try:
-            executor = NodeGraphExecutor()
+            executor = NodeGraphExecutor(
+                cancel_requested=self._cancel_event.is_set,
+            )
             preview_cache = self._preview_cache or NodeGraphPreviewCache(max_side=self._max_side)
             if self._node.node_type is NodeType.PBR_SHADER:
                 result = executor.render_pbr_material_node(
@@ -307,6 +316,8 @@ class GraphPreviewWorker(QObject):
                     f"Output preview · {result.width}x{result.height} · "
                     f"{self._mode_label}{suffix}"
                 )
+            if self._cancel_event.is_set():
+                raise GraphExecutionCancelled("Preview render canceled.")
             self.finished.emit(
                 self._generation,
                 result,
@@ -314,6 +325,8 @@ class GraphPreviewWorker(QObject):
                 meta,
                 self._node.node_id,
             )
+        except GraphExecutionCancelled:
+            self.canceled.emit(self._generation)
         except (GraphExecutionError, OSError, ValueError) as exc:
             self.failed.emit(
                 self._generation,
@@ -350,6 +363,7 @@ class GraphWorkspace(QWidget):
         self._preview_generation = 0
         self._preview_threads: list[QThread] = []
         self._preview_workers: list[GraphPreviewWorker] = []
+        self._preview_active_worker: GraphPreviewWorker | None = None
         self._preview_inflight_generation = 0
         self._pending_preview_request: tuple[
             str,
@@ -361,6 +375,7 @@ class GraphWorkspace(QWidget):
         self._preview_full_reset_pending = False
         self._last_preview_quality_request = PREVIEW_MODE_FULL
         self._property_edit_in_progress = False
+        self._interactive_property_edit = False
         self._recent_project_dirs: list[Path] = []
         self._shortcuts = []
         self._repository = NodeGraphProjectRepository()
@@ -374,7 +389,10 @@ class GraphWorkspace(QWidget):
                 f"Missing texture search failed: {message}"
             )
         )
-        self._preview_cache = NodeGraphPreviewCache(max_side=1024)
+        self._preview_cache = NodeGraphPreviewCache(
+            max_side=1024,
+            interactive_preview=True,
+        )
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setInterval(30000)
         self._autosave_timer.setSingleShot(True)
@@ -492,6 +510,12 @@ class GraphWorkspace(QWidget):
             self._on_transient_preview_requested
         )
         self.properties_panel.preview_refresh_requested.connect(self._on_preview_refresh_requested)
+        self.properties_panel.interactive_edit_started.connect(
+            self._on_interactive_property_edit_started
+        )
+        self.properties_panel.interactive_edit_finished.connect(
+            self._on_interactive_property_edit_finished
+        )
         self.properties_panel.output_profile_apply_requested.connect(self._apply_output_profile)
         self.properties_panel.output_inputs_clear_requested.connect(self._clear_output_inputs)
         self.properties_panel.output_export_requested.connect(self.output_export_requested.emit)
@@ -1291,28 +1315,34 @@ class GraphWorkspace(QWidget):
                 self._invalidate_preview_from_node(selected_node)
             else:
                 self._preview_cache.clear()
+        interactive_edit = self._interactive_property_edit and not needs_rebuild
         if needs_rebuild:
             self._scene.rebuild()
             self._scene.select_node_ids(selected_ids)
         else:
             self._scene.sync_node_positions()
-            self._refresh_node_flags()
-            for node_id in selected_ids:
-                item = self._scene.node_items.get(node_id)
-                if item is not None:
-                    item.refresh_content()
+            if not interactive_edit:
+                self._refresh_node_flags()
+                for node_id in selected_ids:
+                    item = self._scene.node_items.get(node_id)
+                    if item is not None:
+                        item.refresh_content()
 
-        self._refresh_validation()
+        if not interactive_edit:
+            self._refresh_validation()
         if not self._property_edit_in_progress:
             self.properties_panel.set_node(self._scene.selected_node())
-        self._refresh_properties_profile_summary()
+        if not interactive_edit:
+            self._refresh_properties_profile_summary()
         if not self._property_edit_in_progress:
             self._preview_active_display_node()
         self._update_project_label()
-        self._schedule_autosave()
+        if not interactive_edit:
+            self._schedule_autosave()
         if needs_rebuild:
             self._rebuild_asset_watchers()
-        self.template_changed.emit()
+        if not interactive_edit:
+            self.template_changed.emit()
 
     def _delete_selection(self) -> None:
         self._scene.delete_selected()
@@ -1933,6 +1963,24 @@ class GraphWorkspace(QWidget):
             node,
             preview_mode if isinstance(preview_mode, str) else PREVIEW_MODE_FULL,
         )
+
+    def _on_interactive_property_edit_started(self) -> None:
+        self._interactive_property_edit = True
+        self._autosave_timer.stop()
+
+    def _on_interactive_property_edit_finished(self) -> None:
+        if not self._interactive_property_edit:
+            return
+        self._interactive_property_edit = False
+        self._refresh_node_flags()
+        for node_id in self._scene.selected_node_ids():
+            item = self._scene.node_items.get(node_id)
+            if item is not None:
+                item.refresh_content()
+        self._refresh_validation()
+        self._refresh_properties_profile_summary()
+        self._schedule_autosave()
+        self.template_changed.emit()
 
     def _apply_output_profile(self, node: GraphNode | None) -> None:
         if node is None or node.node_type is not NodeType.OUTPUT_RGBA:
@@ -2878,6 +2926,8 @@ class GraphWorkspace(QWidget):
         self._preview_generation += 1
         generation = self._preview_generation
         if self._preview_inflight_generation:
+            if self._preview_active_worker is not None:
+                self._preview_active_worker.cancel()
             self._pending_preview_request = (
                 node.node_id,
                 mode_label,
@@ -2918,6 +2968,7 @@ class GraphWorkspace(QWidget):
         )
         if node_snapshot is None:
             self._preview_inflight_generation = 0
+            self._preview_active_worker = None
             return
         max_side = self._preview_max_side_for_mode(preview_mode)
         thread = QThread(self)
@@ -2930,11 +2981,13 @@ class GraphWorkspace(QWidget):
             preview_cache=self._preview_cache,
         )
         worker.moveToThread(thread)
+        self._preview_active_worker = worker
         self._preview_threads.append(thread)
         self._preview_workers.append(worker)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_preview_worker_finished)
         worker.failed.connect(self._on_preview_worker_failed)
+        worker.canceled.connect(self._on_preview_worker_canceled)
         worker.completed.connect(thread.quit)
         worker.completed.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -2975,6 +3028,7 @@ class GraphWorkspace(QWidget):
         node_id: str,
     ) -> None:
         self._preview_inflight_generation = 0
+        self._preview_active_worker = None
         self._reapply_pending_preview_invalidation()
         pending = self._pending_preview_request
         self._pending_preview_request = None
@@ -2997,6 +3051,7 @@ class GraphWorkspace(QWidget):
         node_id: str,
     ) -> None:
         self._preview_inflight_generation = 0
+        self._preview_active_worker = None
         self._reapply_pending_preview_invalidation()
         pending = self._pending_preview_request
         self._pending_preview_request = None
@@ -3006,6 +3061,15 @@ class GraphWorkspace(QWidget):
             return
         self.preview_failed.emit(title, message, node_id)
         self.status_message.emit(f"{title}: preview failed: {message}")
+        if pending is not None:
+            self._restart_pending_preview(pending)
+
+    def _on_preview_worker_canceled(self, generation: int) -> None:
+        self._preview_inflight_generation = 0
+        self._preview_active_worker = None
+        self._reapply_pending_preview_invalidation()
+        pending = self._pending_preview_request
+        self._pending_preview_request = None
         if pending is not None:
             self._restart_pending_preview(pending)
 
@@ -3129,6 +3193,8 @@ class GraphWorkspace(QWidget):
     def shutdown_background_jobs(self, *, wait_ms: int = 0) -> bool:
         self._preview_generation += 1
         self._pending_preview_request = None
+        if self._preview_active_worker is not None:
+            self._preview_active_worker.cancel()
         for thread in list(self._preview_threads):
             thread.quit()
         self._scene.texture_visual_cache.shutdown(wait_ms=wait_ms)

@@ -61,6 +61,7 @@ from image_converter.services.material_validation import (
     validate_texture_sets,
 )
 from image_converter.services.node_graph_executor import (
+    GraphExecutionCancelled,
     GraphExecutionError,
     NodeGraphExecutor,
     NodeGraphPreviewCache,
@@ -95,7 +96,7 @@ from image_converter.ui.graph_canvas import (
     is_disconnect_shake,
 )
 from image_converter.ui.node_help import node_help_content
-from image_converter.ui.node_editor import GraphWorkspace
+from image_converter.ui.node_editor import GraphPreviewWorker, GraphWorkspace
 from image_converter.ui.node_editor import DRAFT_PREVIEW_MAX_SIDE, PREVIEW_MODE_DRAFT, PREVIEW_MODE_FULL
 from image_converter.ui.node_properties import NodePropertiesPanel
 from image_converter.ui.preview import PreviewPanel
@@ -779,6 +780,93 @@ class PbrPreviewTests(unittest.TestCase):
 
 
 class NodeGraphExecutorPerformanceTests(unittest.TestCase):
+    def test_interactive_preview_keeps_mix_and_mask_at_preview_resolution(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mask_path = Path(tmp) / "mask.png"
+            Image.new("L", (1024, 1024), 128).save(mask_path)
+            red = create_graph_node(
+                NodeType.COLOR,
+                properties={"red": 255, "width": 1024, "height": 1024},
+            )
+            blue = create_graph_node(
+                NodeType.COLOR,
+                properties={"blue": 255, "width": 1024, "height": 1024},
+            )
+            mask = create_graph_node(
+                NodeType.TEXTURE_INPUT,
+                properties={"path": str(mask_path)},
+            )
+            mix = create_graph_node(NodeType.MIX_IMAGE)
+            graph = NodeGraph(
+                nodes=[red, blue, mask, mix],
+                connections=[
+                    GraphConnection("a", red.node_id, "image", mix.node_id, "a"),
+                    GraphConnection("b", blue.node_id, "image", mix.node_id, "b"),
+                    GraphConnection("mask", mask.node_id, "r", mix.node_id, "mask"),
+                ],
+            )
+
+            class TrackingExecutor(NodeGraphExecutor):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.working_sizes: list[tuple[int, int]] = []
+                    self.mask_sizes: list[tuple[int, int]] = []
+
+                def _image_operation_size(self, *args, **kwargs):
+                    size = super()._image_operation_size(*args, **kwargs)
+                    self.working_sizes.append(size)
+                    return size
+
+                def _evaluate_channel_socket_cached(self, graph, connection, target_size, visiting, cache):
+                    if connection.source_node_id == mask.node_id:
+                        self.mask_sizes.append(target_size)
+                    return super()._evaluate_channel_socket_cached(
+                        graph,
+                        connection,
+                        target_size,
+                        visiting,
+                        cache,
+                    )
+
+            executor = TrackingExecutor()
+            preview_cache = NodeGraphPreviewCache(
+                max_side=64,
+                interactive_preview=True,
+            )
+            image, _meta = executor.render_display_node(
+                graph,
+                mix,
+                preview_cache=preview_cache,
+                max_side=64,
+            )
+
+            self.assertEqual((64, 64), image.size)
+            self.assertEqual([(64, 64)], executor.working_sizes)
+            self.assertEqual([(64, 64)], executor.mask_sizes)
+
+    def test_preview_executor_honors_cancellation_before_render(self) -> None:
+        color = create_graph_node(NodeType.COLOR)
+        with self.assertRaises(GraphExecutionCancelled):
+            NodeGraphExecutor(cancel_requested=lambda: True).render_display_node(
+                NodeGraph(nodes=[color]),
+                color,
+            )
+
+    def test_preview_worker_emits_canceled_for_obsolete_request(self) -> None:
+        color = create_graph_node(NodeType.COLOR)
+        worker = GraphPreviewWorker(
+            7,
+            NodeGraphProject(graph=NodeGraph(nodes=[color])),
+            color,
+        )
+        canceled: list[int] = []
+        worker.canceled.connect(canceled.append)
+
+        worker.cancel()
+        worker.run()
+
+        self.assertEqual([7], canceled)
+
     def test_mix_image_uses_alpha_mask_and_output_channel_overrides(self) -> None:
         with TemporaryDirectory() as tmp:
             mask_path = Path(tmp) / "mask.png"
@@ -2193,7 +2281,32 @@ class NodePropertiesPanelTests(unittest.TestCase):
         self.app.processEvents()
 
         self.assertIn(PREVIEW_MODE_DRAFT, changed_modes)
-        self.assertEqual([PREVIEW_MODE_FULL], refresh_modes)
+        self.assertIn(PREVIEW_MODE_FULL, changed_modes)
+        self.assertEqual([], refresh_modes)
+
+    def test_slider_drag_coalesces_rapid_draft_updates(self) -> None:
+        node = create_graph_node(NodeType.LEVELS_CHANNEL)
+        self.panel.set_node(node)
+        changed_modes: list[str] = []
+        self.panel.node_changed.connect(
+            lambda _node, _title, _properties, _needs_rebuild, preview_mode: changed_modes.append(preview_mode)
+        )
+
+        self.panel.level_black_slider.sliderPressed.emit()
+        self.panel.level_black_slider.setValue(20)
+        self.panel.level_black_slider.setValue(40)
+        self.app.processEvents()
+        self.assertEqual([PREVIEW_MODE_DRAFT], changed_modes)
+
+        loop = QEventLoop()
+        QTimer.singleShot(75, loop.quit)
+        loop.exec()
+        self.app.processEvents()
+        self.assertEqual([PREVIEW_MODE_DRAFT, PREVIEW_MODE_DRAFT], changed_modes)
+
+        self.panel.level_black_slider.sliderReleased.emit()
+        self.app.processEvents()
+        self.assertEqual(PREVIEW_MODE_FULL, changed_modes[-1])
 
     def test_numeric_spin_uses_debounced_full_preview(self) -> None:
         node = create_graph_node(NodeType.THRESHOLD_CHANNEL)
@@ -3479,8 +3592,31 @@ class GraphEditorFoundationTests(unittest.TestCase):
         panel.level_black_slider.sliderReleased.emit()
         self.app.processEvents()
 
-        self.assertGreaterEqual(changed_modes.count(PREVIEW_MODE_DRAFT), 2)
-        self.assertEqual(PREVIEW_MODE_FULL, refresh_modes[-1])
+        self.assertEqual(1, changed_modes.count(PREVIEW_MODE_DRAFT))
+        self.assertEqual(PREVIEW_MODE_FULL, changed_modes[-1])
+        self.assertEqual([], refresh_modes)
+
+    def test_workspace_defers_validation_until_slider_release(self) -> None:
+        levels = create_graph_node(NodeType.LEVELS_CHANNEL)
+        self.workspace._push_graph_command(
+            AddNodesCommand(
+                self.workspace.project.graph,
+                self.workspace._on_graph_command_changed,
+                [levels],
+            ),
+            select_node_ids=[levels.node_id],
+        )
+        panel = self.workspace.properties_panel
+
+        with mock.patch.object(self.workspace, "_refresh_validation") as refresh_validation:
+            panel.level_black_slider.sliderPressed.emit()
+            panel.level_black_slider.setValue(32)
+            self.app.processEvents()
+            self.assertEqual(0, refresh_validation.call_count)
+
+            panel.level_black_slider.sliderReleased.emit()
+            self.app.processEvents()
+            self.assertEqual(1, refresh_validation.call_count)
 
     def test_undo_redo_add_and_connect(self) -> None:
         constant = create_graph_node(NodeType.CONSTANT_CHANNEL)

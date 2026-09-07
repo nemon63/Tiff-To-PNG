@@ -1,108 +1,103 @@
-# Roadmap v1
+# Texture Pipeline Workbench — Roadmap
 
-План развития `Tiff-To-PNG` в production-инструмент для CG-художников.
+`ROADMAP.md` отвечает на вопрос «куда развивается продукт». Реальное состояние
+задач, критерии готовности и приоритеты следующей работы находятся в
+[`DEVELOPMENT_BACKLOG.md`](DEVELOPMENT_BACKLOG.md).
 
-## Текущее состояние
+## Что уже является продуктом
 
-Уже реализовано:
+Это больше не ранний TIFF-to-PNG конвертер. В репозитории реализованы два
+связанных рабочих режима.
 
-- модульная архитектура на `PyQt6`
-- batch-конвертация изображений
-- resize и `PNG-8`
-- лог выполнения
-- сохранение пользовательских настроек между сессиями
+### Batch Converter
 
-## 1. MVP
+- очередь файлов и папок, drag-and-drop, статусы и группировка Texture Set;
+- Asset Inspector с preview, метаданными, ручным Map Type и предупреждениями;
+- системные и пользовательские presets, naming rules и настройки формата;
+- распознавание PBR-карт, включая packed layouts `ORM`, `RMA`, `MRA`, Unity
+  URP MetallicSmoothness и Unity HDRP Mask Map;
+- преобразование **из любого поддерживаемого pipeline в любой другой**:
+  packing, repacking и `Traditional / Non-Packed Workflow` для распаковки в
+  отдельные Base Color, Normal, AO, Roughness и Metallic;
+- preflight Texture Set, проверки roughness/glossiness и normal orientation;
+- CLI для базовой пакетной обработки и release-сценарий для Windows.
 
-Цель: сделать приложение удобным для ежедневной личной работы CG-художника.
+### Graph Workbench
 
-### Основные задачи
+- сохраняемые `.texturegraph`-сцены: New, Open, Save, Save As, Recent и
+  autosave рядом с сохранённой сценой;
+- image-, channel- и output-ноды, графовый экспорт и применение graph template
+  к совместимым наборам Batch Queue;
+- авторские ноды обработки: Levels, Remap, Clamp, Threshold, Blur,
+  Dilate/Erode, channel/image blend, Split/Combine RGBA, Set Alpha, Normal Map,
+  Height to Normal, Normal Blend RNM, Color Adjust, Transform 2D и
+  Resize/Canvas;
+- Houdini-подобная работа с графом: node help, выделение проводов, `Y`-cut,
+  shake-bypass с восстановлением прямого соединения, вставка ноды в провод,
+  Undo/Redo;
+- GPU PBR Preview со сферой/плоскостью, управлением камерой и светом,
+  режимами диагностики карт и выбором normal convention;
+- Auto Watch / Auto Rebuild для texture-нод.
 
-- `Drag-and-drop` файлов и папок прямо в окно
-- очередь файлов с колонками: имя, формат, размер, статус, ошибка
-- готовые presets: `Web`, `Game`, `UI`, `Preview`, `Lossless`
-- пользовательские пресеты: сохранить, загрузить, удалить
-- автоопределение типа карты по имени файла:
-  `basecolor`, `albedo`, `normal`, `roughness`, `metallic`, `ao`, `opacity`, `emissive`
-- preview / inspect panel:
-  разрешение, альфа, bit depth, итоговый размер, предупреждения
-- базовые правила именования:
-  lowercase, замена пробелов, нормализация суффиксов
-- texture helpers:
-  `power-of-two`, размеры `1K / 2K / 4K / 8K`
-- экспорт отчета по batch-операции в `.txt` или `.csv`
+## Ближайшая цель — отзывчивый authoring
 
-### Критерий готовности
+Граф уже функционален; следующий качественный шаг — сделать его предсказуемым
+на реальных 2K–4K наборах, а не только на простых графах.
 
-Художник кидает папку текстур, выбирает preset, жмет одну кнопку и получает понятный и предсказуемый результат без ручной возни.
+1. Довести интерактивный scheduler: черновой preview при изменении параметра,
+   отмена устаревшей ветки, один полный preview после отпускания control.
+2. Измерять стоимость нод и выделить CPU/GPU bottleneck прямо в интерфейсе.
+3. Не загружать заново неизменившиеся PBR-карты в OpenGL при изменении одной
+   ветки материала.
+4. После измерений оптимизировать только подтверждённо тяжёлые операции;
+   нативный C++/SIMD backend рассматривать точечно, а не как первый ответ на
+   UI-лаги.
 
-## 2. Production
+Результат: художник свободно редактирует Levels, Color Adjust и цепочки
+композитинга, а полное качество получает после завершения жеста.
 
-Цель: сделать инструмент частью реального production-пайплайна.
+## Следующая продуктовая цель — быстрый PBR-authoring
 
-### Основные задачи
+После стабилизации отзывчивости развиваем именно те инструменты, которые
+сокращают ручную работу CG-художника.
 
-- channel packing: `ORM`, `RMA`, `MRA`
-- правила `colorspace`:
-  `sRGB` для color maps, `Linear` для technical maps
-- invert-операции:
-  `glossiness -> roughness`, инверсия отдельных каналов
-- normal map utilities:
-  `DirectX <-> OpenGL`
-- поддержка `EXR` и аккуратная работа с `16-bit` / `32-bit`
-- `UDIM`-aware обработка
-- watch folders:
-  автоматическая обработка новых файлов в папке
-- batch jobs:
-  сохранить задачу и запускать повторно
-- структура экспорта под движки:
-  `Unreal`, `Unity`, `Blender`
-- проверка ассетов перед экспортом:
-  не-`power-of-two`, `CMYK`, проблемный alpha, oversized textures
+- Frames / comments / reroute и быстрый поиск при добавлении ноды;
+- reusable graph templates и project-level output profiles;
+- расширенная валидация Texture Set: совпадение разрешений, colorspace,
+  конфликт duplicate maps, packed-layout и normal/orientation;
+- удобные preview-режимы: до/после, solo channel, сравнение normal OpenGL и
+  DirectX;
+- дополнительные анализаторы и ноды только после подтверждённого workflow:
+  curvature, edge mask, sharpen, distance/height utilities.
 
-### Критерий готовности
+Результат: Graph Workbench становится местом, где материал не только
+конвертируют, но и быстро готовят к экспорту.
 
-Можно взять сырой набор текстур и за один проход подготовить его под движок или проектный стандарт.
+## Production I/O и автоматизация
 
-## 3. Studio-grade
+Когда authoring и интерактивность устойчивы, следующий слой — надёжная работа
+с большими и студийными данными.
 
-Цель: превратить приложение в устойчивый студийный pipeline-tool.
+- EXR и контролируемый путь для 16/32-bit данных;
+- UDIM-aware intake, graph evaluation и export;
+- project profiles, team presets и portable graph packages;
+- воспроизводимый batch/CLI execution graph templates;
+- отчёты QA и machine-readable sidecar metadata;
+- надёжные watch/export jobs с защитой от path collisions и понятной историей
+  запусков.
 
-### Основные задачи
+Результат: один и тот же граф и preset можно безопасно применять к библиотеке
+ассетов или проектному стандарту.
 
-- плагинная система для новых процессоров и экспортных профилей
-- team presets и общая библиотека правил
-- project profiles:
-  настройки на проект, а не только на пользователя
-- validation mode и QA-репорты для lead / supervisor
-- parity между `CLI` и `GUI`
-- sidecar metadata в `.json`
-- история операций и audit trail
-- multi-thread / task scheduler для больших batch-задач
-- preview diff:
-  сравнение до / после, каналов, веса и разрешения
-- будущие интеграции с DCC и engine pipeline:
-  `Blender`, `Substance`, `Unreal`
+## Долгосрочно
 
-### Критерий готовности
+- точечные native backends для измеренно тяжёлых фильтров;
+- интеграции с DCC и engine pipeline через стабильные файлы, presets и CLI;
+- plugin API — только когда появятся повторяемые внешние сценарии, которые
+  действительно нельзя закрыть graph templates и output profiles.
 
-Инструмент работает не как локальная утилита одного художника, а как полноценный элемент студийного пайплайна.
+## Принцип принятия новых задач
 
-## Приоритет Реализации
-
-Рекомендуемый порядок для ближайших итераций:
-
-1. `Drag-and-drop` + очередь файлов
-2. presets + пользовательские профили
-3. автоопределение типов карт
-4. preview / inspect panel
-5. channel packing
-
-## Следующий Шаг
-
-На следующей сессии начать с блока `MVP`:
-
-1. спроектировать модель очереди файлов
-2. добавить `drag-and-drop` в `PyQt6`
-3. вывести список задач в UI
-4. подготовить основу для presets
+Новая функция попадает в план, если она либо заметно ускоряет повседневную
+работу художника, либо предотвращает дорогую pipeline-ошибку. Нельзя добавлять
+ноду или интеграцию только потому, что она существует в другом DCC.
