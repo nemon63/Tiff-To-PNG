@@ -655,6 +655,44 @@ def node_bypass_socket_pair(node_type: NodeType) -> tuple[str, str] | None:
     return None
 
 
+def node_type_supports_socket(
+    node_type: NodeType,
+    *,
+    direction: SocketDirection,
+    socket_type: SocketType,
+) -> bool:
+    """Return whether a node exposes a socket suitable for a wire endpoint."""
+    return any(
+        socket.direction is direction and socket.socket_type is socket_type
+        for socket in socket_definitions(node_type)
+    )
+
+
+def node_insert_socket_pair(
+    node_type: NodeType,
+    socket_type: SocketType,
+) -> tuple[str, str] | None:
+    """Return the safe inline input/output pair for a wire of ``socket_type``."""
+    bypass_pair = node_bypass_socket_pair(node_type)
+    if bypass_pair is None:
+        return None
+    socket_by_id = {
+        socket.socket_id: socket for socket in socket_definitions(node_type)
+    }
+    input_socket = socket_by_id.get(bypass_pair[0])
+    output_socket = socket_by_id.get(bypass_pair[1])
+    if (
+        input_socket is None
+        or output_socket is None
+        or input_socket.direction is not SocketDirection.INPUT
+        or output_socket.direction is not SocketDirection.OUTPUT
+        or input_socket.socket_type is not socket_type
+        or output_socket.socket_type is not socket_type
+    ):
+        return None
+    return bypass_pair
+
+
 def find_node(graph: NodeGraph, node_id: str) -> GraphNode | None:
     return next((node for node in graph.nodes if node.node_id == node_id), None)
 

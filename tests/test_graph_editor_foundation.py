@@ -95,6 +95,7 @@ from image_converter.ui.graph_canvas import (
     ConnectionItem,
     GraphNodeItem,
     is_disconnect_shake,
+    node_type_matches_wire_port,
 )
 from image_converter.ui.node_help import node_help_content
 from image_converter.ui.node_editor import GraphPreviewWorker, GraphWorkspace
@@ -2819,6 +2820,100 @@ class GraphEditorFoundationTests(unittest.TestCase):
 
             self.assertEqual([True], pbr_cleared)
             request_display.assert_called_once()
+
+    def test_wire_node_menu_filters_nodes_by_source_socket_type(self) -> None:
+        source = create_graph_node(NodeType.COLOR)
+        self.workspace.project.graph.nodes = [source]
+        self.workspace._scene.rebuild()
+        node_item = self.workspace._scene.node_items[source.node_id]
+
+        image_matches = {
+            node_type
+            for node_type in NodeType
+            if node_type_matches_wire_port(node_type, node_item.port_items["image"])
+        }
+        channel_matches = {
+            node_type
+            for node_type in NodeType
+            if node_type_matches_wire_port(node_type, node_item.port_items["r"])
+        }
+
+        self.assertIn(NodeType.COLOR_ADJUST, image_matches)
+        self.assertIn(NodeType.SPLIT_RGBA, image_matches)
+        self.assertNotIn(NodeType.LEVELS_CHANNEL, image_matches)
+        self.assertNotIn(NodeType.HEIGHT_TO_NORMAL, image_matches)
+        self.assertIn(NodeType.LEVELS_CHANNEL, channel_matches)
+        self.assertIn(NodeType.HEIGHT_TO_NORMAL, channel_matches)
+        self.assertIn(NodeType.COMBINE_RGBA, channel_matches)
+        self.assertNotIn(NodeType.COLOR_ADJUST, channel_matches)
+
+    def test_context_insert_rejects_channel_node_on_image_wire(self) -> None:
+        source = create_graph_node(NodeType.COLOR)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        wire = GraphConnection(
+            "image-wire",
+            source.node_id,
+            "image",
+            output.node_id,
+            "image",
+        )
+        self.workspace.project.graph.nodes = [source, output]
+        self.workspace.project.graph.connections = [wire]
+        self.workspace._scene.rebuild()
+
+        self.workspace._on_connection_insert_node_requested(
+            wire,
+            NodeType.INVERT_CHANNEL,
+            None,
+        )
+
+        self.assertEqual(2, len(self.workspace.project.graph.nodes))
+        self.assertEqual([wire], self.workspace.project.graph.connections)
+
+    def test_context_insert_uses_image_passthrough_pair_on_image_wire(self) -> None:
+        source = create_graph_node(NodeType.COLOR)
+        output = create_graph_node(NodeType.OUTPUT_RGBA)
+        wire = GraphConnection(
+            "image-wire",
+            source.node_id,
+            "image",
+            output.node_id,
+            "image",
+        )
+        self.workspace.project.graph.nodes = [source, output]
+        self.workspace.project.graph.connections = [wire]
+        self.workspace._scene.rebuild()
+
+        self.workspace._on_connection_insert_node_requested(
+            wire,
+            NodeType.COLOR_ADJUST,
+            None,
+        )
+
+        inserted = next(
+            node
+            for node in self.workspace.project.graph.nodes
+            if node.node_type is NodeType.COLOR_ADJUST
+        )
+        self.assertEqual(2, len(self.workspace.project.graph.connections))
+        self.assertTrue(
+            any(
+                connection.source_node_id == source.node_id
+                and connection.source_socket_id == "image"
+                and connection.target_node_id == inserted.node_id
+                and connection.target_socket_id == "image"
+                for connection in self.workspace.project.graph.connections
+            )
+        )
+        self.assertTrue(
+            any(
+                connection.source_node_id == inserted.node_id
+                and connection.source_socket_id == "out"
+                and connection.target_node_id == output.node_id
+                and connection.target_socket_id == "image"
+                for connection in self.workspace.project.graph.connections
+            )
+        )
 
     def test_loading_graph_clears_stale_graph_pbr_material_in_window(self) -> None:
         window = MainWindow()

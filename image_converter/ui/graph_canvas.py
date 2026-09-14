@@ -44,9 +44,10 @@ from image_converter.domain.node_graph import (
     TextureDataRole,
     incoming_connection,
     make_connection_id,
-    node_bypass_socket_pair,
     node_has_enable_flag,
     node_has_resettable_parameters,
+    node_insert_socket_pair,
+    node_type_supports_socket,
     socket_definitions,
 )
 from image_converter.services.map_types import detect_texture_map_type
@@ -77,6 +78,85 @@ SHAKE_MIN_REVERSALS = 2
 SHAKE_MIN_TRAVEL_PX = 90
 SHAKE_MIN_SPAN_PX = 28
 SHAKE_HORIZONTAL_BIAS = 1.35
+
+NODE_MENU_GROUPS: tuple[tuple[str, tuple[tuple[str, NodeType], ...]], ...] = (
+    (
+        "Input",
+        (
+            ("Texture", NodeType.TEXTURE_INPUT),
+            ("Color", NodeType.COLOR),
+            ("Constant", NodeType.CONSTANT_CHANNEL),
+        ),
+    ),
+    (
+        "Channel",
+        (
+            ("Invert", NodeType.INVERT_CHANNEL),
+            ("Levels", NodeType.LEVELS_CHANNEL),
+            ("Remap", NodeType.REMAP_CHANNEL),
+            ("Clamp", NodeType.CLAMP_CHANNEL),
+            ("Threshold", NodeType.THRESHOLD_CHANNEL),
+            ("Blur", NodeType.BLUR_CHANNEL),
+            ("Dilate", NodeType.DILATE_CHANNEL),
+            ("Erode", NodeType.ERODE_CHANNEL),
+            ("Luminance", NodeType.LUMINANCE),
+        ),
+    ),
+    (
+        "Image",
+        (
+            ("Mix Image", NodeType.MIX_IMAGE),
+            ("Blend Image", NodeType.BLEND_IMAGE),
+            ("Normal Map", NodeType.NORMAL_MAP),
+            ("Height to Normal", NodeType.HEIGHT_TO_NORMAL),
+            ("Normal Blend", NodeType.NORMAL_BLEND),
+            ("Color Adjust", NodeType.COLOR_ADJUST),
+            ("Transform 2D", NodeType.TRANSFORM_2D),
+            ("Resize / Canvas", NodeType.RESIZE_CANVAS),
+            ("Split RGBA", NodeType.SPLIT_RGBA),
+            ("Combine RGBA", NodeType.COMBINE_RGBA),
+            ("Apply Mask", NodeType.SET_ALPHA),
+        ),
+    ),
+    ("Math", (("Blend Channel", NodeType.BLEND_CHANNEL),)),
+    ("Utility", (("View", NodeType.VIEW),)),
+    (
+        "Output",
+        (
+            ("PBR Shader", NodeType.PBR_SHADER),
+            ("Output RGBA", NodeType.OUTPUT_RGBA),
+        ),
+    ),
+)
+
+INLINE_INSERT_NODE_TYPES: tuple[NodeType, ...] = (
+    NodeType.INVERT_CHANNEL,
+    NodeType.LEVELS_CHANNEL,
+    NodeType.REMAP_CHANNEL,
+    NodeType.CLAMP_CHANNEL,
+    NodeType.THRESHOLD_CHANNEL,
+    NodeType.BLUR_CHANNEL,
+    NodeType.DILATE_CHANNEL,
+    NodeType.ERODE_CHANNEL,
+    NodeType.NORMAL_MAP,
+    NodeType.COLOR_ADJUST,
+    NodeType.TRANSFORM_2D,
+    NodeType.RESIZE_CANVAS,
+    NodeType.SET_ALPHA,
+)
+
+
+def node_type_matches_wire_port(node_type: NodeType, port: "PortItem") -> bool:
+    required_direction = (
+        SocketDirection.INPUT
+        if port.direction is SocketDirection.OUTPUT
+        else SocketDirection.OUTPUT
+    )
+    return node_type_supports_socket(
+        node_type,
+        direction=required_direction,
+        socket_type=port.socket_type,
+    )
 
 
 def is_disconnect_shake(samples: list[tuple[float, float, float]]) -> bool:
@@ -1234,7 +1314,10 @@ class GraphScene(QGraphicsScene):
             connection.target_node_id,
         ):
             return False
-        bypass_pair = node_bypass_socket_pair(node_item.node.node_type)
+        bypass_pair = node_insert_socket_pair(
+            node_item.node.node_type,
+            connection_item.source_port.socket_type,
+        )
         if bypass_pair is None:
             return False
         socket_by_id = {
@@ -1245,13 +1328,13 @@ class GraphScene(QGraphicsScene):
         output_socket = socket_by_id.get(bypass_pair[1])
         if input_socket is None or output_socket is None:
             return False
-        wire_type = connection_item.source_port.socket_type
         return (
-            connection_item.target_port.socket_type is wire_type
+            connection_item.target_port.socket_type
+            is connection_item.source_port.socket_type
             and input_socket.direction is SocketDirection.INPUT
             and output_socket.direction is SocketDirection.OUTPUT
-            and input_socket.socket_type is wire_type
-            and output_socket.socket_type is wire_type
+            and input_socket.socket_type is connection_item.source_port.socket_type
+            and output_socket.socket_type is connection_item.source_port.socket_type
         )
 
     @staticmethod
@@ -1629,53 +1712,24 @@ class GraphView(QGraphicsView):
         wire_port: PortItem | None = None,
     ) -> None:
         menu = QMenu(self)
-
-        if wire_port is None or wire_port.direction is SocketDirection.INPUT:
-            input_menu = menu.addMenu("Input")
-            self._add_node_menu_action(input_menu, "Texture", NodeType.TEXTURE_INPUT, scene_position, wire_port)
-            self._add_node_menu_action(input_menu, "Color", NodeType.COLOR, scene_position, wire_port)
-            self._add_node_menu_action(input_menu, "Constant", NodeType.CONSTANT_CHANNEL, scene_position, wire_port)
-
-        channel_menu = menu.addMenu("Channel")
-        self._add_node_menu_action(channel_menu, "Invert", NodeType.INVERT_CHANNEL, scene_position, wire_port)
-        self._add_node_menu_action(channel_menu, "Levels", NodeType.LEVELS_CHANNEL, scene_position, wire_port)
-        self._add_node_menu_action(channel_menu, "Remap", NodeType.REMAP_CHANNEL, scene_position, wire_port)
-        self._add_node_menu_action(channel_menu, "Clamp", NodeType.CLAMP_CHANNEL, scene_position, wire_port)
-        self._add_node_menu_action(channel_menu, "Threshold", NodeType.THRESHOLD_CHANNEL, scene_position, wire_port)
-        self._add_node_menu_action(channel_menu, "Blur", NodeType.BLUR_CHANNEL, scene_position, wire_port)
-        self._add_node_menu_action(channel_menu, "Dilate", NodeType.DILATE_CHANNEL, scene_position, wire_port)
-        self._add_node_menu_action(channel_menu, "Erode", NodeType.ERODE_CHANNEL, scene_position, wire_port)
-        self._add_node_menu_action(channel_menu, "Luminance", NodeType.LUMINANCE, scene_position, wire_port)
-
-        image_menu = menu.addMenu("Image")
-        self._add_node_menu_action(image_menu, "Mix Image", NodeType.MIX_IMAGE, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Blend Image", NodeType.BLEND_IMAGE, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Normal Map", NodeType.NORMAL_MAP, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Height to Normal", NodeType.HEIGHT_TO_NORMAL, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Normal Blend", NodeType.NORMAL_BLEND, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Color Adjust", NodeType.COLOR_ADJUST, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Transform 2D", NodeType.TRANSFORM_2D, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Resize / Canvas", NodeType.RESIZE_CANVAS, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Split RGBA", NodeType.SPLIT_RGBA, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Combine RGBA", NodeType.COMBINE_RGBA, scene_position, wire_port)
-        self._add_node_menu_action(image_menu, "Apply Mask", NodeType.SET_ALPHA, scene_position, wire_port)
-
-        math_menu = menu.addMenu("Math")
-        self._add_node_menu_action(math_menu, "Blend Channel", NodeType.BLEND_CHANNEL, scene_position, wire_port)
-
-        if wire_port is None or wire_port.direction is SocketDirection.OUTPUT:
-            utility_menu = menu.addMenu("Utility")
-            self._add_node_menu_action(utility_menu, "View", NodeType.VIEW, scene_position, wire_port)
-
-            output_menu = menu.addMenu("Output")
-            self._add_node_menu_action(
-                output_menu,
-                "PBR Shader",
-                NodeType.PBR_SHADER,
-                scene_position,
-                wire_port,
-            )
-            self._add_node_menu_action(output_menu, "Output RGBA", NodeType.OUTPUT_RGBA, scene_position, wire_port)
+        for group_label, candidates in NODE_MENU_GROUPS:
+            compatible_candidates = [
+                (label, node_type)
+                for label, node_type in candidates
+                if wire_port is None
+                or node_type_matches_wire_port(node_type, wire_port)
+            ]
+            if not compatible_candidates:
+                continue
+            node_menu = menu.addMenu(group_label)
+            for label, node_type in compatible_candidates:
+                self._add_node_menu_action(
+                    node_menu,
+                    label,
+                    node_type,
+                    scene_position,
+                    wire_port,
+                )
 
         menu.addSeparator()
         fit_action = menu.addAction("Fit View")
@@ -1694,16 +1748,28 @@ class GraphView(QGraphicsView):
     ) -> None:
         menu = QMenu(self)
         insert_menu = menu.addMenu("Insert Node")
-        for label, node_type in (
-            ("Invert", NodeType.INVERT_CHANNEL),
-            ("Levels", NodeType.LEVELS_CHANNEL),
-            ("Remap", NodeType.REMAP_CHANNEL),
-            ("Clamp", NodeType.CLAMP_CHANNEL),
-            ("Threshold", NodeType.THRESHOLD_CHANNEL),
-            ("Blur", NodeType.BLUR_CHANNEL),
-            ("Dilate", NodeType.DILATE_CHANNEL),
-            ("Erode", NodeType.ERODE_CHANNEL),
-        ):
+        scene = self.scene()
+        connection_item = (
+            scene.connection_items.get(connection.connection_id)
+            if isinstance(scene, GraphScene)
+            else None
+        )
+        wire_type = (
+            connection_item.source_port.socket_type
+            if connection_item is not None
+            and connection_item.target_port.socket_type
+            is connection_item.source_port.socket_type
+            else None
+        )
+        labels_by_type = {
+            node_type: label
+            for _group_label, candidates in NODE_MENU_GROUPS
+            for label, node_type in candidates
+        }
+        for node_type in INLINE_INSERT_NODE_TYPES:
+            if wire_type is None or node_insert_socket_pair(node_type, wire_type) is None:
+                continue
+            label = labels_by_type[node_type]
             action = insert_menu.addAction(label)
             action.triggered.connect(
                 lambda _checked=False, current_type=node_type: self.connection_insert_node_requested.emit(
@@ -1712,6 +1778,9 @@ class GraphView(QGraphicsView):
                     scene_position,
                 )
             )
+
+        if not insert_menu.actions():
+            insert_menu.setEnabled(False)
 
         delete_action = menu.addAction("Delete Connection")
         delete_action.triggered.connect(lambda: self.connection_delete_requested.emit(connection))

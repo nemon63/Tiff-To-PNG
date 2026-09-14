@@ -60,6 +60,7 @@ from image_converter.domain.node_graph import (
     node_bypass_socket_pair,
     node_has_enable_flag,
     node_has_resettable_parameters,
+    node_insert_socket_pair,
     node_type_label,
     reset_node_parameters,
     socket_definitions,
@@ -1578,11 +1579,26 @@ class GraphWorkspace(QWidget):
             resolved_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
         except ValueError:
             return
-        input_socket_id = self._first_channel_input_socket_id(resolved_type)
-        output_socket_id = self._first_channel_output_socket_id(resolved_type)
-        if input_socket_id is None or output_socket_id is None:
-            self.status_message.emit(f"{node_type_label(resolved_type)} cannot be inserted in a wire.")
+        source_socket = self._connection_source_socket(connection)
+        target_socket = self._connection_target_socket(connection)
+        if (
+            source_socket is None
+            or target_socket is None
+            or source_socket.socket_type is not target_socket.socket_type
+        ):
+            self.status_message.emit("Cannot insert a node into an invalid wire.")
             return
+        bypass_pair = node_insert_socket_pair(
+            resolved_type,
+            source_socket.socket_type,
+        )
+        if bypass_pair is None:
+            self.status_message.emit(
+                f"{node_type_label(resolved_type)} cannot be inserted in a "
+                f"{source_socket.socket_type.value} wire."
+            )
+            return
+        input_socket_id, output_socket_id = bypass_pair
 
         position = self._node_position_for(scene_position)
         count = sum(1 for node in self.project.graph.nodes if node.node_type is resolved_type)
@@ -2749,22 +2765,6 @@ class GraphWorkspace(QWidget):
             self.project_label.setText(f"{self.project.name}{suffix}")
         except RuntimeError:
             return
-
-    @staticmethod
-    def _first_channel_input_socket_id(node_type: NodeType) -> str | None:
-        return GraphWorkspace._first_socket_id(
-            node_type,
-            SocketDirection.INPUT,
-            SocketType.CHANNEL,
-        )
-
-    @staticmethod
-    def _first_channel_output_socket_id(node_type: NodeType) -> str | None:
-        return GraphWorkspace._first_socket_id(
-            node_type,
-            SocketDirection.OUTPUT,
-            SocketType.CHANNEL,
-        )
 
     @staticmethod
     def _first_socket_id(
