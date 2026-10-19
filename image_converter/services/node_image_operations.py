@@ -253,25 +253,15 @@ def transform_2d(
         max(1, round(source.width * scale)),
         max(1, round(source.height * scale)),
     )
-    if scaled_size != source.size:
-        source = source.resize(
-            scaled_size,
-            image_resampling(node.properties.get("filter", "bilinear")),
-        )
-
     offset_x = round(_property_int(node, "offset_x", 0) * offset_scale[0])
     offset_y = round(_property_int(node, "offset_y", 0) * offset_scale[1])
-    left = (output_width - source.width) // 2 + offset_x
-    top = (output_height - source.height) // 2 + offset_y
+    left = (output_width - scaled_size[0]) // 2 + offset_x
+    top = (output_height - scaled_size[1]) // 2 + offset_y
     address_mode = str(node.properties.get("address_mode", "repeat")).lower()
-    if address_mode == "clamp":
-        return _clamped_canvas(source, output_size, left, top)
-    return _tiled_canvas(
-        source,
-        output_size,
-        left,
-        top,
-        mirrored=address_mode == "mirror",
+    return _resampled_canvas(
+        source, scaled_size, output_size, left, top,
+        address_mode=address_mode,
+        resampling=image_resampling(node.properties.get("filter", "bilinear")),
     )
 
 
@@ -371,68 +361,132 @@ def _clamped_canvas(
     left: int,
     top: int,
 ) -> Image.Image:
-    output_width, output_height = output_size
-    pad_left = max(0, left)
-    pad_top = max(0, top)
-    pad_right = max(0, output_width - left - source.width)
-    pad_bottom = max(0, output_height - top - source.height)
-    extended = Image.new(
-        "RGBA",
-        (pad_left + source.width + pad_right, pad_top + source.height + pad_bottom),
-    )
-    extended.paste(source, (pad_left, pad_top))
-    if pad_left:
-        extended.paste(
-            source.crop((0, 0, 1, source.height)).resize((pad_left, source.height)),
-            (0, pad_top),
-        )
-    if pad_right:
-        extended.paste(
-            source.crop((source.width - 1, 0, source.width, source.height)).resize(
-                (pad_right, source.height)
-            ),
-            (pad_left + source.width, pad_top),
-        )
-    if pad_top:
-        row = extended.crop((0, pad_top, extended.width, pad_top + 1))
-        extended.paste(row.resize((extended.width, pad_top)), (0, 0))
-    if pad_bottom:
-        row_y = pad_top + source.height - 1
-        row = extended.crop((0, row_y, extended.width, row_y + 1))
-        extended.paste(row.resize((extended.width, pad_bottom)), (0, row_y + 1))
-    crop_left = -left + pad_left
-    crop_top = -top + pad_top
-    return extended.crop(
-        (crop_left, crop_top, crop_left + output_width, crop_top + output_height)
+    return _resampled_canvas(
+        source, source.size, output_size, left, top,
+        address_mode="clamp", resampling=Image.Resampling.NEAREST,
     )
 
 
-def _tiled_canvas(
+def _canvas_axis_spans(
+    tile_length: int,
+    output_length: int,
+    offset: int,
+    address_mode: str,
+) -> list[tuple[int, int, int, int, bool]]:
+    """Return destination/source intervals for a clamp or one repeat period."""
+    if address_mode == "clamp":
+        start = max(0, min(offset, output_length))
+        end = max(0, min(offset + tile_length, output_length))
+        spans = []
+        if start:
+            spans.append((0, start, 0, 1, False))
+        if end > start:
+            spans.append((start, end, start - offset, end - offset, False))
+        if end < output_length:
+            spans.append((end, output_length, tile_length - 1, tile_length, False))
+        return spans
+
+    mirrored = address_mode == "mirror"
+    length = min(output_length, tile_length * (2 if mirrored else 1))
+    spans = []
+    position = 0
+    while position < length:
+        tile_index, local = divmod(position - offset, tile_length)
+        count = min(length - position, tile_length - local)
+        flipped = mirrored and bool(tile_index % 2)
+        start = tile_length - local - count if flipped else local
+        spans.append((position, position + count, start, start + count, flipped))
+        position += count
+    return spans
+
+
+@lru_cache(maxsize=128)
+def _nearest_resize_offset(start: int, input_length: int, scaled_length: int) -> float:
+    # Match Pillow's full-image nearest sampling, including accumulated rounding
+    # at exact pixel boundaries. Multiplication instead of addition changes ties.
+    step = input_length / scaled_length
+    position = step * 0.5
+    for _ in range(start):
+        position += step
+    return position - step * 0.5
+
+
+def _resampled_canvas(
     source: Image.Image,
+    scaled_size: tuple[int, int],
     output_size: tuple[int, int],
     left: int,
     top: int,
     *,
-    mirrored: bool,
+    address_mode: str,
+    resampling: Image.Resampling,
 ) -> Image.Image:
+    """Sample only visible regions; never materialize an enlarged texture/padding."""
     output_width, output_height = output_size
-    canvas = Image.new("RGBA", output_size, (0, 0, 0, 0))
-    first_x = math.floor(-left / source.width) - 1
-    last_x = math.ceil((output_width - left) / source.width) + 1
-    first_y = math.floor(-top / source.height) - 1
-    last_y = math.ceil((output_height - top) / source.height) + 1
-    tiles = {(False, False): source}
-    if mirrored:
-        tiles[(True, False)] = source.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        tiles[(False, True)] = source.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-        tiles[(True, True)] = source.transpose(Image.Transpose.ROTATE_180)
-    for tile_y in range(first_y, last_y + 1):
-        for tile_x in range(first_x, last_x + 1):
-            tile = tiles[(bool(tile_x % 2), bool(tile_y % 2))] if mirrored else source
-            canvas.alpha_composite(
-                tile,
-                (left + tile_x * source.width, top + tile_y * source.height),
+    scaled_width, scaled_height = scaled_size
+    if scaled_size == source.size:
+        scaled_source = source
+    elif scaled_width <= source.width and scaled_height <= source.height:
+        # Downsampling once retains the filter's full footprint and is cheap to tile.
+        scaled_source = source.resize(scaled_size, resampling)
+    else:
+        scaled_source = None
+    sampling_source = source
+    if scaled_source is None and resampling != Image.Resampling.NEAREST:
+        # Match Pillow's premultiplied-alpha resize without converting the input
+        # again for each visible region.
+        sampling_source = source.convert("RGBa")
+
+    def sample(box: tuple[int, int, int, int]) -> Image.Image:
+        if scaled_source is not None:
+            return scaled_source.crop(box)
+        x0, y0, x1, y1 = box
+        size = (x1 - x0, y1 - y0)
+        scale_x = source.width / scaled_width
+        scale_y = source.height / scaled_height
+        if resampling == Image.Resampling.NEAREST:
+            return source.transform(
+                size, Image.Transform.AFFINE,
+                (
+                    scale_x, 0, _nearest_resize_offset(x0, source.width, scaled_width),
+                    0, scale_y, _nearest_resize_offset(y0, source.height, scaled_height),
+                ),
+                resample=resampling,
             )
+        return sampling_source.resize(
+            size, resampling,
+            box=(x0 * scale_x, y0 * scale_y, x1 * scale_x, y1 * scale_y),
+        ).convert("RGBA")
+
+    x_spans = _canvas_axis_spans(scaled_width, output_width, left, address_mode)
+    y_spans = _canvas_axis_spans(scaled_height, output_height, top, address_mode)
+    canvas = Image.new("RGBA", output_size, (0, 0, 0, 0))
+    for dy0, dy1, sy0, sy1, flip_y in y_spans:
+        for dx0, dx1, sx0, sx1, flip_x in x_spans:
+            tile = sample((sx0, sy0, sx1, sy1))
+            if flip_x:
+                tile = tile.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            if flip_y:
+                tile = tile.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+            if address_mode == "clamp":
+                if tile.size != (dx1 - dx0, dy1 - dy0):
+                    tile = tile.resize((dx1 - dx0, dy1 - dy0), Image.Resampling.NEAREST)
+                canvas.paste(tile, (dx0, dy0))
+            else:
+                canvas.alpha_composite(tile, (dx0, dy0))
+
+    # Replicate the rendered period by doubling, rather than compositing thousands
+    # of individual tiles when the texture is scaled down to 1%.
+    filled_width = x_spans[-1][1]
+    filled_height = y_spans[-1][1]
+    while filled_width < output_width:
+        count = min(filled_width, output_width - filled_width)
+        canvas.paste(canvas.crop((0, 0, count, filled_height)), (filled_width, 0))
+        filled_width += count
+    while filled_height < output_height:
+        count = min(filled_height, output_height - filled_height)
+        canvas.paste(canvas.crop((0, 0, output_width, count)), (0, filled_height))
+        filled_height += count
     return canvas
 
 
