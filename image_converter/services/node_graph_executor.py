@@ -29,6 +29,11 @@ from image_converter.domain.node_graph import (
     socket_definitions,
 )
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
+from image_converter.services.graph_profiling import (
+    GraphEvaluationProfiler,
+    profile_render,
+    profile_socket,
+)
 from image_converter.services.material_validation import (
     NORMAL_ORIENTATION_DIRECTX,
     graph_normal_orientation_issues,
@@ -376,9 +381,15 @@ class NodeGraphExecutor:
         self,
         *,
         cancel_requested: Callable[[], bool] | None = None,
+        profiler: GraphEvaluationProfiler | None = None,
     ) -> None:
         self._lookup: NodeGraphLookup | None = None
         self._cancel_requested = cancel_requested
+        self._profiler = profiler
+
+    def _profile_cache_lookup(self, image: Image.Image | None) -> None:
+        if self._profiler is not None:
+            self._profiler.cache_lookup(image is not None)
 
     def _check_cancelled(self) -> None:
         if self._cancel_requested is not None and self._cancel_requested():
@@ -402,6 +413,7 @@ class NodeGraphExecutor:
         lookup = self._lookup or self._prepare_lookup(graph)
         return lookup.incoming_by_socket.get((target_node_id, target_socket_id))
 
+    @profile_render
     def render_display_node(
         self,
         graph: NodeGraph,
@@ -510,6 +522,7 @@ class NodeGraphExecutor:
         meta = f"Display flag · {output_socket.name} · {image.width}x{image.height} · channel"
         return image, meta
 
+    @profile_render
     def render_output_node(self, graph: NodeGraph, output_node: GraphNode) -> Image.Image:
         self._prepare_lookup(graph)
         if output_node.node_type is not NodeType.OUTPUT_RGBA:
@@ -526,6 +539,7 @@ class NodeGraphExecutor:
 
         return self._compose_output_image(graph, output_node, target_size, cache)
 
+    @profile_render
     def render_pbr_material_node(
         self,
         graph: NodeGraph,
@@ -1507,6 +1521,7 @@ class NodeGraphExecutor:
             return Image.new("L", target_size, 255)
         return self._evaluate_channel_socket_cached(graph, connection, target_size, set(), cache)
 
+    @profile_socket
     def _evaluate_image_socket(
         self,
         graph: NodeGraph,
@@ -1520,6 +1535,7 @@ class NodeGraphExecutor:
         cache_key = (connection.source_node_id, connection.source_socket_id, target_size)
         if cache is not None:
             cached = cache.get_image("image", cache_key)
+            self._profile_cache_lookup(cached)
             if cached is not None:
                 return cached.copy()
         if key in visiting:
@@ -1958,6 +1974,7 @@ class NodeGraphExecutor:
             mask = mask.resize(target_size, resampling)
         return mask
 
+    @profile_socket
     def _evaluate_channel_socket(
         self,
         graph: NodeGraph,
@@ -2136,6 +2153,7 @@ class NodeGraphExecutor:
             channel = channel.resize(target_size, RESAMPLING_LANCZOS)
         return channel.copy()
 
+    @profile_socket
     def _evaluate_channel_socket_cached(
         self,
         graph: NodeGraph,
@@ -2150,6 +2168,7 @@ class NodeGraphExecutor:
 
         cache_key = (connection.source_node_id, connection.source_socket_id, target_size)
         cached = cache.get_image("channel", cache_key)
+        self._profile_cache_lookup(cached)
         if cached is not None:
             return cached.copy()
 
@@ -2957,6 +2976,7 @@ class NodeGraphExecutor:
     ) -> Image.Image:
         cache_key = (node.node_id, socket_id, target_size)
         cached = cache.get_image("texture-channel", cache_key)
+        self._profile_cache_lookup(cached)
         if cached is not None:
             return cached.copy()
         working_image = self._load_texture_preview_image_cached(node, cache, target_size)
@@ -2984,6 +3004,7 @@ class NodeGraphExecutor:
     ) -> Image.Image:
         cache_key = (node.node_id, target_size)
         cached = cache.get_image("texture-preview", cache_key)
+        self._profile_cache_lookup(cached)
         if cached is not None:
             return cached.copy()
         image = self._load_texture_preview_image(node)

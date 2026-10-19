@@ -109,6 +109,8 @@ from image_converter.ui.node_editor_constants import (
     PREVIEW_MODE_FULL,
 )
 from image_converter.ui.node_properties import NodePropertiesPanel
+from image_converter.ui.graph_performance import GraphPerformancePanel
+from image_converter.services.graph_profiling import GraphEvaluationProfile, GraphEvaluationProfiler
 from image_converter.services.node_graph_executor import (
     GraphExecutionCancelled,
     GraphExecutionError,
@@ -261,6 +263,7 @@ class OutputProfilePlan:
 
 class GraphPreviewWorker(QObject):
     finished = pyqtSignal(int, object, str, str, str)
+    profile_ready = pyqtSignal(int, object)
     failed = pyqtSignal(int, str, str, str)
     canceled = pyqtSignal(int)
     completed = pyqtSignal()
@@ -289,8 +292,10 @@ class GraphPreviewWorker(QObject):
 
     def run(self) -> None:
         try:
+            profiler = GraphEvaluationProfiler()
             executor = NodeGraphExecutor(
                 cancel_requested=self._cancel_event.is_set,
+                profiler=profiler,
             )
             preview_cache = self._preview_cache or NodeGraphPreviewCache(max_side=self._max_side)
             if self._node.node_type is NodeType.PBR_SHADER:
@@ -319,6 +324,7 @@ class GraphPreviewWorker(QObject):
                 )
             if self._cancel_event.is_set():
                 raise GraphExecutionCancelled("Preview render canceled.")
+            self.profile_ready.emit(self._generation, profiler.snapshot(max_side=self._max_side))
             self.finished.emit(
                 self._generation,
                 result,
@@ -507,6 +513,8 @@ class GraphWorkspace(QWidget):
         self.view.texture_dropped.connect(self.add_texture_node_for_path)
         self.view.node_add_requested.connect(self.add_node_of_type)
         self.properties_panel = NodePropertiesPanel()
+        self.performance_panel = GraphPerformancePanel()
+        self.performance_panel.node_requested.connect(self._select_profile_node)
         self.properties_panel.node_changed.connect(self._on_node_properties_changed)
         self.properties_panel.transient_preview_requested.connect(
             self._on_transient_preview_requested
@@ -557,6 +565,7 @@ class GraphWorkspace(QWidget):
 
         tabs = QTabWidget()
         tabs.addTab(self.properties_panel, "Properties")
+        tabs.addTab(self.performance_panel, "Performance")
 
         validation_tab = QWidget()
         validation_layout = QVBoxLayout(validation_tab)
@@ -800,6 +809,7 @@ class GraphWorkspace(QWidget):
         return True
 
     def _reset_preview_for_project_change(self) -> None:
+        self.performance_panel.clear_profile()
         self._last_preview_node_id = None
         self._last_preview_mode_label = ""
         self._preview_generation += 1
@@ -2934,6 +2944,7 @@ class GraphWorkspace(QWidget):
         preview_mode: str = PREVIEW_MODE_FULL,
         property_overrides: dict[str, dict] | None = None,
     ) -> None:
+        self.performance_panel.mark_pending()
         self._last_preview_node_id = node.node_id
         self._last_preview_mode_label = mode_label
         self._last_preview_quality_request = preview_mode
@@ -3000,6 +3011,7 @@ class GraphWorkspace(QWidget):
         self._preview_workers.append(worker)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_preview_worker_finished)
+        worker.profile_ready.connect(self._on_preview_profile_ready)
         worker.failed.connect(self._on_preview_worker_failed)
         worker.canceled.connect(self._on_preview_worker_canceled)
         worker.completed.connect(thread.quit)
@@ -3032,6 +3044,18 @@ class GraphWorkspace(QWidget):
             preview_mode=self._last_preview_quality_request,
         )
         return True
+
+    def _select_profile_node(self, node_id: str) -> None:
+        if node_id in self._scene.node_items:
+            self._scene.select_node_ids([node_id])
+
+    def _on_preview_profile_ready(self, generation: int, profile: object) -> None:
+        if (
+            generation == self._preview_generation
+            and generation == self._preview_inflight_generation
+            and isinstance(profile, GraphEvaluationProfile)
+        ):
+            self.performance_panel.set_profile(profile)
 
     def _on_preview_worker_finished(
         self,
@@ -3077,6 +3101,7 @@ class GraphWorkspace(QWidget):
             if pending is not None:
                 self._restart_pending_preview(pending)
             return
+        self.performance_panel.mark_pending("Preview failed; rows belong to the last completed preview.")
         self.preview_failed.emit(title, message, node_id)
         self.status_message.emit(f"{title}: preview failed: {message}")
         if pending is not None:
