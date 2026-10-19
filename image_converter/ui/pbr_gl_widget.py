@@ -24,6 +24,7 @@ from image_converter.services.pbr_preview import (
     PBR_SOLO_NORMAL,
     PBR_SOLO_NORMAL_CHECK,
     PBR_SOLO_ROUGHNESS,
+    PBR_TEXTURE_NAMES,
     PbrMaterialData,
 )
 from image_converter.ui.common import _qimage_from_pil
@@ -253,6 +254,7 @@ class PbrOpenGLWidget(QOpenGLWidget):
         self._program: QOpenGLShaderProgram | None = None
         self._vertex_buffer: QOpenGLBuffer | None = None
         self._textures: list[QOpenGLTexture] = []
+        self._uploaded_texture_keys: tuple[object, ...] = ()
         self._material: PbrMaterialData | None = None
         self._uploaded_material: PbrMaterialData | None = None
         self._geometry = "sphere"
@@ -344,6 +346,7 @@ class PbrOpenGLWidget(QOpenGLWidget):
     def initializeGL(self) -> None:
         try:
             self._uploaded_material = None
+            self._uploaded_texture_keys = ()
             self.context().aboutToBeDestroyed.connect(self.cleanup)
             self._functions = QOpenGLFunctions_2_0()
             if not self._functions.initializeOpenGLFunctions():
@@ -528,37 +531,70 @@ class PbrOpenGLWidget(QOpenGLWidget):
         super().wheelEvent(event)
 
     def _upload_material(self) -> None:
-        for texture in self._textures:
-            texture.destroy()
-        self._textures.clear()
-        self._uploaded_material = self._material
-        if self._material is None:
+        material = self._material
+        if material is None:
+            self._destroy_textures()
+            self._uploaded_material = None
             return
 
-        for image in (
-            self._material.basecolor,
-            self._material.normal,
-            self._material.properties,
-            self._material.emissive,
-        ):
-            texture = QOpenGLTexture(
-                _qimage_from_pil(image),
-                QOpenGLTexture.MipMapGeneration.GenerateMipMaps,
-            )
+        images = tuple(getattr(material, name) for name in PBR_TEXTURE_NAMES)
+        revisions = material.texture_keys or (object(), object(), object(), object())
+        keys = tuple((revision, image.size, image.mode) for revision, image in zip(revisions, images))
+        replacements: dict[int, QOpenGLTexture] = {}
+        try:
+            for index, (key, image) in enumerate(zip(keys, images)):
+                if (
+                    index < len(self._textures)
+                    and index < len(self._uploaded_texture_keys)
+                    and key == self._uploaded_texture_keys[index]
+                ):
+                    continue
+                replacements[index] = self._create_texture(image)
+        except Exception:
+            # A failed upload must not leave a material mixing old/new maps.
+            for texture in replacements.values():
+                texture.destroy()
+            raise
+
+        for index, texture in replacements.items():
+            if index < len(self._textures):
+                self._textures[index].destroy()
+                self._textures[index] = texture
+            else:
+                self._textures.append(texture)
+        self._uploaded_texture_keys = keys
+        self._uploaded_material = material
+
+    @staticmethod
+    def _create_texture(image) -> QOpenGLTexture:
+        texture = QOpenGLTexture(
+            _qimage_from_pil(image),
+            QOpenGLTexture.MipMapGeneration.GenerateMipMaps,
+        )
+        try:
+            if not texture.isCreated():
+                raise RuntimeError("Could not create the PBR texture.")
             texture.setWrapMode(QOpenGLTexture.WrapMode.Repeat)
             texture.setMinificationFilter(
                 QOpenGLTexture.Filter.LinearMipMapLinear
             )
             texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
-            self._textures.append(texture)
+            return texture
+        except Exception:
+            texture.destroy()
+            raise
+
+    def _destroy_textures(self) -> None:
+        for texture in self._textures:
+            texture.destroy()
+        self._textures.clear()
+        self._uploaded_texture_keys = ()
 
     def cleanup(self) -> None:
         if not self.isValid():
             return
         self.makeCurrent()
-        for texture in self._textures:
-            texture.destroy()
-        self._textures.clear()
+        self._destroy_textures()
         if self._vertex_buffer is not None:
             self._vertex_buffer.destroy()
         self._uploaded_material = None

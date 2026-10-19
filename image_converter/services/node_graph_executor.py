@@ -278,7 +278,7 @@ class NodeGraphPreviewCache:
         self.max_bytes = max(0, max_bytes)
         self.max_size_entries = max(1, max_size_entries)
         self.interactive_preview = interactive_preview
-        self._images: OrderedDict[tuple[str, object], tuple[Image.Image, int]] = OrderedDict()
+        self._images: OrderedDict[tuple[str, object], tuple[Image.Image, int, object]] = OrderedDict()
         self.texture_sizes: OrderedDict[str, tuple[int, int] | None] = OrderedDict()
         self.current_bytes = 0
         self.lock = RLock()
@@ -296,6 +296,16 @@ class NodeGraphPreviewCache:
             self._images.move_to_end(cache_key)
             return entry[0]
 
+    def image_revision(self, bucket: str, key: object) -> object:
+        """Return a bounded, image-free identity for this cached computation.
+
+        Missing/evicted entries get a fresh token: extra upload is safe, false
+        reuse is not. Tokens change on every write and never alias across scenes.
+        """
+        with self.lock:
+            entry = self._images.get((bucket, key))
+            return entry[2] if entry is not None else object()
+
     def put_image(self, bucket: str, key: object, image: Image.Image) -> None:
         size = self._image_bytes(image)
         cache_key = (bucket, key)
@@ -310,9 +320,9 @@ class NodeGraphPreviewCache:
             if previous is not None:
                 self.current_bytes -= previous[1]
             while self._images and self.current_bytes + size > self.max_bytes:
-                _old_key, (_old_image, old_size) = self._images.popitem(last=False)
+                _old_key, (_old_image, old_size, _revision) = self._images.popitem(last=False)
                 self.current_bytes -= old_size
-            self._images[cache_key] = (image, size)
+            self._images[cache_key] = (image, size, object())
             self.current_bytes += size
 
     def get_texture_size(self, node_id: str) -> tuple[int, int] | None | object:
@@ -339,7 +349,7 @@ class NodeGraphPreviewCache:
     def invalidate_node_and_downstream(self, graph: NodeGraph, node_id: str) -> None:
         dirty_node_ids = self._downstream_node_ids(graph, node_id)
         with self.lock:
-            for cache_key, (_image, size) in tuple(self._images.items()):
+            for cache_key, (_image, size, _revision) in tuple(self._images.items()):
                 item_key = cache_key[1]
                 if isinstance(item_key, tuple) and item_key and item_key[0] in dirty_node_ids:
                     self._images.pop(cache_key)
@@ -602,31 +612,42 @@ class NodeGraphExecutor:
             max_side,
         )
 
+        input_keys: dict[str, object] = {}
+
+        def record_input_key(socket_id: str, bucket: str, connection: GraphConnection) -> None:
+            input_keys[socket_id] = cache.image_revision(
+                bucket, (connection.source_node_id, connection.source_socket_id, target_size),
+            )
+
         def image_input(socket_id: str) -> Image.Image | None:
             self._check_cancelled()
             connection = connections[socket_id]
             if connection is None:
                 return None
-            return self._evaluate_image_socket(
+            image = self._evaluate_image_socket(
                 graph,
                 connection,
                 target_size,
                 set(),
                 cache,
             )
+            record_input_key(socket_id, "image", connection)
+            return image
 
         def channel_input(socket_id: str) -> Image.Image | None:
             self._check_cancelled()
             connection = connections[socket_id]
             if connection is None:
                 return None
-            return self._evaluate_channel_socket_cached(
+            channel = self._evaluate_channel_socket_cached(
                 graph,
                 connection,
                 target_size,
                 set(),
                 cache,
-            ).convert("L")
+            )
+            record_input_key(socket_id, "channel", connection)
+            return channel.convert("L")
 
         try:
             workflow = PbrWorkflow(
@@ -740,6 +761,42 @@ class NodeGraphExecutor:
             used_labels=used_labels,
             workflow_label=workflow_label,
             normal_status=normal_status,
+            texture_keys=self._pbr_texture_keys(input_keys, workflow, target_size),
+        )
+
+    @staticmethod
+    def _pbr_texture_keys(
+        inputs: dict[str, object], workflow: PbrWorkflow, size: tuple[int, int],
+    ) -> tuple[object, object, object, object]:
+        # These describe the final conversion recipes, not just shader revisions:
+        # a uniform-only change (e.g. normal convention) must not re-upload maps.
+        roughness: object = ("solid", 128)
+        metallic: object = ("solid", 0)
+        ao: object = ("solid", 255)
+        if "packed" in inputs:
+            packed = inputs["packed"]
+            if workflow in (PbrWorkflow.UNITY_URP, PbrWorkflow.UNITY_HDRP):
+                metallic, roughness = (packed, "R"), (packed, "1-A")
+                if workflow is PbrWorkflow.UNITY_HDRP:
+                    ao = (packed, "G")
+            elif workflow is PbrWorkflow.UNREAL_ORM:
+                ao, roughness, metallic = (packed, "R"), (packed, "G"), (packed, "B")
+            elif workflow is PbrWorkflow.UNREAL_MRA:
+                metallic, roughness, ao = (packed, "R"), (packed, "G"), (packed, "B")
+            elif workflow is PbrWorkflow.UNREAL_RMA:
+                roughness, metallic, ao = (packed, "R"), (packed, "G"), (packed, "B")
+        if "roughness" in inputs:
+            roughness = inputs["roughness"]
+        elif "smoothness" in inputs:
+            roughness = ("invert", inputs["smoothness"])
+        metallic = inputs.get("metallic", metallic)
+        ao = inputs.get("ao", ao)
+        opacity = inputs.get("opacity", ("solid", 255))
+        return (
+            ("RGBA", size, inputs.get("basecolor", ("solid", 160, 160, 160, 255))),
+            ("RGB", size, inputs.get("normal", ("solid", 128, 128, 255))),
+            ("RGBA", size, roughness, metallic, ao, opacity),
+            ("RGB", size, inputs.get("emissive", ("solid", 0, 0, 0))),
         )
 
     @staticmethod

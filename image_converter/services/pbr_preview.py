@@ -29,6 +29,8 @@ PBR_NORMAL_AUTO = "auto"
 PBR_NORMAL_OPENGL = "opengl"
 PBR_NORMAL_DIRECTX = "directx"
 
+PBR_TEXTURE_NAMES = ("basecolor", "normal", "properties", "emissive")
+
 
 @dataclass(slots=True, frozen=True)
 class PbrTextureSource:
@@ -47,7 +49,12 @@ class PbrPreviewSettings:
 
 @dataclass(slots=True, frozen=True)
 class PbrMaterialData:
-    """Images prepared once on the CPU and uploaded once to the GPU."""
+    """CPU material snapshot; images must not be mutated after publication.
+
+    Equal texture keys guarantee equal pixels for the corresponding slot.
+    Producers without revision tracking leave keys unset (full GPU upload).
+    Keys are process-local and must not retain images or graph objects.
+    """
 
     basecolor: Image.Image
     normal: Image.Image
@@ -57,6 +64,7 @@ class PbrMaterialData:
     used_labels: tuple[str, ...]
     workflow_label: str = ""
     normal_status: str = ""
+    texture_keys: tuple[object, object, object, object] | None = None
 
     @property
     def size(self) -> tuple[int, int]:
