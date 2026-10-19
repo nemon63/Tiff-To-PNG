@@ -4,6 +4,8 @@ import json
 import re
 from pathlib import Path
 
+from image_converter.services.atomic_io import write_json_atomic
+
 from image_converter.domain.models import (
     ChannelPackLayout,
     ChannelPackingMode,
@@ -281,7 +283,11 @@ class PresetRepository:
         except (OSError, json.JSONDecodeError):
             return ()
 
+        if not isinstance(raw_data, dict):
+            return ()
         raw_presets = raw_data.get("presets", [])
+        if not isinstance(raw_presets, list):
+            return ()
         presets: list[ConversionPreset] = []
         for raw_preset in raw_presets:
             if not isinstance(raw_preset, dict):
@@ -319,11 +325,7 @@ class PresetRepository:
             ]
         }
 
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_json_atomic(self._path, payload)
 
     def _build_unique_preset_id(self, name: str, existing_ids: set[str]) -> str:
         slug = re.sub(r"[^\w]+", "-", name.lower(), flags=re.UNICODE).strip("-_")

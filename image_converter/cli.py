@@ -180,4 +180,4 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     service = BatchConversionService()
     summary = service.run(request, logger=print)
     print(f"\n{summary.as_text()}")
-    return 0
+    return 1 if summary.failed or summary.packed_failed else 0

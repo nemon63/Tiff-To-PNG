@@ -811,7 +811,16 @@ class GraphWorkspace(QWidget):
         self._last_preview_quality_request = PREVIEW_MODE_FULL
         self._preview_dirty_node_ids.clear()
         self._preview_full_reset_pending = False
-        self._preview_cache.clear()
+        # A canceled worker can still finish an image load. Never let it write
+        # into the next project's cache, even when saved node IDs are identical.
+        previous_cache = self._preview_cache
+        self._preview_cache = NodeGraphPreviewCache(
+            max_side=previous_cache.max_side,
+            fallback_size=previous_cache.fallback_size,
+            max_bytes=previous_cache.max_bytes,
+            max_size_entries=previous_cache.max_size_entries,
+            interactive_preview=previous_cache.interactive_preview,
+        )
         self.pbr_preview_cleared.emit()
 
     @staticmethod

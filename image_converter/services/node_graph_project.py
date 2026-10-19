@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from image_converter.services.atomic_io import write_json_atomic
+
 from image_converter.domain.node_graph import (
     GraphConnection,
     GraphNode,
@@ -27,10 +29,7 @@ class NodeGraphProjectRepository:
             project_path = project_path.with_suffix(GRAPH_PROJECT_EXTENSION)
         project_path.parent.mkdir(parents=True, exist_ok=True)
         payload = self._serialize_project(project, project_path.parent)
-        project_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_json_atomic(project_path, payload)
         return project_path
 
     def load(self, location: Path) -> NodeGraphProject:
@@ -38,6 +37,9 @@ class NodeGraphProjectRepository:
         raw_data = json.loads(project_path.read_text(encoding="utf-8"))
         if not isinstance(raw_data, dict):
             raise ValueError("Invalid graph project file.")
+        version = raw_data.get("version", 1)
+        if version != 1:
+            raise ValueError(f"Unsupported graph project version: {version}. Expected version 1.")
         fallback_name = (
             project_path.parent.name
             if project_path.name == GRAPH_PROJECT_FILENAME
@@ -143,8 +145,10 @@ class NodeGraphProjectRepository:
     def _deserialize_node(self, data: dict[str, Any], bundle_dir: Path) -> GraphNode:
         try:
             node_type = NodeType(str(data.get("type", NodeType.TEXTURE_INPUT.value)))
-        except ValueError:
-            node_type = NodeType.TEXTURE_INPUT
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsupported node type: {data.get('type')!r} (node {data.get('id', '')})."
+            ) from exc
 
         raw_properties = data.get("properties", {})
         if not isinstance(raw_properties, dict):

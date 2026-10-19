@@ -279,6 +279,9 @@ def resize_canvas(
     image: Image.Image,
     output_size: tuple[int, int],
     node: GraphNode,
+    *,
+    natural_input_size: tuple[int, int] | None = None,
+    natural_output_size: tuple[int, int] | None = None,
 ) -> Image.Image:
     source = image.convert("RGBA")
     target_width, target_height = output_size
@@ -287,28 +290,42 @@ def resize_canvas(
     if mode == "stretch":
         return source.resize(output_size, resampling)
 
+    # Layout is defined in document pixels, independently of preview resolution.
+    input_width, input_height = natural_input_size or source.size
+    canvas_width, canvas_height = natural_output_size or output_size
     if mode == "crop":
-        resized = source
+        logical_size = (input_width, input_height)
     else:
-        width_ratio = target_width / source.width
-        height_ratio = target_height / source.height
+        width_ratio = canvas_width / input_width
+        height_ratio = canvas_height / input_height
         scale = max(width_ratio, height_ratio) if mode == "fill" else min(width_ratio, height_ratio)
         if mode == "pad":
             scale = min(1.0, scale)
-        resized_size = (
-            max(1, round(source.width * scale)),
-            max(1, round(source.height * scale)),
+        logical_size = (
+            max(1, round(input_width * scale)),
+            max(1, round(input_height * scale)),
         )
-        resized = source if resized_size == source.size else source.resize(resized_size, resampling)
 
     if mode == "fill":
-        left = max(0, (resized.width - target_width) // 2)
-        top = max(0, (resized.height - target_height) // 2)
-        return resized.crop((left, top, left + target_width, top + target_height))
+        logical_left = -max(0, (logical_size[0] - canvas_width) // 2)
+        logical_top = -max(0, (logical_size[1] - canvas_height) // 2)
+    else:
+        logical_left = (canvas_width - logical_size[0]) // 2
+        logical_top = (canvas_height - logical_size[1]) // 2
+
+    scale_x = target_width / canvas_width
+    scale_y = target_height / canvas_height
+    left = round(logical_left * scale_x)
+    top = round(logical_top * scale_y)
+    resized_size = (
+        max(1, round((logical_left + logical_size[0]) * scale_x) - left),
+        max(1, round((logical_top + logical_size[1]) * scale_y) - top),
+    )
+    resized = source if resized_size == source.size else source.resize(resized_size, resampling)
+    if mode == "fill":
+        return resized.crop((-left, -top, target_width - left, target_height - top))
 
     canvas = Image.new("RGBA", output_size, (0, 0, 0, 0))
-    left = (target_width - resized.width) // 2
-    top = (target_height - resized.height) // 2
     canvas.alpha_composite(resized, (left, top))
     return canvas
 

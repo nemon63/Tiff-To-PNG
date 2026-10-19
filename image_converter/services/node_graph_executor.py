@@ -1750,17 +1750,36 @@ class NodeGraphExecutor:
                     input_connection,
                     cache,
                 ) or target_size
+                enabled = self._node_enabled(source_node)
+                natural_output = (
+                    resize_output_size(natural_input, source_node) if enabled else natural_input
+                )
+                preview_scale = min(
+                    1.0,
+                    max(
+                        target_size[0] / natural_output[0],
+                        target_size[1] / natural_output[1],
+                    ),
+                )
+                working_size = (
+                    max(1, round(natural_input[0] * preview_scale)),
+                    max(1, round(natural_input[1] * preview_scale)),
+                )
                 source = self._evaluate_image_socket(
                     graph,
                     input_connection,
-                    natural_input,
+                    working_size,
                     visiting,
                     cache,
                 ).convert("RGBA")
-                if not self._node_enabled(source_node):
+                if not enabled:
                     image = source.resize(target_size, RESAMPLING_LANCZOS)
                 else:
-                    image = resize_canvas(source, target_size, source_node)
+                    image = resize_canvas(
+                        source, target_size, source_node,
+                        natural_input_size=natural_input,
+                        natural_output_size=natural_output,
+                    )
             elif source_node.node_type is NodeType.SET_ALPHA:
                 image = self._evaluate_required_image_input(
                     graph,

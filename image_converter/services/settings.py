@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from image_converter.domain.models import AppSettings
+from image_converter.services.atomic_io import write_json_atomic
 from image_converter.services.options_codec import (
     deserialize_conversion_options,
     serialize_conversion_options,
@@ -26,17 +27,10 @@ class AppSettingsRepository:
         except (OSError, json.JSONDecodeError):
             return AppSettings()
 
-        return self._deserialize(raw_data)
+        return self._deserialize(raw_data) if isinstance(raw_data, dict) else AppSettings()
 
     def save(self, settings: AppSettings) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
-                json.dumps(self._serialize(settings), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except OSError:
-            return
+        write_json_atomic(self._path, self._serialize(settings))
 
     def _serialize(self, settings: AppSettings) -> dict[str, Any]:
         return {
@@ -63,6 +57,8 @@ class AppSettingsRepository:
     def _deserialize(self, data: dict[str, Any]) -> AppSettings:
         options_data = data.get("options", {})
         window_data = data.get("window", {})
+        if not isinstance(window_data, dict):
+            window_data = {}
         use_saved_layout = self._coerce_int(window_data.get("layout_version"), 0) == LAYOUT_VERSION
 
         workspace_mode = str(data.get("workspace_mode", "batch"))

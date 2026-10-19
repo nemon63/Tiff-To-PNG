@@ -100,7 +100,8 @@ class BatchConversionService:
                 request.options,
             )
         )
-        virtual_delete_state: dict[Path, tuple[bool, Path]] = {}
+        # Keep sources alive until all consumers, including packing, have finished.
+        delete_state: dict[Path, tuple[bool, Path]] = {}
 
         if conversion_sources:
             for source_spec in conversion_sources:
@@ -118,19 +119,17 @@ class BatchConversionService:
                     summary.register(result)
                     if on_item_complete is not None:
                         on_item_complete(result)
-                    if source_spec.source_channel is not None:
-                        previous_success, first_destination = virtual_delete_state.get(
+                    if request.options.delete_source:
+                        previous_success, first_destination = delete_state.get(
                             source,
                             (True, destination),
                         )
                         if self._paths_equal(source, destination):
                             first_destination = destination
-                        virtual_delete_state[source] = (
+                        delete_state[source] = (
                             previous_success and result.is_success,
                             first_destination,
                         )
-                    elif result.is_success and request.options.delete_source:
-                        self._delete_source(source, destination, write_log)
                 except Exception as exc:
                     failed_result = ConversionResult(
                         source=source,
@@ -142,17 +141,12 @@ class BatchConversionService:
                     summary.register(failed_result)
                     if on_item_complete is not None:
                         on_item_complete(failed_result)
-                    if source_spec.source_channel is not None:
-                        _previous_success, first_destination = virtual_delete_state.get(
+                    if request.options.delete_source:
+                        _previous_success, first_destination = delete_state.get(
                             source,
                             (True, destination),
                         )
-                        virtual_delete_state[source] = (False, first_destination)
-
-            if request.options.delete_source:
-                for source, (all_succeeded, destination) in virtual_delete_state.items():
-                    if all_succeeded:
-                        self._delete_source(source, destination, write_log)
+                        delete_state[source] = (False, first_destination)
         elif source_specs:
             write_log("---- Source Conversion ----")
             if request.options.packing.enabled and request.options.packing.mode is ChannelPackingMode.PACK_ONLY:
@@ -160,6 +154,7 @@ class BatchConversionService:
             else:
                 write_log("Skipped regular PNG export. Nothing outside the packed channels needs export.")
 
+        packing_succeeded = not request.options.packing.enabled
         if request.options.packing.enabled:
             pack_jobs = build_channel_pack_jobs(source_specs, request.output_root, request.options)
             layout = request.options.packing.layout.label
@@ -191,6 +186,16 @@ class BatchConversionService:
             write_log(
                 f"Packing итоги: создано={pack_created}, пропущено={pack_skipped}, ошибок={pack_failed}"
             )
+            # An existing/skipped output is not proof that it matches these sources.
+            packing_succeeded = bool(pack_jobs) and pack_failed == 0 and pack_skipped == 0
+
+        if request.options.delete_source:
+            if packing_succeeded:
+                for source, (all_succeeded, destination) in delete_state.items():
+                    if all_succeeded:
+                        self._delete_source(source, destination, write_log)
+            elif delete_state:
+                write_log("Source deletion skipped: packing did not complete successfully.")
 
         return summary
 
