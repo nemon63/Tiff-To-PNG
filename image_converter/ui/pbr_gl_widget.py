@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from time import perf_counter
 
-from PyQt6.QtCore import QPointF, Qt, pyqtSignal
+from PyQt6.QtCore import QPointF, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QMouseEvent, QSurfaceFormat, QWheelEvent
 from PyQt6.QtOpenGL import (
     QOpenGLBuffer,
@@ -28,6 +30,7 @@ from image_converter.services.pbr_preview import (
     PbrMaterialData,
 )
 from image_converter.ui.common import _qimage_from_pil
+from image_converter.ui.pbr_timing import GpuDrawTimer, PbrPreviewTiming, supports_gpu_timer
 
 
 _VERTEX_SHADER = """
@@ -225,6 +228,7 @@ void main()
 
 class PbrOpenGLWidget(QOpenGLWidget):
     initialization_failed = pyqtSignal(str)
+    timing_ready = pyqtSignal(object)
 
     _OBJECT_DRAG_SENSITIVITY = 0.25
     _LIGHT_DRAG_SENSITIVITY = 0.35
@@ -270,6 +274,19 @@ class PbrOpenGLWidget(QOpenGLWidget):
         self._drag_position: QPointF | None = None
         self._drag_mode: str | None = None
         self._initialization_error = ""
+        self._timing_enabled = False
+        self._material_serial = 0
+        self._draw_serial = 0
+        self._timing_draw_token = None
+        self._last_timing_sample = float("-inf")
+        self._timing: PbrPreviewTiming | None = None
+        self._gpu_timer = GpuDrawTimer()
+        self._gpu_poll_timer = QTimer(self)
+        self._gpu_poll_timer.setInterval(16)
+        self._gpu_poll_timer.timeout.connect(self._poll_gpu_timing)
+        self._timing_sample_timer = QTimer(self)
+        self._timing_sample_timer.setSingleShot(True)
+        self._timing_sample_timer.timeout.connect(self.update)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     @property
@@ -289,8 +306,66 @@ class PbrOpenGLWidget(QOpenGLWidget):
         return self._zoom
 
     def set_material(self, material: PbrMaterialData | None) -> None:
+        if material is not self._material:
+            self._reset_timing(material)
         self._material = material
         self.update()
+
+    def set_timing_enabled(self, enabled: bool) -> None:
+        self._timing_enabled = bool(enabled)
+        self._last_timing_sample = float("-inf")
+        self._gpu_poll_timer.stop()
+        if self.isValid():
+            self.makeCurrent()
+            self._gpu_timer.release()
+            self._gpu_timer.supported = supports_gpu_timer(self.context())
+            self.doneCurrent()
+        self._reset_timing(self._material)
+        self.update()
+
+    def _reset_timing(self, material: PbrMaterialData | None) -> None:
+        self._material_serial += 1
+        self._timing_draw_token = None
+        self._timing_sample_timer.stop()
+        self._timing = (
+            PbrPreviewTiming(self._material_serial, material.size)
+            if self._timing_enabled and material is not None else None
+        )
+        if material is None:
+            self._gpu_poll_timer.stop()
+        self.timing_ready.emit(self._timing)
+
+    def _collect_gpu_timing(self) -> None:
+        was_pending = self._gpu_timer.pending
+        result = self._gpu_timer.poll()
+        if self._timing is not None:
+            if result is not None and result[0] == self._timing_draw_token:
+                self._timing = replace(self._timing, draw_gpu_ms=result[1], gpu_status=self._gpu_timer.status)
+                self.timing_ready.emit(self._timing)
+            elif not self._gpu_timer.pending and self._timing.gpu_status == "GPU result pending":
+                self._timing = replace(self._timing, gpu_status=self._gpu_timer.status)
+                self.timing_ready.emit(self._timing)
+        if not self._gpu_timer.pending:
+            self._gpu_poll_timer.stop()
+            # A previous scene's query may have occupied the single query slot.
+            # Sample this scene once; never run a permanent preview repaint loop.
+            if was_pending and self._timing is not None and self._timing.draw_cpu_ms is None:
+                self.update()
+
+    def _poll_gpu_timing(self) -> None:
+        if not self._timing_enabled or not self.isValid() or not self.isVisible():
+            self._gpu_poll_timer.stop()
+            return
+        self.makeCurrent()
+        try:
+            self._collect_gpu_timing()
+        finally:
+            self.doneCurrent()
+
+    def hideEvent(self, event) -> None:
+        self._gpu_poll_timer.stop()
+        self._timing_sample_timer.stop()
+        super().hideEvent(event)
 
     def set_geometry(self, geometry: str) -> None:
         self._geometry = geometry
@@ -351,6 +426,7 @@ class PbrOpenGLWidget(QOpenGLWidget):
             self._functions = QOpenGLFunctions_2_0()
             if not self._functions.initializeOpenGLFunctions():
                 raise RuntimeError("OpenGL 2.0 functions are unavailable.")
+            self._gpu_timer.supported = supports_gpu_timer(self.context())
 
             program = QOpenGLShaderProgram(self)
             if not program.addShaderFromSourceCode(
@@ -406,11 +482,33 @@ class PbrOpenGLWidget(QOpenGLWidget):
         self._functions.glClear(0x00004000)
         if self._program is None or self._vertex_buffer is None:
             return
+        if self._timing_enabled:
+            self._collect_gpu_timing()
         if self._material is not self._uploaded_material:
-            self._upload_material()
+            started = perf_counter() if self._timing_enabled else 0.0
+            uploaded_maps = self._upload_material()
+            if self._timing is not None:
+                self._timing = replace(
+                    self._timing, upload_cpu_ms=(perf_counter() - started) * 1000,
+                    uploaded_maps=uploaded_maps,
+                )
+                self.timing_ready.emit(self._timing)
         if not self._textures:
             return
 
+        sample = (
+            self._timing_enabled and not self._gpu_timer.pending
+            and perf_counter() - self._last_timing_sample >= 0.1
+        )
+        if (
+            not sample and self._timing is not None and self._timing.draw_cpu_ms is None
+            and not self._gpu_timer.pending and not self._timing_sample_timer.isActive()
+        ):
+            # A newly published material must respect the same sampling budget.
+            # Schedule its final sample once even if editing stops before 100 ms.
+            delay_ms = math.ceil((0.1 - (perf_counter() - self._last_timing_sample)) * 1000)
+            self._timing_sample_timer.start(max(1, delay_ms))
+        draw_started = perf_counter() if sample else 0.0
         program = self._program
         program.bind()
         for unit, texture in enumerate(self._textures):
@@ -436,12 +534,33 @@ class PbrOpenGLWidget(QOpenGLWidget):
         self._vertex_buffer.bind()
         program.enableAttributeArray(0)
         program.setAttributeBuffer(0, 0x1406, 0, 2, 0)
-        self._functions.glDrawArrays(0x0004, 0, 6)
+        gpu_sample = False
+        if sample:
+            self._draw_serial += 1
+            self._timing_draw_token = (self._material_serial, self._draw_serial)
+            gpu_sample = self._gpu_timer.begin(self._timing_draw_token)
+        try:
+            self._functions.glDrawArrays(0x0004, 0, 6)
+        finally:
+            if gpu_sample:
+                self._gpu_timer.end()
         program.disableAttributeArray(0)
         self._vertex_buffer.release()
         for texture in self._textures:
             texture.release()
         program.release()
+        if sample and self._timing is not None:
+            self._last_timing_sample = perf_counter()
+            ratio = self.devicePixelRatioF()
+            self._timing = replace(
+                self._timing, draw_cpu_ms=(self._last_timing_sample - draw_started) * 1000,
+                draw_gpu_ms=None,
+                viewport_size=(round(self.width() * ratio), round(self.height() * ratio)),
+                gpu_status=self._gpu_timer.status,
+            )
+            self.timing_ready.emit(self._timing)
+        if self._timing_enabled and self._gpu_timer.pending:
+            self._gpu_poll_timer.start()
 
     def _uses_directx_normal(self) -> bool:
         if self._normal_convention == PBR_NORMAL_DIRECTX:
@@ -530,12 +649,12 @@ class PbrOpenGLWidget(QOpenGLWidget):
             return
         super().wheelEvent(event)
 
-    def _upload_material(self) -> None:
+    def _upload_material(self) -> tuple[str, ...]:
         material = self._material
         if material is None:
             self._destroy_textures()
             self._uploaded_material = None
-            return
+            return ()
 
         images = tuple(getattr(material, name) for name in PBR_TEXTURE_NAMES)
         revisions = material.texture_keys or (object(), object(), object(), object())
@@ -564,6 +683,7 @@ class PbrOpenGLWidget(QOpenGLWidget):
                 self._textures.append(texture)
         self._uploaded_texture_keys = keys
         self._uploaded_material = material
+        return tuple(PBR_TEXTURE_NAMES[index] for index in replacements)
 
     @staticmethod
     def _create_texture(image) -> QOpenGLTexture:
@@ -591,11 +711,15 @@ class PbrOpenGLWidget(QOpenGLWidget):
         self._uploaded_texture_keys = ()
 
     def cleanup(self) -> None:
+        self._gpu_poll_timer.stop()
+        self._timing_sample_timer.stop()
         if not self.isValid():
             return
         self.makeCurrent()
+        self._gpu_timer.release()
         self._destroy_textures()
         if self._vertex_buffer is not None:
             self._vertex_buffer.destroy()
         self._uploaded_material = None
         self.doneCurrent()
+        self._reset_timing(self._material)

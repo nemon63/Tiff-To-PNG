@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QShowEvent
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -35,6 +35,7 @@ from image_converter.services.pbr_preview import (
     pbr_sources_from_items,
 )
 from image_converter.ui.pbr_gl_widget import PbrOpenGLWidget
+from image_converter.ui.pbr_timing import PbrPreviewTiming
 
 
 class PbrPreviewPanel(QWidget):
@@ -47,6 +48,11 @@ class PbrPreviewPanel(QWidget):
         self._source_revision: tuple[tuple[str, int, int], ...] = ()
         self._generation = 0
         self._material: PbrMaterialData | None = None
+        self._latest_timing: PbrPreviewTiming | None = None
+        self._timing_ui_timer = QTimer(self)
+        self._timing_ui_timer.setSingleShot(True)
+        self._timing_ui_timer.setInterval(100)
+        self._timing_ui_timer.timeout.connect(self._refresh_timing_label)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -60,6 +66,11 @@ class PbrPreviewPanel(QWidget):
         title.setObjectName("PanelTitle")
         header.addWidget(title)
         header.addStretch(1)
+        self.timings_button = QPushButton("Timings")
+        self.timings_button.setCheckable(True)
+        self.timings_button.setToolTip("Show CPU upload cost and asynchronous GPU draw timing.")
+        self.timings_button.toggled.connect(self._set_timing_visible)
+        header.addWidget(self.timings_button)
         self.refresh_button = QPushButton("Reload Maps")
         self.refresh_button.clicked.connect(self._request_material_load)
         header.addWidget(self.refresh_button)
@@ -105,6 +116,7 @@ class PbrPreviewPanel(QWidget):
             "ЛКМ: вращение. СКМ: перемещение. Ctrl+ЛКМ: свет. Колесо: масштаб."
         )
         self.gl_preview.initialization_failed.connect(self._on_gl_failed)
+        self.gl_preview.timing_ready.connect(self._on_timing_ready)
 
         self.normal_check_label = QLabel("")
         self.normal_check_label.setObjectName("PreviewFileName")
@@ -120,6 +132,13 @@ class PbrPreviewPanel(QWidget):
         navigation_hint.setObjectName("SummaryText")
         layout.addWidget(navigation_hint)
 
+        self.timing_label = QLabel("No material timing yet.")
+        self.timing_label.setObjectName("SummaryText")
+        self.timing_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.timing_label.setWordWrap(True)
+        self.timing_label.hide()
+        layout.addWidget(self.timing_label)
+
         self.set_label = QLabel("Выберите Texture Set в очереди.")
         self.set_label.setObjectName("PreviewFileName")
         self.set_label.setWordWrap(True)
@@ -132,6 +151,53 @@ class PbrPreviewPanel(QWidget):
         self.meta_label.setWordWrap(True)
         layout.addWidget(self.meta_label)
         self._apply_gpu_settings()
+
+    def _set_timing_visible(self, enabled: bool) -> None:
+        self.timing_label.setVisible(enabled)
+        self._timing_ui_timer.stop()
+        self._latest_timing = None
+        self.gl_preview.set_timing_enabled(enabled)
+
+    def _on_timing_ready(self, timing: object) -> None:
+        if not self.timings_button.isChecked():
+            return
+        if timing is None:
+            self._latest_timing = None
+            self._timing_ui_timer.stop()
+            self.timing_label.setText("No material timing yet.")
+            self.timing_label.setToolTip("")
+        elif (
+            isinstance(timing, PbrPreviewTiming)
+            and timing.material_serial == self.gl_preview._material_serial
+        ):
+            self._latest_timing = timing
+            if self.isVisible() and not self._timing_ui_timer.isActive():
+                self._timing_ui_timer.start()
+
+    def _refresh_timing_label(self) -> None:
+        timing = self._latest_timing
+        if not self.timings_button.isChecked() or timing is None or not self.isVisible():
+            return
+        upload = "—" if timing.upload_cpu_ms is None else f"{timing.upload_cpu_ms:.2f} ms"
+        draw_cpu = "—" if timing.draw_cpu_ms is None else f"{timing.draw_cpu_ms:.2f} ms"
+        draw_gpu = (
+            f"{timing.draw_gpu_ms:.2f} ms" if timing.draw_gpu_ms is not None
+            else "pending" if timing.gpu_status == "GPU result pending" else "n/a"
+        )
+        maps = "not measured" if timing.upload_cpu_ms is None else f"{len(timing.uploaded_maps)}/4 maps"
+        self.timing_label.setText(
+            f"Upload CPU: {upload} · {maps}\n"
+            f"Draw: CPU {draw_cpu} · GPU {draw_gpu}"
+        )
+        self.timing_label.setToolTip(
+            "Upload CPU: last material update, including PIL → QImage, GL calls and mipmaps. "
+            "This is CPU wall time, not GPU execution time.\n"
+            f"Updated maps: {', '.join(timing.uploaded_maps) or 'none'}.\n"
+            "Draw: last sampled CPU submission and GPU draw call; no Qt composition, swap or VSync. "
+            "These timings overlap; do not add them or interpret them as FPS.\n"
+            f"Texture: {timing.texture_size}; viewport: {timing.viewport_size}.\n"
+            f"{timing.gpu_status}. GPU results are polled without waiting."
+        )
 
     def set_texture_set(self, items: tuple[QueueItem, ...] | list[QueueItem]) -> None:
         sources = pbr_sources_from_items(tuple(items))
@@ -301,6 +367,7 @@ class PbrPreviewPanel(QWidget):
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
+        self._refresh_timing_label()
         if self._sources and self._material is None:
             self._request_material_load()
 

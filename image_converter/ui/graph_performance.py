@@ -49,7 +49,7 @@ class GraphPerformancePanel(QWidget):
         explanation = QLabel(
             "Self: this node only. Branch: includes upstream work; do not add branch times.\n"
             "Cache H/M: image-cache hits/misses. Double-click a row to select its node.\n"
-            "CPU wall time includes loading and copies. GPU upload/draw is not measured."
+            "CPU wall time includes loading and copies. PBR upload/draw: enable Timings in PBR Preview."
         )
         explanation.setObjectName("SummaryText")
         explanation.setWordWrap(True)
