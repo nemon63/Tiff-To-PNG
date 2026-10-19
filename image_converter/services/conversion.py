@@ -28,6 +28,10 @@ from image_converter.services.packing import (
     summarize_channel_pack_jobs,
 )
 from image_converter.services.pipeline import ConversionPipeline
+from image_converter.services.atomic_io import save_png_atomic
+from image_converter.services.output_safety import (
+    PlannedImageWrite, path_identity_keys, validate_batch_output_paths,
+)
 
 Logger = Callable[[str], None]
 
@@ -62,10 +66,8 @@ class ImageConverter:
             processed = self._pipeline.process(working_image, options)
             output_image = processed.copy()
 
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        output_image.save(
-            destination,
-            format="PNG",
+        saved = save_png_atomic(
+            output_image, destination, overwrite=options.overwrite,
             optimize=options.optimize,
             compress_level=options.compress_level,
         )
@@ -73,8 +75,8 @@ class ImageConverter:
         return ConversionResult(
             source=source.path,
             destination=destination,
-            status=ConversionStatus.SUCCESS,
-            message=f"успех: {destination.name}",
+            status=ConversionStatus.SUCCESS if saved else ConversionStatus.SKIPPED,
+            message=f"успех: {destination.name}" if saved else f"пропуск (уже есть): {destination.name}",
         )
 
 class BatchConversionService:
@@ -100,21 +102,44 @@ class BatchConversionService:
                 request.options,
             )
         )
+        conversions = [
+            (source, self.build_destination_for_source(source, request.output_root, request.options))
+            for source in conversion_sources
+        ]
+        pack_jobs = (
+            build_channel_pack_jobs(source_specs, request.output_root, request.options)
+            if request.options.packing.enabled else ()
+        )
+        writes = [
+            PlannedImageWrite(destination, (source.path,), f"{source.path} [{source.source_channel or 'image'}]")
+            for source, destination in conversions
+        ] + [
+            PlannedImageWrite(
+                job.output_path, tuple(channel.source.path for channel in job.channel_sources if channel.source),
+                f"PACK {job.layout.label} {job.group_name}",
+            ) for job in pack_jobs
+        ]
+        validate_batch_output_paths(
+            [source.path for source in source_specs], writes, overwrite=request.options.overwrite,
+        )
+        # Capture identities before atomic replacements can change file IDs.
+        source_keys = {source.path: path_identity_keys(source.path) for source in source_specs}
+        destination_keys = {write.destination: path_identity_keys(write.destination) for write in writes}
+        unsuccessful_inputs: set[tuple] = set()
         # Keep sources alive until all consumers, including packing, have finished.
         delete_state: dict[Path, tuple[bool, Path]] = {}
 
         if conversion_sources:
-            for source_spec in conversion_sources:
+            for source_spec, destination in conversions:
                 source = source_spec.path
-                destination = self.build_destination_for_source(
-                    source_spec,
-                    request.output_root,
-                    request.options,
-                )
                 try:
                     if on_item_start is not None:
                         on_item_start(source)
+                    if destination_keys[destination] & unsuccessful_inputs:
+                        raise RuntimeError("Input preserved: an earlier consumer failed or was skipped.")
                     result = self._converter.convert_source(source_spec, destination, request.options)
+                    if not result.is_success:
+                        unsuccessful_inputs.update(source_keys[source])
                     write_log(f"{source.name} -> {result.message}")
                     summary.register(result)
                     if on_item_complete is not None:
@@ -131,6 +156,7 @@ class BatchConversionService:
                             first_destination,
                         )
                 except Exception as exc:
+                    unsuccessful_inputs.update(source_keys[source])
                     failed_result = ConversionResult(
                         source=source,
                         destination=destination,
@@ -156,7 +182,6 @@ class BatchConversionService:
 
         packing_succeeded = not request.options.packing.enabled
         if request.options.packing.enabled:
-            pack_jobs = build_channel_pack_jobs(source_specs, request.output_root, request.options)
             layout = request.options.packing.layout.label
             write_log(f"---- Channel Packing {layout} ----")
             write_log(summarize_channel_pack_jobs(pack_jobs))
@@ -166,15 +191,23 @@ class BatchConversionService:
             pack_failed = 0
 
             for job in pack_jobs:
+                job_input_keys = set().union(*(
+                    source_keys[channel.source.path] for channel in job.channel_sources if channel.source
+                ))
                 try:
+                    if destination_keys[job.output_path] & unsuccessful_inputs:
+                        raise RuntimeError("Input preserved: an earlier consumer failed or was skipped.")
                     pack_result = execute_channel_pack_job(job, request.options)
                 except Exception as exc:
+                    unsuccessful_inputs.update(job_input_keys)
                     write_log(f"PACK {job.layout.label} {job.group_name} -> ОШИБКА: {exc}")
                     pack_failed += 1
                     summary.register_packed(ConversionStatus.FAILED)
                     continue
 
                 write_log(f"PACK {job.layout.label} {job.group_name} -> {pack_result.message}")
+                if pack_result.status is not ConversionStatus.SUCCESS:
+                    unsuccessful_inputs.update(job_input_keys)
                 if pack_result.status is ConversionStatus.SUCCESS:
                     pack_created += 1
                 elif pack_result.status is ConversionStatus.SKIPPED:

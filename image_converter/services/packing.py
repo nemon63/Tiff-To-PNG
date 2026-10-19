@@ -14,6 +14,7 @@ from image_converter.domain.models import (
     TextureMapType,
 )
 from image_converter.services.image_loading import copy_first_frame_preserving_alpha
+from image_converter.services.atomic_io import save_png_atomic
 from image_converter.services.map_types import known_map_aliases, strip_channel_pack_suffix
 from image_converter.services.naming import apply_naming_rules
 from image_converter.services.pipeline import RESAMPLING_LANCZOS, ResizeProcessor
@@ -399,17 +400,16 @@ def execute_channel_pack_job(job: ChannelPackJob, options: ConversionOptions) ->
         )
 
     merged = Image.merge("RGBA" if len(channels) == 4 else "RGB", tuple(channels))
-    job.output_path.parent.mkdir(parents=True, exist_ok=True)
-    merged.save(
-        job.output_path,
-        format="PNG",
+    saved = save_png_atomic(
+        merged, job.output_path, overwrite=options.overwrite,
         optimize=options.optimize,
         compress_level=options.compress_level,
     )
     return ChannelPackResult(
         job=job,
-        status=ConversionStatus.SUCCESS,
-        message=f"packed {job.layout.label}: {job.output_path.name}",
+        status=ConversionStatus.SUCCESS if saved else ConversionStatus.SKIPPED,
+        message=(f"packed {job.layout.label}: {job.output_path.name}" if saved
+                 else f"пропуск (уже есть): {job.output_path.name}"),
     )
 
 

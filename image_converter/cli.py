@@ -178,6 +178,10 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         return 2
 
     service = BatchConversionService()
-    summary = service.run(request, logger=print)
+    try:
+        summary = service.run(request, logger=print)
+    except ValidationError as exc:
+        print(exc)
+        return 1
     print(f"\n{summary.as_text()}")
     return 1 if summary.failed or summary.packed_failed else 0

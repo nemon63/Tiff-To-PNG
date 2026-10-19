@@ -78,6 +78,7 @@ from image_converter.ui.graph_commands import (
     clone_graph_connection,
     clone_graph_node,
 )
+from image_converter.services.graph_layout import NodeLayoutGeometry, connected_graph_layout
 from image_converter.ui.graph_canvas import (
     ConnectionItem,
     FLAG_GAP,
@@ -132,7 +133,7 @@ from image_converter.application.path_search import (
     MissingTextureSearchRequest,
 )
 
-GRAPH_LAYOUT_X_SPACING = 300
+GRAPH_LAYOUT_X_GAP = 100
 GRAPH_LAYOUT_Y_SPACING = 36
 GRAPH_LAYOUT_GRID = 20
 
@@ -489,6 +490,7 @@ class GraphWorkspace(QWidget):
         self.fit_button.clicked.connect(lambda: self.view.fit_graph())
         tools_row.addWidget(self.fit_button)
         self.layout_button = QPushButton("Layout")
+        self.layout_button.setToolTip("Arrange connected branches left to right, using socket order. Undo is supported.")
         self.layout_button.clicked.connect(self.auto_layout_nodes)
         tools_row.addWidget(self.layout_button)
         tools_row.addWidget(QLabel("Preview"))
@@ -1087,100 +1089,44 @@ class GraphWorkspace(QWidget):
         self.status_message.emit(f"Auto layout: arranged {len(nodes)} node(s).")
 
     def _auto_layout_positions(self, nodes: list[GraphNode]) -> dict[str, tuple[float, float]]:
-        node_ids = {node.node_id for node in nodes}
-        depth_by_id = self._layout_depth_by_node(nodes)
-        columns: dict[int, list[GraphNode]] = {}
+        geometry = {}
         for node in nodes:
-            columns.setdefault(depth_by_id.get(node.node_id, 0), []).append(node)
-
-        depths = sorted(columns)
-        center = self.view.mapToScene(self.view.viewport().rect().center())
-        total_width = max(0, (len(depths) - 1) * GRAPH_LAYOUT_X_SPACING)
-        left = center.x() - total_width / 2
-        positions: dict[str, tuple[float, float]] = {}
-
-        for column_index, depth in enumerate(depths):
-            column_nodes = sorted(
-                columns[depth],
-                key=lambda item: (self._layout_type_rank(item.node_type), item.position[1], item.title),
-            )
-            heights = [self._estimated_node_height(node) for node in column_nodes]
-            total_height = sum(heights) + max(0, len(heights) - 1) * GRAPH_LAYOUT_Y_SPACING
-            x = self._snap_to_layout_grid(left + column_index * GRAPH_LAYOUT_X_SPACING)
-            y = self._snap_to_layout_grid(center.y() - total_height / 2)
-            for node, height in zip(column_nodes, heights, strict=True):
-                if node.node_id in node_ids:
-                    positions[node.node_id] = (x, y)
-                y = self._snap_to_layout_grid(y + height + GRAPH_LAYOUT_Y_SPACING)
-        return positions
-
-    def _layout_depth_by_node(self, nodes: list[GraphNode]) -> dict[str, int]:
-        node_by_id = {node.node_id: node for node in nodes}
-        depth_by_id = {
-            node.node_id: self._layout_type_rank(node.node_type)
-            for node in nodes
-        }
-        incoming_count = {node.node_id: 0 for node in nodes}
-        outgoing: dict[str, list[str]] = {node.node_id: [] for node in nodes}
-        for connection in self.project.graph.connections:
-            if connection.source_node_id not in node_by_id or connection.target_node_id not in node_by_id:
-                continue
-            outgoing[connection.source_node_id].append(connection.target_node_id)
-            incoming_count[connection.target_node_id] += 1
-
-        queue = sorted(
-            (node_id for node_id, count in incoming_count.items() if count == 0),
-            key=lambda node_id: (
-                depth_by_id.get(node_id, 0),
-                node_by_id[node_id].position[0],
-                node_by_id[node_id].position[1],
-            ),
-        )
-        while queue:
-            node_id = queue.pop(0)
-            for target_id in outgoing[node_id]:
-                depth_by_id[target_id] = max(depth_by_id[target_id], depth_by_id[node_id] + 1)
-                incoming_count[target_id] -= 1
-                if incoming_count[target_id] == 0:
-                    queue.append(target_id)
-                    queue.sort(
-                        key=lambda item: (
-                            depth_by_id.get(item, 0),
-                            node_by_id[item].position[0],
-                            node_by_id[item].position[1],
+            item = self._scene.node_items.get(node.node_id)
+            if item is not None:
+                geometry[node.node_id] = NodeLayoutGeometry(
+                    item.rect().width(), item.rect().height(),
+                    {socket_id: port.pos().y() for socket_id, port in item.port_items.items()},
+                )
+            else:
+                is_texture = node.node_type is NodeType.TEXTURE_INPUT
+                socket_y = {}
+                for direction in SocketDirection:
+                    sockets = [s for s in socket_definitions(node.node_type) if s.direction is direction]
+                    for index, socket in enumerate(sockets):
+                        socket_y[socket.socket_id] = (
+                            TEXTURE_PORT_CENTER_Y + index * TEXTURE_PORT_SPACING if is_texture
+                            else TITLE_HEIGHT + 40 + index * ROW_HEIGHT
                         )
-                    )
-        return depth_by_id
-
-    @staticmethod
-    def _layout_type_rank(node_type: NodeType) -> int:
-        if node_type in (NodeType.TEXTURE_INPUT, NodeType.COLOR, NodeType.CONSTANT_CHANNEL):
-            return 0
-        if node_type in (
-            NodeType.INVERT_CHANNEL,
-            NodeType.LEVELS_CHANNEL,
-            NodeType.REMAP_CHANNEL,
-            NodeType.CLAMP_CHANNEL,
-            NodeType.THRESHOLD_CHANNEL,
-            NodeType.BLUR_CHANNEL,
-            NodeType.DILATE_CHANNEL,
-            NodeType.ERODE_CHANNEL,
-            NodeType.BLEND_CHANNEL,
-            NodeType.LUMINANCE,
-            NodeType.MIX_IMAGE,
-            NodeType.BLEND_IMAGE,
-            NodeType.NORMAL_MAP,
-            NodeType.HEIGHT_TO_NORMAL,
-            NodeType.NORMAL_BLEND,
-            NodeType.COLOR_ADJUST,
-            NodeType.TRANSFORM_2D,
-            NodeType.RESIZE_CANVAS,
-            NodeType.SPLIT_RGBA,
-            NodeType.COMBINE_RGBA,
-            NodeType.SET_ALPHA,
-        ):
-            return 1
-        return 2
+                geometry[node.node_id] = NodeLayoutGeometry(
+                    TEXTURE_NODE_WIDTH if is_texture else NODE_WIDTH,
+                    self._estimated_node_height(node), socket_y,
+                )
+        positions = connected_graph_layout(
+            nodes, self.project.graph.connections, geometry,
+            horizontal_gap=GRAPH_LAYOUT_X_GAP, vertical_gap=GRAPH_LAYOUT_Y_SPACING,
+            grid=GRAPH_LAYOUT_GRID,
+        )
+        if not positions:
+            return {}
+        # Preserve the graph's center, not the viewport center altered by Fit.
+        # Repeating Layout consequently does not shift nodes or add undo entries.
+        offsets = []
+        for axis in (0, 1):
+            sizes = {n.node_id: geometry[n.node_id].width if axis == 0 else geometry[n.node_id].height for n in nodes}
+            before_center = (min(n.position[axis] for n in nodes) + max(n.position[axis] + sizes[n.node_id] for n in nodes)) / 2
+            after_center = (min(p[axis] for p in positions.values()) + max(p[axis] + sizes[n] for n, p in positions.items())) / 2
+            offsets.append(self._snap_to_layout_grid(before_center - after_center))
+        return {node_id: (x + offsets[0], y + offsets[1]) for node_id, (x, y) in positions.items()}
 
     @staticmethod
     def _estimated_node_height(node: GraphNode) -> float:
@@ -1188,7 +1134,7 @@ class GraphWorkspace(QWidget):
         input_count = sum(1 for socket in sockets if socket.direction is SocketDirection.INPUT)
         output_count = sum(1 for socket in sockets if socket.direction is SocketDirection.OUTPUT)
         row_count = max(input_count, output_count, 2)
-        body_height = row_count * ROW_HEIGHT + 16
+        body_height = row_count * ROW_HEIGHT + 40
         if node.node_type is NodeType.TEXTURE_INPUT:
             body_height = TEXTURE_BODY_HEIGHT
         return float(TITLE_HEIGHT + body_height)
