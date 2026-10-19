@@ -59,7 +59,7 @@ class MaterialRevisionTests(unittest.TestCase):
         first, second = self.render(), self.render()
         self.assertEqual(set(), _changed_slots(first, second))
         for name in PBR_TEXTURE_NAMES:
-            self.assertIsNot(getattr(first, name), getattr(second, name))
+            self.assertIs(getattr(first, name), getattr(second, name))
             self.assertEqual(getattr(first, name).tobytes(), getattr(second, name).tobytes())
 
     def test_each_branch_changes_only_its_material_slot(self):

@@ -260,6 +260,15 @@ class GraphExportSummary:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _PbrMapCacheKey:
+    # Checked by recipe, not invalidated by node ID. Only the latest recipe per
+    # shader/slot/size is retained, within the shared image LRU budget.
+    shader_node_id: str
+    slot: str
+    size: tuple[int, int]
+
+
 class NodeGraphPreviewCache:
     DEFAULT_MAX_BYTES = 256 * 1024 * 1024
     DEFAULT_MAX_SIZE_ENTRIES = 2048
@@ -287,11 +296,13 @@ class NodeGraphPreviewCache:
     def _image_bytes(image: Image.Image) -> int:
         return image.width * image.height * max(1, len(image.getbands()))
 
-    def get_image(self, bucket: str, key: object) -> Image.Image | None:
+    def get_image(
+        self, bucket: str, key: object, *, revision: object | None = None,
+    ) -> Image.Image | None:
         cache_key = (bucket, key)
         with self.lock:
             entry = self._images.get(cache_key)
-            if entry is None:
+            if entry is None or (revision is not None and entry[2] != revision):
                 return None
             self._images.move_to_end(cache_key)
             return entry[0]
@@ -300,13 +311,16 @@ class NodeGraphPreviewCache:
         """Return a bounded, image-free identity for this cached computation.
 
         Missing/evicted entries get a fresh token: extra upload is safe, false
-        reuse is not. Tokens change on every write and never alias across scenes.
+        reuse is not. Socket tokens change on every write and never alias across
+        scenes. Prepared PBR maps instead carry their explicit recipe revision.
         """
         with self.lock:
             entry = self._images.get((bucket, key))
             return entry[2] if entry is not None else object()
 
-    def put_image(self, bucket: str, key: object, image: Image.Image) -> None:
+    def put_image(
+        self, bucket: str, key: object, image: Image.Image, *, revision: object | None = None,
+    ) -> None:
         size = self._image_bytes(image)
         cache_key = (bucket, key)
         if size > self.max_bytes:
@@ -320,9 +334,17 @@ class NodeGraphPreviewCache:
             if previous is not None:
                 self.current_bytes -= previous[1]
             while self._images and self.current_bytes + size > self.max_bytes:
-                _old_key, (_old_image, old_size, _revision) = self._images.popitem(last=False)
+                # Prepared maps are optional acceleration data. Never let them
+                # displace upstream computations and force repeated graph/GPU
+                # rebuilds when a high-resolution working set fills the cache.
+                old_key = next((key for key in self._images if key[0] == "pbr-map"), None)
+                if old_key is None:
+                    if bucket == "pbr-map":
+                        return
+                    old_key = next(iter(self._images))
+                _old_image, old_size, _revision = self._images.pop(old_key)
                 self.current_bytes -= old_size
-            self._images[cache_key] = (image, size, object())
+            self._images[cache_key] = (image, size, revision if revision is not None else object())
             self.current_bytes += size
 
     def get_texture_size(self, node_id: str) -> tuple[int, int] | None | object:
@@ -630,6 +652,7 @@ class NodeGraphExecutor:
                 target_size,
                 set(),
                 cache,
+                copy_result=False,
             )
             record_input_key(socket_id, "image", connection)
             return image
@@ -645,9 +668,10 @@ class NodeGraphExecutor:
                 target_size,
                 set(),
                 cache,
+                copy_result=False,
             )
             record_input_key(socket_id, "channel", connection)
-            return channel.convert("L")
+            return channel if channel.mode == "L" else channel.convert("L")
 
         try:
             workflow = PbrWorkflow(
@@ -665,56 +689,70 @@ class NodeGraphExecutor:
                 "Packed / Mask подключён, но Traditional workflow не задаёт схему каналов"
             )
 
-        roughness: Image.Image | None = None
-        metallic: Image.Image | None = None
-        ao: Image.Image | None = None
-        if packed is not None:
-            red, green, blue, alpha = packed.convert("RGBA").split()
-            if workflow is PbrWorkflow.UNITY_URP:
-                metallic, roughness = red, ImageOps.invert(alpha)
-            elif workflow is PbrWorkflow.UNITY_HDRP:
-                metallic, ao, roughness = red, green, ImageOps.invert(alpha)
-            elif workflow is PbrWorkflow.UNREAL_ORM:
-                ao, roughness, metallic = red, green, blue
-            elif workflow is PbrWorkflow.UNREAL_MRA:
-                metallic, roughness, ao = red, green, blue
-            elif workflow is PbrWorkflow.UNREAL_RMA:
-                roughness, metallic, ao = red, green, blue
-
         explicit_roughness = channel_input("roughness")
         explicit_smoothness = channel_input("smoothness")
-        if explicit_roughness is not None:
-            roughness = explicit_roughness
-        elif explicit_smoothness is not None:
-            roughness = ImageOps.invert(explicit_smoothness)
         explicit_metallic = channel_input("metallic")
         explicit_ao = channel_input("ao")
-        if explicit_metallic is not None:
-            metallic = explicit_metallic
-        if explicit_ao is not None:
-            ao = explicit_ao
         opacity = channel_input("opacity")
+        texture_keys = self._pbr_texture_keys(input_keys, workflow, target_size)
 
-        if basecolor is None:
-            basecolor = Image.new("RGBA", target_size, (160, 160, 160, 255))
-        else:
-            basecolor = basecolor.convert("RGBA")
-        if normal is None:
-            normal = Image.new("RGB", target_size, (128, 128, 255))
-        else:
-            normal = normal.convert("RGB")
-        if emissive is None:
-            emissive = Image.new("RGB", target_size, (0, 0, 0))
-        else:
-            emissive = emissive.convert("RGB")
-        if roughness is None:
-            roughness = Image.new("L", target_size, 128)
-        if metallic is None:
-            metallic = Image.new("L", target_size, 0)
-        if ao is None:
-            ao = Image.new("L", target_size, 255)
-        if opacity is None:
-            opacity = Image.new("L", target_size, 255)
+        def properties_image() -> Image.Image:
+            roughness = metallic = ao = None
+            if packed is not None:
+                red, green, blue, alpha = packed.split()
+                if workflow is PbrWorkflow.UNITY_URP:
+                    metallic, roughness = red, ImageOps.invert(alpha)
+                elif workflow is PbrWorkflow.UNITY_HDRP:
+                    metallic, ao, roughness = red, green, ImageOps.invert(alpha)
+                elif workflow is PbrWorkflow.UNREAL_ORM:
+                    ao, roughness, metallic = red, green, blue
+                elif workflow is PbrWorkflow.UNREAL_MRA:
+                    metallic, roughness, ao = red, green, blue
+                elif workflow is PbrWorkflow.UNREAL_RMA:
+                    roughness, metallic, ao = red, green, blue
+            if explicit_roughness is not None:
+                roughness = explicit_roughness
+            elif explicit_smoothness is not None:
+                roughness = ImageOps.invert(explicit_smoothness)
+            if explicit_metallic is not None:
+                metallic = explicit_metallic
+            if explicit_ao is not None:
+                ao = explicit_ao
+            return Image.merge("RGBA", (
+                roughness if roughness is not None else Image.new("L", target_size, 128),
+                metallic if metallic is not None else Image.new("L", target_size, 0),
+                ao if ao is not None else Image.new("L", target_size, 255),
+                opacity if opacity is not None else Image.new("L", target_size, 255),
+            ))
+
+        def prepared_image(
+            slot: str, revision: object, build: Callable[[], Image.Image],
+        ) -> Image.Image:
+            key = _PbrMapCacheKey(shader_node.node_id, slot, target_size)
+            image = cache.get_image("pbr-map", key, revision=revision)
+            self._profile_cache_lookup(image)
+            if image is None:
+                image = build()
+                self._check_cancelled()
+                cache.put_image("pbr-map", key, image, revision=revision)
+            return image
+
+        def color_image(
+            slot: str, index: int, image: Image.Image | None, mode: str, fallback: tuple,
+        ) -> Image.Image:
+            if image is not None and image.mode == mode:
+                # The PBR material is read-only; do not duplicate a suitable
+                # socket image or charge it twice to the LRU budget.
+                return image
+            return prepared_image(
+                slot, texture_keys[index],
+                lambda: image.convert(mode) if image is not None else Image.new(mode, target_size, fallback),
+            )
+
+        basecolor = color_image("basecolor", 0, basecolor, "RGBA", (160, 160, 160, 255))
+        normal = color_image("normal", 1, normal, "RGB", (128, 128, 255))
+        emissive = color_image("emissive", 3, emissive, "RGB", (0, 0, 0))
+        properties = prepared_image("properties", texture_keys[2], properties_image)
 
         expected = pbr_expected_normal_orientation(shader_node)
         detected, source_path = trace_pbr_normal_orientation(graph, shader_node)
@@ -755,13 +793,13 @@ class NodeGraphExecutor:
         return PbrMaterialData(
             basecolor=basecolor,
             normal=normal,
-            properties=Image.merge("RGBA", (roughness, metallic, ao, opacity)),
+            properties=properties,
             emissive=emissive,
             normal_is_directx=resolved == NORMAL_ORIENTATION_DIRECTX,
             used_labels=used_labels,
             workflow_label=workflow_label,
             normal_status=normal_status,
-            texture_keys=self._pbr_texture_keys(input_keys, workflow, target_size),
+            texture_keys=texture_keys,
         )
 
     @staticmethod
@@ -1586,7 +1624,10 @@ class NodeGraphExecutor:
         target_size: tuple[int, int],
         visiting: set[tuple[str, str]],
         cache: NodeGraphPreviewCache | None = None,
+        *,
+        copy_result: bool = True,
     ) -> Image.Image:
+        """Return a mutable copy, or a borrowed read-only image for PBR assembly."""
         self._check_cancelled()
         key = (connection.source_node_id, connection.source_socket_id)
         cache_key = (connection.source_node_id, connection.source_socket_id, target_size)
@@ -1594,7 +1635,7 @@ class NodeGraphExecutor:
             cached = cache.get_image("image", cache_key)
             self._profile_cache_lookup(cached)
             if cached is not None:
-                return cached.copy()
+                return cached.copy() if copy_result else cached
         if key in visiting:
             raise GraphExecutionError("Graph contains a cycle.")
         visiting.add(key)
@@ -1883,6 +1924,11 @@ class NodeGraphExecutor:
         if image.size != target_size:
             image = image.resize(target_size, RESAMPLING_LANCZOS)
         self._check_cancelled()
+        if not copy_result:
+            result = image if image.mode == "RGBA" else image.convert("RGBA")
+            if cache is not None:
+                cache.put_image("image", cache_key, result)
+            return result
         result = image.convert("RGBA").copy()
         if cache is not None:
             cache.put_image("image", cache_key, result.copy())
@@ -2218,7 +2264,10 @@ class NodeGraphExecutor:
         target_size: tuple[int, int],
         visiting: set[tuple[str, str]],
         cache: NodeGraphPreviewCache,
+        *,
+        copy_result: bool = True,
     ) -> Image.Image:
+        """Return a mutable copy, or a borrowed read-only channel for PBR assembly."""
         key = (connection.source_node_id, connection.source_socket_id)
         if key in visiting:
             raise GraphExecutionError("Graph contains a cycle.")
@@ -2227,7 +2276,7 @@ class NodeGraphExecutor:
         cached = cache.get_image("channel", cache_key)
         self._profile_cache_lookup(cached)
         if cached is not None:
-            return cached.copy()
+            return cached.copy() if copy_result else cached
 
         visiting.add(key)
         try:
@@ -2439,10 +2488,10 @@ class NodeGraphExecutor:
 
         if channel.size != target_size:
             channel = channel.resize(target_size, RESAMPLING_LANCZOS)
-        result = channel.copy()
+        result = channel.copy() if copy_result else channel
         self._check_cancelled()
         cache.put_image("channel", cache_key, result)
-        return result.copy()
+        return result.copy() if copy_result else result
 
     def _determine_output_size(
         self,
